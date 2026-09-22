@@ -7,7 +7,9 @@ Wants=network-online.target
 Type=simple
 Environment="RUST_LOG=info"
 Environment="TETRA_IDENTITY_DIR=/var/lib/tetra/identity"
-ExecStart=/usr/bin/tetra agent-connect --config /etc/tetra/transport.json --host-id %H
+Environment="TETRA_LISTEN=0.0.0.0:7780"
+EnvironmentFile=-/etc/tetra/enrollment.env
+ExecStart=/usr/bin/tetra agent-ws-serve --listen ${TETRA_LISTEN} --identity-dir /var/lib/tetra/identity --tls-cert /etc/tetra/tetra.crt --tls-key /etc/tetra/tetra.key
 Restart=on-failure
 RestartSec=5
 

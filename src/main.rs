@@ -17,6 +17,7 @@ use tetra::{
         websocket_server::{self, WebSocketServerConfig},
     },
     catalog::{RenderOptions, RenderedResource},
+    enrollment,
 };
 
 /// Tetra CLI entry point.
@@ -58,6 +59,9 @@ enum Commands {
 
     /// Serve an authenticated WebSocket for a dashboard client.
     AgentWsServe(AgentWsServeCli),
+
+    /// Enroll this host with an Ultramarine Dashboard.
+    Enroll(EnrollCli),
 }
 
 #[derive(Debug, Parser)]
@@ -116,6 +120,50 @@ struct AgentWsServeCli {
 }
 
 #[derive(Debug, Parser)]
+struct EnrollCli {
+    /// Dashboard base URL.
+    #[arg(long, env = "TETRA_DASHBOARD_URL")]
+    dashboard_url: Option<String>,
+
+    /// Public WSS URL where Dashboard can reach this host.
+    #[arg(long)]
+    agent_url: Option<String>,
+
+    /// Local address and port for the Tetra WebSocket listener.
+    #[arg(long)]
+    listen: Option<String>,
+
+    /// Dashboard display name for this host.
+    #[arg(long)]
+    display_name: Option<String>,
+
+    /// Write device authorization details to this file as soon as they are created.
+    #[arg(long)]
+    approval_file: Option<PathBuf>,
+
+    /// Browser-reachable base URL to use when printing the approval link.
+    #[arg(long)]
+    verification_url: Option<String>,
+
+    #[arg(long, default_value = "/var/lib/tetra/identity")]
+    identity_dir: String,
+
+    #[arg(long, default_value = "/etc/tetra")]
+    config_dir: String,
+
+    #[arg(long)]
+    hostname: Option<String>,
+
+    /// Permit plaintext/local development endpoints and invalid Dashboard TLS.
+    #[arg(long)]
+    insecure: bool,
+
+    /// Do not call systemctl after approval (useful in containers and OOBE).
+    #[arg(long)]
+    skip_service: bool,
+}
+
+#[derive(Debug, Parser)]
 struct AgentConnectCli {
     /// JSON transport config containing `control_plane_url` and optional TLS paths.
     #[arg(short, long, value_name = "FILE")]
@@ -140,6 +188,22 @@ async fn main() -> Result<()> {
         Commands::AgentVsockServe(cli) => cli.serve(),
         Commands::AgentConnect(cli) => agent_connect(cli).await,
         Commands::AgentWsServe(cli) => agent_ws_serve(cli).await,
+        Commands::Enroll(cli) => {
+            enrollment::run(enrollment::Options {
+                dashboard_url: cli.dashboard_url,
+                agent_url: cli.agent_url,
+                listen: cli.listen,
+                display_name: cli.display_name,
+                approval_file: cli.approval_file,
+                verification_url: cli.verification_url,
+                identity_dir: cli.identity_dir,
+                config_dir: cli.config_dir,
+                hostname: cli.hostname,
+                insecure: cli.insecure,
+                skip_service: cli.skip_service,
+            })
+            .await
+        }
     }
 }
 

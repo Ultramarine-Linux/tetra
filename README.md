@@ -179,9 +179,30 @@ dispatch over vsock.
 
 ## Systemd
 
-A sample systemd unit is provided in `systemd/tetra.service`. It runs
-`agent-connect` with a transport config and persists identity under
-`/var/lib/tetra/identity`.
+A sample systemd unit is provided in `systemd/tetra.service`. After
+`tetra enroll` is approved by Dashboard, it runs the authenticated inbound
+WebSocket listener with TLS material under `/etc/tetra` and persists identity
+under `/var/lib/tetra/identity`.
+
+## Host enrollment
+
+The host-side `enroll` command uses a device authorization flow. It generates
+the host identity and TLS material, prints a Dashboard verification URL and
+short approval code, then waits for an authenticated Dashboard user to approve
+the request:
+
+```text
+tetra enroll --dashboard-url https://dashboard.example.com \\
+  --agent-url wss://host.example.com:9443 \\
+  --listen 0.0.0.0:9443 \\
+  --display-name host-01
+```
+
+The Dashboard stores the controller private key; Tetra stores only the
+controller public key. Use `--agent-url` for the address Dashboard should use
+to reach the host and `--listen` for the local bind address and port. The host's
+firewall or private network must allow the Dashboard to reach the configured
+WebSocket URL. If omitted, `--listen` defaults to `0.0.0.0:7780`.
 
 ## Authentication and Elevation
 

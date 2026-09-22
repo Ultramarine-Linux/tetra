@@ -13,6 +13,7 @@
 
 pub mod agent;
 pub mod catalog;
+pub mod enrollment;
 pub mod prelude;
 pub mod types;
 

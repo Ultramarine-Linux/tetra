@@ -1,4 +1,4 @@
-use std::{env, time::Duration};
+use std::{env, fs::File, io::BufReader, sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result, bail};
 use futures_util::{SinkExt, StreamExt};
@@ -6,7 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{Connector, connect_async_tls_with_config, tungstenite::Message};
 
 use super::{
     AgentBackend, AgentCommand, AgentResponse,
@@ -183,9 +183,10 @@ async fn connect_once(
     config: &WebSocketAgentConfig,
     queue: DispatchQueue,
 ) -> Result<()> {
-    let (mut socket, response) = connect_async(url)
+    let connector = tls_connector(&config.transport)?;
+    let (mut socket, response) = connect_async_tls_with_config(url, None, false, Some(connector))
         .await
-        .with_context(|| format!("failed to connect to control plane `{url}`"))?;
+        .with_context(|| format!("failed to connect to control plane {url}"))?;
     eprintln!(
         "connected to control plane `{url}` with HTTP {}",
         response.status()
@@ -225,6 +226,50 @@ async fn connect_once(
     }
 
     Ok(())
+}
+
+fn tls_connector(config: &TransportConfig) -> Result<Connector> {
+    let ca_path = config
+        .server_ca_path
+        .as_deref()
+        .context("missing server CA path for outbound WSS")?;
+    let cert_path = config
+        .client_cert_path
+        .as_deref()
+        .context("missing client certificate path for outbound WSS")?;
+    let key_path = config
+        .client_key_path
+        .as_deref()
+        .context("missing client key path for outbound WSS")?;
+
+    let mut ca_reader = BufReader::new(
+        File::open(ca_path).with_context(|| format!("failed to open server CA `{ca_path}`"))?,
+    );
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in rustls_pemfile::certs(&mut ca_reader) {
+        roots
+            .add(certificate.context("failed to parse server CA certificate")?)
+            .context("failed to add server CA certificate")?;
+    }
+
+    let mut cert_reader = BufReader::new(
+        File::open(cert_path)
+            .with_context(|| format!("failed to open client certificate `{cert_path}`"))?,
+    );
+    let certificates = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to parse client certificate")?;
+    let mut key_reader = BufReader::new(
+        File::open(key_path).with_context(|| format!("failed to open client key `{key_path}`"))?,
+    );
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .context("failed to parse client key")?
+        .context("client key PEM contains no private key")?;
+    let client = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certificates, key)
+        .context("invalid client certificate/private-key pair")?;
+    Ok(Connector::Rustls(Arc::new(client)))
 }
 
 /// Exponential reconnect backoff with jitter: `2^attempt` seconds, capped at
