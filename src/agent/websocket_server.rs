@@ -609,7 +609,7 @@ mod tests {
     fn random_tokens_are_non_empty_and_different() {
         let first = random_token(16);
         let second = random_token(16);
-        assert!(!first.is_empty());
+        assert_ne!(first, "");
         assert_ne!(first, second);
     }
 

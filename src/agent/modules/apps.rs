@@ -878,7 +878,7 @@ resources:
             json!({ "base_dir": base.path(), "files_base_dir": files.path() }),
         )
         .unwrap();
-        assert!(response["apps"].as_array().unwrap().is_empty());
+        assert_eq!(response["apps"], json!([]));
         assert_eq!(response["invalid"], json!(["demo"]));
     }
 
@@ -1076,7 +1076,7 @@ resources:
 
         let response = dispatch("create", create_payload(base.path(), files.path())).unwrap();
         assert_eq!(response["written"], true);
-        assert!(response["systemd"].as_array().unwrap().is_empty());
+        assert_eq!(response["systemd"], json!([]));
         assert_eq!(
             fs::read_to_string(base.path().join("demo-web.container")).unwrap(),
             "[Container]\nContainerName=demo-web\nImage=example/demo:latest\n"
@@ -1118,7 +1118,7 @@ resources:
         assert_eq!(list["apps"].as_array().unwrap().len(), 1);
         assert_eq!(list["apps"][0]["name"], "demo");
         assert_eq!(list["apps"][0]["services"], json!(["demo-web.service"]));
-        assert!(list["invalid"].as_array().unwrap().is_empty());
+        assert_eq!(list["invalid"], json!([]));
     }
 
     /// Recipe that declares `bundle_dir`, so the agent can point templates at
