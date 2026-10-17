@@ -19,15 +19,19 @@ tetra/
 │       ├── dispatcher.rs       # Command routing registry
 │       ├── backend.rs          # Kameo actor wrapping the dispatcher
 │       ├── queue.rs            # Bounded transport-to-dispatch queue
+│       ├── remote.rs           # remote.enabled gate for the outbound session
 │       ├── command.rs          # AgentCommand / AgentResponse types
+│       ├── config.rs           # Runtime config (/etc/tetra/tetra.json)
 │       ├── messages.rs         # Internal actor message types
 │       ├── protocol.rs         # JSON frame protocol for transports
 │       ├── crypto.rs           # Ed25519 signing/verification
 │       ├── identity.rs         # Host keypair generation and persistence
+│       ├── local_socket.rs     # Local Unix socket listener (production)
 │       ├── verify_password.rs  # Shadow password verification
 │       ├── transport.rs        # Shared endpoint/TLS configuration
 │       ├── websocket.rs        # Outbound WSS control-plane client
-│       ├── websocket_server.rs # Inbound authenticated WebSocket listener
+│       ├── websocket_server.rs # Authenticated WebSocket protocol (ServerState)
+│       ├── dev_listener.rs     # Dev-only TCP listener (`dev-listener` feature)
 │       ├── vsock.rs            # Virtio-vsock smoke-test transport
 │       ├── module_support.rs   # Shared module helpers
 │       └── modules/            # One module per host-management surface
@@ -197,25 +201,46 @@ depend on one serde schema.
 Tetra exposes the same command envelope over multiple transports. All transports
 feed into the same `DispatchQueue`.
 
-### Outbound WSS (`agent-connect`)
+### Local Unix socket (`agent-serve`)
 
-Production transport. Tetra dials out to the dashboard/control plane over WSS
-using mTLS. This avoids firewall/NAT issues because the connection is outbound.
+Production transport for local clients (the dashboard container and the server
+OOBE), and the only listener `tetra.service` runs. The socket at
+`/run/tetra/tetra.sock` is created by `tetra.socket` as `root:tetra 0660` and
+passed in through systemd socket activation; outside systemd Tetra binds it
+itself. It carries the same authenticated WebSocket protocol as
+`agent-ws-serve`.
+
+- `local_socket.rs` — socket activation, fallback bind, accept loop.
+- `websocket_server.rs` — `ServerState`, the per-connection protocol shared with the TCP listener.
+
+### Outbound WSS (remote control)
+
+Tetra dials out to a control plane over WSS using mTLS. This avoids
+firewall/NAT issues because the connection is outbound. It is gated by
+`remote.enabled` in `/etc/tetra/tetra.json` (default `false`). `agent-serve`
+re-reads the file on `SIGHUP`, starts the session when the gate opens and drops
+it when the gate closes. `agent-connect` runs the session standalone under the
+same gate.
 
 Key files:
 
+- `config.rs` — runtime config (`remote.*`), fails closed on invalid files.
+- `remote.rs` — supervisor that runs or drops the session as the setting changes, and the `SIGHUP` reload.
 - `websocket.rs` — outbound WSS client with reconnection.
 - `transport.rs` — shared config parsing (`control_plane_url`, client cert/key paths, CA path).
 
 ### Inbound WebSocket (`agent-ws-serve`)
 
-Development transport. An authenticated WebSocket listener that accepts
+Development transport, compiled only with the `dev-listener` Cargo feature.
+Release builds leave it off, so production binaries cannot listen on the
+network. An authenticated WebSocket listener that accepts
 Ed25519-signed command frames from a controller client. Requires an explicitly
 configured controller public key before accepting commands.
 
 - Loopback `ws://` is allowed without TLS.
 - Non-loopback addresses require `--tls-cert` and `--tls-key`.
-- `websocket_server.rs` — inbound listener, challenge/auth handshake, session management.
+- `dev_listener.rs` — TCP bind, optional TLS, loopback-or-TLS check.
+- `websocket_server.rs` — challenge/auth handshake and session management, shared with the local socket.
 
 ### Vsock (`agent-vsock-serve`)
 

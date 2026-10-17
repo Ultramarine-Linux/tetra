@@ -29,7 +29,7 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_mins(1);
 /// authenticates with mTLS, and exchanges [`TransportFrame`]s. Dialing out
 /// (rather than listening) keeps the agent behind NAT/firewalls without port
 /// forwarding — the same reason a Tailscale tailnet works.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSocketAgentConfig {
     pub transport: TransportConfig,
     pub host_id: String,
@@ -139,6 +139,13 @@ impl TransportFrame {
 /// The outer loop is the reconnect loop; the inner [`connect_once`] is a single
 /// session.
 pub async fn run(config: WebSocketAgentConfig) -> Result<()> {
+    let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), DEFAULT_QUEUE_CAPACITY);
+    run_with_queue(config, queue).await
+}
+
+/// [`run`] against an existing dispatch queue, so the outbound session shares
+/// one dispatcher with the local transports.
+pub async fn run_with_queue(config: WebSocketAgentConfig, queue: DispatchQueue) -> Result<()> {
     let url = match config.transport.endpoint()? {
         TransportEndpoint::WebSocket { url } => url,
         TransportEndpoint::Vsock(_) => {
@@ -148,7 +155,6 @@ pub async fn run(config: WebSocketAgentConfig) -> Result<()> {
 
     config.transport.validate(&url)?;
 
-    let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), DEFAULT_QUEUE_CAPACITY);
     let mut attempt = 0_u32;
 
     loop {

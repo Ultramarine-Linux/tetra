@@ -6,14 +6,19 @@ feature-gated modules for apps, files, recipes, SELinux, services, Quadlets,
 reverse-proxy, Podman, Samba, NFS, users, and virtual machines. The `settings`
 module is always compiled so the control plane can discover basic host facts.
 
-The production transport is an outbound WSS connection to the dashboard/control
-plane (`agent-connect`), using mTLS for transport identity and carrying signed
-command envelopes. When the agent runs inside a VM, the same JSON frame
-protocol can be carried over a virtio-vsock stream.
+Local clients (the dashboard container and the server OOBE) talk to Tetra over
+a Unix socket at `/run/tetra/tetra.sock` (`agent-serve`). This is the only
+listener a production install runs; Tetra does not listen on the network.
+The socket carries the authenticated WebSocket protocol, with Ed25519-signed
+command frames.
 
-For development and dashboard testing, the inbound authenticated WebSocket
-listener (`agent-ws-serve`) accepts Ed25519-signed command frames from a
-controller client.
+An outbound mTLS WSS connection to a remote control plane also exists. It is
+off unless `remote.enabled` is set in `/etc/tetra/tetra.json`. When the agent runs inside a VM, the same JSON frame protocol can
+be carried over a virtio-vsock stream.
+
+For development, `agent-ws-serve` runs the same authenticated WebSocket
+protocol on a TCP listener. It is only compiled with the `dev-listener`
+feature, so release builds cannot listen on the network.
 
 The local `agent-dispatch` command accepts the same command envelope shape for
 one-shot debugging. See [docs/agent-protocol.md](docs/agent-protocol.md) for
@@ -51,6 +56,8 @@ Default build features:
 Additional optional features:
 
 - `virtual-machines`
+- `dev-listener`: the development TCP listener (`agent-ws-serve`). Leave it
+  off in release builds.
 
 Build with every module:
 
@@ -115,14 +122,32 @@ cargo run -- agent-dispatch examples/settings.command.json
 `examples/apps.command.json` shows a dry-run `apps.create` that cooks an
 inline recipe into an installed app bundle.
 
+### Local socket (production)
+
+`agent-serve` is the host agent daemon. It serves the authenticated WebSocket
+protocol to local clients over a Unix socket. Under systemd the socket comes
+from `tetra.socket` through socket activation; otherwise Tetra binds
+`--socket` (default `/run/tetra/tetra.sock`) with mode `0660`:
+
+```sh
+cargo run -- agent-serve \
+  --socket /tmp/tetra.sock \
+  --identity-dir /tmp/tetra-identity \
+  --controller-public-key "$TETRA_CONTROLLER_PUBLIC_KEY"
+```
+
+Clients open a WebSocket over the Unix stream; the HTTP `Host` and path are
+ignored. With Node's `ws`, use `ws+unix:///run/tetra/tetra.sock`.
+
 ### Inbound WebSocket server (development)
 
-`agent-ws-serve` runs an authenticated WebSocket for dashboard clients. It
-requires an enrolled controller Ed25519 public key before accepting commands.
+`agent-ws-serve` runs an authenticated WebSocket on TCP. It is only built
+with the `dev-listener` feature (add `--features dev-listener` to the commands
+below). It requires an enrolled controller Ed25519 public key before accepting commands.
 The host identity is automatically generated under `/var/lib/tetra/identity`:
 
 ```sh
-cargo run -- agent-ws-serve \
+cargo run --features dev-listener -- agent-ws-serve \
   --listen 127.0.0.1:7780 \
   --controller-public-key "$TETRA_CONTROLLER_PUBLIC_KEY"
 ```
@@ -130,30 +155,47 @@ cargo run -- agent-ws-serve \
 For non-loopback addresses, TLS is required:
 
 ```sh
-cargo run -- agent-ws-serve \
+cargo run --features dev-listener -- agent-ws-serve \
   --listen 0.0.0.0:7780 \
   --tls-cert /etc/tetra/tetra.crt \
   --tls-key /etc/tetra/tetra.key
 ```
 
-### Outbound WSS control plane (production)
+### Outbound WSS control plane (remote control)
 
-`agent-connect` dials out to the dashboard/control plane and maintains a
-persistent connection:
-
-```sh
-cargo run -- agent-connect --config examples/transport.json --host-id myhost
-```
-
-The transport config JSON contains:
+Remote control ships disabled. `agent-serve` connects out only while
+`remote.enabled` is `true` in the runtime config, `/etc/tetra/tetra.json`
+(override with `--config` or `TETRA_CONFIG`). A missing file means remote
+control is off, and an unreadable or invalid file turns it off too.
 
 ```json
 {
-  "control_plane_url": "wss://dashboard.example.com/tetra/agent",
-  "client_cert_path": "/var/lib/tetra/identity/agent.crt",
-  "client_key_path": "/var/lib/tetra/identity/agent.key",
-  "server_ca_path": "/var/lib/tetra/identity/dashboard-ca.crt"
+  "remote": {
+    "enabled": true,
+    "host_id": "host-01",
+    "transport": {
+      "control_plane_url": "wss://dashboard.example.com/tetra/agent",
+      "client_cert_path": "/var/lib/tetra/identity/agent.crt",
+      "client_key_path": "/var/lib/tetra/identity/agent.key",
+      "server_ca_path": "/var/lib/tetra/identity/dashboard-ca.crt"
+    }
+  }
 }
+```
+
+`examples/tetra.json` has the full shape. Tetra re-reads the file on `SIGHUP`
+(`systemctl reload tetra.service`). Enabling remote control starts the mTLS
+session; disabling it drops any live session immediately. A reload that
+leaves `remote` unchanged keeps the current session.
+
+`agent-connect` runs the same outbound session on its own, with the transport
+config in a separate file. It obeys the same gate: it refuses to start unless
+`remote.enabled` is `true`, and it drops the session when a `SIGHUP` reload
+turns it off:
+
+```sh
+cargo run -- agent-connect --config examples/transport.json --host-id myhost \
+  --runtime-config examples/tetra.json
 ```
 
 ### Vsock smoke test
@@ -179,10 +221,16 @@ dispatch over vsock.
 
 ## Systemd
 
-A sample systemd unit is provided in `systemd/tetra.service`. After
-`tetra enroll` is approved by Dashboard, it runs the authenticated inbound
-WebSocket listener with TLS material under `/etc/tetra` and persists identity
-under `/var/lib/tetra/identity`.
+`systemd/tetra.socket` creates `/run/tetra/tetra.sock` as `root:tetra`, mode
+`0660`, and socket-activates `systemd/tetra.service`, which runs
+`agent-serve` and persists identity under `/var/lib/tetra/identity`. The
+service does not bind a TCP port.
+
+`systemd/tetra.sysusers.conf` creates the `tetra` group. To let the dashboard
+container reach Tetra, bind-mount the socket into the container and run it
+with the `tetra` group (for a Quadlet, `Volume=/run/tetra/tetra.sock:/run/tetra/tetra.sock`
+and `GroupAdd=tetra`, or `GroupAdd=keep-groups` for a rootless container whose
+user is in `tetra`).
 
 ## Host enrollment
 
@@ -203,6 +251,11 @@ controller public key. Use `--agent-url` for the address Dashboard should use
 to reach the host and `--listen` for the local bind address and port. The host's
 firewall or private network must allow the Dashboard to reach the configured
 WebSocket URL. If omitted, `--listen` defaults to `0.0.0.0:7780`.
+
+`tetra.service` no longer runs a TCP listener, so the `--listen` and
+`--agent-url` values recorded by `enroll` are not served by the default
+install. `agent-ws-serve` is a development-only listener (`dev-listener`
+feature) and is not part of release builds.
 
 ## Authentication and Elevation
 

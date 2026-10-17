@@ -78,14 +78,15 @@ impl SiteMetadata {
     /// Render a single site snippet.
     ///
     /// The `# tetra: {metadata}` line embeds `SiteMetadata` as JSON so
-    /// `list_sites` can round-trip the original parameters. TLS off emits
-    /// `auto_https off` to disable Caddy's automatic certificate provisioning
-    /// for this site.
+    /// `list_sites` can round-trip the original parameters. TLS off uses an
+    /// `http://` site address, which serves the site over plain HTTP without
+    /// provisioning a certificate. (`auto_https` is a global option and Caddy
+    /// rejects it inside a site block.)
     fn render(&self) -> Result<String> {
         let metadata = serde_json::to_string(self)?;
-        let tls = if self.tls { "" } else { "\n\tauto_https off" };
+        let scheme = if self.tls { "" } else { "http://" };
         Ok(format!(
-            "{MANAGED_HEADER}\n# tetra: {metadata}\n{} {{{tls}\n\treverse_proxy {}\n}}\n",
+            "{MANAGED_HEADER}\n# tetra: {metadata}\n{scheme}{} {{\n\treverse_proxy {}\n}}\n",
             self.domain, self.upstream
         ))
     }
@@ -357,6 +358,28 @@ mod tests {
                 .unwrap()
                 .contains("reverse_proxy 127.0.0.1:8080")
         );
+    }
+
+    #[test]
+    fn renders_plain_http_site_without_auto_https() {
+        let site = SiteMetadata::new("app.example.com", "127.0.0.1:8080", false).unwrap();
+        let contents = site.render().unwrap();
+        let site_block = contents
+            .lines()
+            .find(|line| !line.starts_with('#'))
+            .unwrap();
+
+        assert!(site_block.starts_with("http://app.example.com "));
+        assert!(!contents.contains("auto_https"));
+    }
+
+    #[test]
+    fn renders_tls_site_with_bare_domain() {
+        let site = SiteMetadata::new("app.example.com", "127.0.0.1:8080", true).unwrap();
+        let contents = site.render().unwrap();
+
+        assert!(contents.contains("\napp.example.com {\n"));
+        assert!(!contents.contains("http://"));
     }
 
     #[test]

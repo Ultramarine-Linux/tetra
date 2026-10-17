@@ -1,0 +1,12 @@
+{
+  "remote": {
+    "enabled": false,
+    "host_id": "host-01",
+    "transport": {
+      "control_plane_url": "wss://dashboard.example.com/tetra/agent",
+      "client_cert_path": "/var/lib/tetra/identity/agent.crt",
+      "client_key_path": "/var/lib/tetra/identity/agent.key",
+      "server_ca_path": "/var/lib/tetra/identity/dashboard-ca.crt"
+    }
+  }
+}

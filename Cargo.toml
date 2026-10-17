@@ -38,6 +38,9 @@ quadlets = []
 reverse-proxy = []
 users = []
 virtual-machines = []
+# Development-only TCP listener (`agent-ws-serve`). Release builds leave this
+# off so the binary cannot listen on the network.
+dev-listener = ["dep:tokio-rustls"]
 
 
 [dependencies]
@@ -65,7 +68,7 @@ tokio = { version = "1", features = [
     "signal",
     "time",
 ] }
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", optional = true }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 rustls = "0.23"
 rustls-pemfile = "2"
