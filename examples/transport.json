@@ -1,7 +1,7 @@
 {
   "_comment": "Tetra control-plane transport configuration.",
   "control_plane_url": "wss://dashboard.example.com/tetra/agent",
-  "client_cert_path": "/var/lib/tetra/identity/agent.crt",
-  "client_key_path": "/var/lib/tetra/identity/agent.key",
-  "server_ca_path": "/var/lib/tetra/identity/dashboard-ca.crt"
+  "client_cert_path": "/var/lib/tetra/remote/client.crt",
+  "client_key_path": "/var/lib/tetra/remote/client.key",
+  "server_ca_path": "/var/lib/tetra/remote/server-ca.crt"
 }

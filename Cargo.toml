@@ -1,6 +1,6 @@
 [package]
 name = "tetra"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "A modular host agent for Ultramarine Server and cloud hosts"
@@ -38,6 +38,9 @@ quadlets = []
 reverse-proxy = []
 users = []
 virtual-machines = []
+# Development-only TCP listener (`agent-ws-serve`). Release builds leave this
+# off so the binary cannot listen on the network.
+dev-listener = ["dep:tokio-rustls"]
 
 
 [dependencies]
@@ -65,7 +68,7 @@ tokio = { version = "1", features = [
     "signal",
     "time",
 ] }
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", optional = true }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 rustls = "0.23"
 rustls-pemfile = "2"
@@ -74,9 +77,13 @@ libc = "0.2"
 preinterpret = "0.2.1"
 phf = { version = "0.14.0", features = ["macros"] }
 enum_dispatch = "0.3.13"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+x509-parser = "0.18.1"
 
 [dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 tempfile = "3"
+tokio-rustls = "0.26"
 
 [lints]
 workspace = true
@@ -87,8 +94,8 @@ nursery = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 suspicious = { level = "warn", priority = -1 }
 
-disallowed-macros = "deny"
-excessive-nesting = "warn"
+disallowed_macros = "deny"
+excessive_nesting = "warn"
 
 arithmetic_side_effects = "warn"
 assertions_on_result_states = "warn"

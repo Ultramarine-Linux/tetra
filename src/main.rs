@@ -1,23 +1,27 @@
 use std::{
     fs,
     io::{self, Read},
-    net::SocketAddr,
     path::PathBuf,
 };
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tokio::sync::watch;
 
 use tetra::{
     agent::{
-        AgentCommand, backend,
+        AgentBackend, AgentCommand, backend,
+        config::{self, RuntimeConfig},
+        local_socket,
+        queue::{DEFAULT_QUEUE_CAPACITY, DispatchQueue},
+        remote,
         transport::TransportConfig,
         vsock::VsockAgentConfig,
-        websocket::{self, WebSocketAgentConfig},
-        websocket_server::{self, WebSocketServerConfig},
+        websocket::WebSocketAgentConfig,
+        websocket_server::ServerState,
     },
     catalog::{RenderOptions, RenderedResource},
-    enrollment,
+    enrollment::{self, store::DEFAULT_ENROLLMENT_DIR, store::Enrollment},
 };
 
 /// Tetra CLI entry point.
@@ -27,11 +31,12 @@ use tetra::{
 /// - **Recipe rendering** (`render`) — pure local tooling that turns a YAML
 ///   recipe + Tera templates into container unit and companion files. No agent
 ///   backend, no transport.
-/// - **Agent** (`agent-dispatch`, `agent-vsock-serve`, `agent-connect`,
-///   `agent-ws-serve`) — the same Kameo-backed dispatcher exposed through
-///   different surfaces: a one-shot CLI, a vsock smoke-test listener, an
-///   outbound WSS control-plane connection, and an authenticated inbound
-///   WebSocket for the dashboard.
+/// - **Agent** (`agent-serve`, `agent-dispatch`, `agent-vsock-serve`,
+///   `agent-connect`, `agent-ws-serve`) — the same Kameo-backed dispatcher
+///   exposed through different surfaces: the local Unix socket daemon, a
+///   one-shot CLI, a vsock smoke-test listener, an outbound WSS control-plane
+///   connection, and (with the `dev-listener` feature) a development TCP
+///   WebSocket listener.
 #[derive(Debug, Parser)]
 #[command(
     author,
@@ -48,6 +53,9 @@ enum Commands {
     /// Render a Tetra app recipe into container unit files with Tera templates.
     Render(RenderCli),
 
+    /// Run the host agent daemon, serving local clients over a Unix socket.
+    AgentServe(AgentServeCli),
+
     /// Dispatch one signed agent command envelope locally.
     AgentDispatch(AgentDispatchCli),
 
@@ -57,11 +65,15 @@ enum Commands {
     /// Connect the local agent backend to an outbound WSS control plane.
     AgentConnect(AgentConnectCli),
 
-    /// Serve an authenticated WebSocket for a dashboard client.
+    /// Serve an authenticated WebSocket over TCP (development only).
+    #[cfg(feature = "dev-listener")]
     AgentWsServe(AgentWsServeCli),
 
-    /// Enroll this host with an Ultramarine Dashboard.
+    /// Enroll this host for outbound remote control (requires remote.enabled).
     Enroll(EnrollCli),
+
+    /// Remove this host's remote-control certificate and controller record.
+    Unenroll(UnenrollCli),
 }
 
 #[derive(Debug, Parser)]
@@ -93,10 +105,38 @@ struct AgentDispatchCli {
 }
 
 #[derive(Debug, Parser)]
+struct AgentServeCli {
+    /// Runtime config (`remote.enabled`, ...). Re-read on SIGHUP.
+    #[arg(long, env = "TETRA_CONFIG", default_value = config::DEFAULT_CONFIG_PATH)]
+    config: PathBuf,
+
+    /// Unix socket to bind when not started by systemd socket activation.
+    #[arg(long, env = "TETRA_SOCKET", default_value = local_socket::DEFAULT_SOCKET_PATH)]
+    socket: PathBuf,
+
+    /// URL-safe base64 Ed25519 public key enrolled for the dashboard controller.
+    #[arg(long, env = "TETRA_CONTROLLER_PUBLIC_KEY")]
+    controller_public_key: Option<String>,
+
+    /// One-time token accepted to enroll a controller while no key is stored.
+    #[arg(long, env = "TETRA_ENROLLMENT_TOKEN")]
+    enrollment_token: Option<String>,
+
+    /// Mutable identity directory. Defaults to /var/lib/tetra/identity.
+    #[arg(long, default_value = "/var/lib/tetra/identity")]
+    identity_dir: PathBuf,
+
+    /// Remote-control enrollment written by `tetra enroll`.
+    #[arg(long, env = "TETRA_ENROLLMENT_DIR", default_value = DEFAULT_ENROLLMENT_DIR)]
+    enrollment_dir: PathBuf,
+}
+
+#[cfg(feature = "dev-listener")]
+#[derive(Debug, Parser)]
 struct AgentWsServeCli {
     /// Loopback address for the WebSocket listener.
     #[arg(long, default_value = "127.0.0.1:7780")]
-    listen: SocketAddr,
+    listen: std::net::SocketAddr,
 
     /// URL-safe base64 Ed25519 public key enrolled for the dashboard controller.
     #[arg(long, env = "TETRA_CONTROLLER_PUBLIC_KEY")]
@@ -121,19 +161,11 @@ struct AgentWsServeCli {
 
 #[derive(Debug, Parser)]
 struct EnrollCli {
-    /// Dashboard base URL.
+    /// Controller base URL that serves the enrollment API.
     #[arg(long, env = "TETRA_DASHBOARD_URL")]
     dashboard_url: Option<String>,
 
-    /// Public WSS URL where Dashboard can reach this host.
-    #[arg(long)]
-    agent_url: Option<String>,
-
-    /// Local address and port for the Tetra WebSocket listener.
-    #[arg(long)]
-    listen: Option<String>,
-
-    /// Dashboard display name for this host.
+    /// Display name for this host on the controller.
     #[arg(long)]
     display_name: Option<String>,
 
@@ -145,16 +177,18 @@ struct EnrollCli {
     #[arg(long)]
     verification_url: Option<String>,
 
-    #[arg(long, default_value = "/var/lib/tetra/identity")]
-    identity_dir: String,
+    /// Runtime config; enrollment refuses to run unless `remote.enabled` is true.
+    #[arg(long, env = "TETRA_CONFIG", default_value = config::DEFAULT_CONFIG_PATH)]
+    config: PathBuf,
 
-    #[arg(long, default_value = "/etc/tetra")]
-    config_dir: String,
+    /// Root-only directory for the client key, certificate and controller record.
+    #[arg(long, env = "TETRA_ENROLLMENT_DIR", default_value = DEFAULT_ENROLLMENT_DIR)]
+    enrollment_dir: PathBuf,
 
     #[arg(long)]
     hostname: Option<String>,
 
-    /// Permit plaintext/local development endpoints and invalid Dashboard TLS.
+    /// Permit a plaintext controller URL and invalid controller TLS (development only).
     #[arg(long)]
     insecure: bool,
 
@@ -164,46 +198,75 @@ struct EnrollCli {
 }
 
 #[derive(Debug, Parser)]
-struct AgentConnectCli {
-    /// JSON transport config containing `control_plane_url` and optional TLS paths.
-    #[arg(short, long, value_name = "FILE")]
-    config: PathBuf,
+struct UnenrollCli {
+    /// Directory written by `tetra enroll`.
+    #[arg(long, env = "TETRA_ENROLLMENT_DIR", default_value = DEFAULT_ENROLLMENT_DIR)]
+    enrollment_dir: PathBuf,
 
-    /// Stable dashboard host id for this agent.
+    /// Do not reload tetra.service after removing the enrollment.
+    #[arg(long)]
+    skip_service: bool,
+}
+
+#[derive(Debug, Parser)]
+struct AgentConnectCli {
+    /// JSON transport config containing `control_plane_url` and optional TLS
+    /// paths. Defaults to the enrollment.
+    #[arg(short, long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
+    /// Stable control-plane host id for this agent. Defaults to the enrollment.
     #[arg(long, env = "TETRA_HOST_ID")]
-    host_id: String,
+    host_id: Option<String>,
+
+    /// Remote-control enrollment written by `tetra enroll`.
+    #[arg(long, env = "TETRA_ENROLLMENT_DIR", default_value = DEFAULT_ENROLLMENT_DIR)]
+    enrollment_dir: PathBuf,
 
     /// Reconnect with exponential backoff when the control-plane session closes.
     #[arg(long, default_value_t = true)]
     reconnect: bool,
+
+    /// Runtime config whose `remote.enabled` gates this connection. Re-read on SIGHUP.
+    #[arg(long, env = "TETRA_CONFIG", default_value = config::DEFAULT_CONFIG_PATH)]
+    runtime_config: PathBuf,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Both rustls providers are compiled in (reqwest pulls in ring), so rustls
+    // cannot pick one itself and would panic on first TLS use.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("a rustls crypto provider was already installed"))?;
 
     match cli.command {
         Commands::Render(cli) => render(cli),
+        Commands::AgentServe(cli) => agent_serve(cli).await,
         Commands::AgentDispatch(cli) => agent_dispatch(cli).await,
         Commands::AgentVsockServe(cli) => cli.serve(),
         Commands::AgentConnect(cli) => agent_connect(cli).await,
+        #[cfg(feature = "dev-listener")]
         Commands::AgentWsServe(cli) => agent_ws_serve(cli).await,
         Commands::Enroll(cli) => {
             enrollment::run(enrollment::Options {
                 dashboard_url: cli.dashboard_url,
-                agent_url: cli.agent_url,
-                listen: cli.listen,
                 display_name: cli.display_name,
                 approval_file: cli.approval_file,
                 verification_url: cli.verification_url,
-                identity_dir: cli.identity_dir,
-                config_dir: cli.config_dir,
+                runtime_config: cli.config,
+                enrollment_dir: cli.enrollment_dir,
                 hostname: cli.hostname,
                 insecure: cli.insecure,
                 skip_service: cli.skip_service,
             })
             .await
         }
+        Commands::Unenroll(cli) => enrollment::unenroll(&enrollment::UnenrollOptions {
+            enrollment_dir: cli.enrollment_dir,
+            skip_service: cli.skip_service,
+        }),
     }
 }
 
@@ -256,6 +319,27 @@ async fn agent_dispatch(cli: AgentDispatchCli) -> Result<()> {
     Ok(())
 }
 
+async fn agent_serve(cli: AgentServeCli) -> Result<()> {
+    let state = ServerState::load(
+        &cli.identity_dir,
+        cli.controller_public_key,
+        cli.enrollment_token,
+    )?;
+    let listener = local_socket::listener(&cli.socket)?;
+    state.log_identity();
+
+    let enrollment_dir = cli.enrollment_dir;
+    let select = move |config: &RuntimeConfig| remote::connection_from(config, &enrollment_dir);
+    let (sender, settings) = watch::channel(select(&RuntimeConfig::load_or_disabled(&cli.config)));
+    let queue = state.queue().clone();
+    tokio::select! {
+        result = local_socket::serve(listener, state) => result,
+        () = remote::supervise(settings, queue) => Ok(()),
+        result = remote::reload_on_hangup(cli.config, sender, select) => result,
+    }
+}
+
+#[cfg(feature = "dev-listener")]
 async fn agent_ws_serve(
     AgentWsServeCli {
         listen,
@@ -270,26 +354,70 @@ async fn agent_ws_serve(
         tls_cert.as_ref().xor(tls_key.as_ref()).is_none(),
         "--tls-cert and --tls-key must be supplied together"
     );
-    websocket_server::WebSocketServerConfig::serve(WebSocketServerConfig {
-        listen,
-        controller_public_key,
-        enrollment_token,
-        identity_dir,
-        tls_cert_key_path: tls_cert.zip(tls_key),
-    })
+    tetra::agent::dev_listener::WebSocketServerConfig::serve(
+        tetra::agent::dev_listener::WebSocketServerConfig {
+            listen,
+            controller_public_key,
+            enrollment_token,
+            identity_dir,
+            tls_cert_key_path: tls_cert.zip(tls_key),
+        },
+    )
     .await
 }
 
 async fn agent_connect(cli: AgentConnectCli) -> Result<()> {
-    let text = fs::read_to_string(&cli.config)
-        .with_context(|| format!("failed to read config `{}`", cli.config.display()))?;
-    let transport: TransportConfig =
-        serde_json::from_str(&text).context("failed to parse transport config JSON")?;
+    anyhow::ensure!(
+        RuntimeConfig::load(&cli.runtime_config)?.remote.enabled,
+        "remote control is disabled; set remote.enabled to true in `{}`",
+        cli.runtime_config.display()
+    );
 
-    websocket::run(WebSocketAgentConfig {
-        transport,
-        host_id: cli.host_id,
-        reconnect: cli.reconnect,
-    })
-    .await
+    let transport = cli
+        .config
+        .map(|path| -> Result<TransportConfig> {
+            let text = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read config `{}`", path.display()))?;
+            serde_json::from_str(&text).context("failed to parse transport config JSON")
+        })
+        .transpose()?;
+    // Re-resolved on every reload, so `tetra unenroll` drops the session.
+    let resolve = move || -> Result<WebSocketAgentConfig> {
+        let enrollment = Enrollment::load(&cli.enrollment_dir)?;
+        let host_id = cli
+            .host_id
+            .clone()
+            .or_else(|| {
+                enrollment
+                    .as_ref()
+                    .map(|enrollment| enrollment.controller.host_id.clone())
+            })
+            .context("this host is not enrolled; run `tetra enroll` or pass --host-id")?;
+        let transport = transport
+            .clone()
+            .or_else(|| enrollment.as_ref().map(Enrollment::transport))
+            .context("this host is not enrolled; run `tetra enroll` or pass --config")?;
+        Ok(WebSocketAgentConfig {
+            transport,
+            host_id,
+            reconnect: cli.reconnect,
+        })
+    };
+
+    let (sender, settings) = watch::channel(Some(resolve()?));
+    let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), DEFAULT_QUEUE_CAPACITY);
+    let select = move |config: &RuntimeConfig| {
+        config
+            .remote
+            .enabled
+            .then(&resolve)?
+            .inspect_err(|error| {
+                eprintln!("{error:#}; remote control disabled");
+            })
+            .ok()
+    };
+    tokio::select! {
+        () = remote::supervise(settings, queue) => Ok(()),
+        result = remote::reload_on_hangup(cli.runtime_config, sender, select) => result,
+    }
 }

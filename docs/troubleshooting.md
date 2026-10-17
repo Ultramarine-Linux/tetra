@@ -39,9 +39,9 @@ is trusted:
 ```json
 {
   "control_plane_url": "wss://dashboard.example.com/tetra/agent",
-  "client_cert_path": "/var/lib/tetra/identity/agent.crt",
-  "client_key_path": "/var/lib/tetra/identity/agent.key",
-  "server_ca_path": "/var/lib/tetra/identity/dashboard-ca.crt"
+  "client_cert_path": "/var/lib/tetra/remote/client.crt",
+  "client_key_path": "/var/lib/tetra/remote/client.key",
+  "server_ca_path": "/var/lib/tetra/remote/server-ca.crt"
 }
 ```
 
@@ -50,12 +50,19 @@ Common causes:
 - The `server_ca_path` does not match the CA that signed the server certificate.
 - The hostname in `control_plane_url` does not match the certificate SAN.
 
+### `unrecognized subcommand 'agent-ws-serve'`
+
+The TCP listener is development-only and is compiled only with the
+`dev-listener` feature. Build with `cargo run --features dev-listener -- ...`.
+Release builds intentionally leave it out; local clients use the Unix socket
+at `/run/tetra/tetra.sock`.
+
 ### `agent-ws-serve` refuses to bind to a non-loopback address
 
 Non-loopback addresses require TLS. Provide both `--tls-cert` and `--tls-key`:
 
 ```sh
-cargo run -- agent-ws-serve \
+cargo run --features dev-listener -- agent-ws-serve \
   --listen 0.0.0.0:7780 \
   --tls-cert /etc/tetra/tetra.crt \
   --tls-key /etc/tetra/tetra.key \
@@ -82,7 +89,7 @@ The `TETRA_IDENTITY_DIR` environment variable overrides the default path.
 will accept commands. Pass it on startup:
 
 ```sh
-cargo run -- agent-ws-serve \
+cargo run --features dev-listener -- agent-ws-serve \
   --listen 127.0.0.1:7780 \
   --controller-public-key "$TETRA_CONTROLLER_PUBLIC_KEY"
 ```
@@ -224,7 +231,7 @@ Set `RUST_LOG` before running Tetra:
 
 ```sh
 RUST_LOG=debug cargo run -- agent-connect --config examples/transport.json --host-id myhost
-RUST_LOG=trace cargo run -- agent-ws-serve --listen 127.0.0.1:7780 ...
+RUST_LOG=trace cargo run --features dev-listener -- agent-ws-serve --listen 127.0.0.1:7780 ...
 ```
 
 ### Dry-run before applying mutations
