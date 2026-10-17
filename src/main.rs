@@ -10,11 +10,11 @@ use clap::{Parser, Subcommand};
 
 use tetra::{
     agent::{
-        AgentCommand, backend,
+        AgentCommand, backend, local_socket,
         transport::TransportConfig,
         vsock::VsockAgentConfig,
         websocket::{self, WebSocketAgentConfig},
-        websocket_server::{self, WebSocketServerConfig},
+        websocket_server::{self, ServerState, WebSocketServerConfig},
     },
     catalog::{RenderOptions, RenderedResource},
     enrollment,
@@ -27,11 +27,11 @@ use tetra::{
 /// - **Recipe rendering** (`render`) — pure local tooling that turns a YAML
 ///   recipe + Tera templates into container unit and companion files. No agent
 ///   backend, no transport.
-/// - **Agent** (`agent-dispatch`, `agent-vsock-serve`, `agent-connect`,
-///   `agent-ws-serve`) — the same Kameo-backed dispatcher exposed through
-///   different surfaces: a one-shot CLI, a vsock smoke-test listener, an
-///   outbound WSS control-plane connection, and an authenticated inbound
-///   WebSocket for the dashboard.
+/// - **Agent** (`agent-serve`, `agent-dispatch`, `agent-vsock-serve`,
+///   `agent-connect`, `agent-ws-serve`) — the same Kameo-backed dispatcher
+///   exposed through different surfaces: the local Unix socket daemon, a
+///   one-shot CLI, a vsock smoke-test listener, an outbound WSS control-plane
+///   connection, and a development TCP WebSocket listener.
 #[derive(Debug, Parser)]
 #[command(
     author,
@@ -48,6 +48,9 @@ enum Commands {
     /// Render a Tetra app recipe into container unit files with Tera templates.
     Render(RenderCli),
 
+    /// Run the host agent daemon, serving local clients over a Unix socket.
+    AgentServe(AgentServeCli),
+
     /// Dispatch one signed agent command envelope locally.
     AgentDispatch(AgentDispatchCli),
 
@@ -57,7 +60,7 @@ enum Commands {
     /// Connect the local agent backend to an outbound WSS control plane.
     AgentConnect(AgentConnectCli),
 
-    /// Serve an authenticated WebSocket for a dashboard client.
+    /// Serve an authenticated WebSocket over TCP (development only).
     AgentWsServe(AgentWsServeCli),
 
     /// Enroll this host with an Ultramarine Dashboard.
@@ -90,6 +93,25 @@ struct RenderCli {
 struct AgentDispatchCli {
     /// JSON command envelope to dispatch. Reads stdin when omitted.
     command: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct AgentServeCli {
+    /// Unix socket to bind when not started by systemd socket activation.
+    #[arg(long, env = "TETRA_SOCKET", default_value = local_socket::DEFAULT_SOCKET_PATH)]
+    socket: PathBuf,
+
+    /// URL-safe base64 Ed25519 public key enrolled for the dashboard controller.
+    #[arg(long, env = "TETRA_CONTROLLER_PUBLIC_KEY")]
+    controller_public_key: Option<String>,
+
+    /// One-time token accepted to enroll a controller while no key is stored.
+    #[arg(long, env = "TETRA_ENROLLMENT_TOKEN")]
+    enrollment_token: Option<String>,
+
+    /// Mutable identity directory. Defaults to /var/lib/tetra/identity.
+    #[arg(long, default_value = "/var/lib/tetra/identity")]
+    identity_dir: PathBuf,
 }
 
 #[derive(Debug, Parser)]
@@ -184,6 +206,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Render(cli) => render(cli),
+        Commands::AgentServe(cli) => agent_serve(cli).await,
         Commands::AgentDispatch(cli) => agent_dispatch(cli).await,
         Commands::AgentVsockServe(cli) => cli.serve(),
         Commands::AgentConnect(cli) => agent_connect(cli).await,
@@ -254,6 +277,17 @@ async fn agent_dispatch(cli: AgentDispatchCli) -> Result<()> {
     let response = backend::dispatch_with_default_backend(command).await?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
+}
+
+async fn agent_serve(cli: AgentServeCli) -> Result<()> {
+    let state = ServerState::load(
+        &cli.identity_dir,
+        cli.controller_public_key,
+        cli.enrollment_token,
+    )?;
+    let listener = local_socket::listener(&cli.socket)?;
+    state.log_identity();
+    local_socket::serve(listener, state).await
 }
 
 async fn agent_ws_serve(

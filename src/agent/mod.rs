@@ -13,14 +13,17 @@
 //!   command runner, and the shared SELinux-labeling helper.
 //! - [`backend`] wraps the dispatcher in a Kameo actor so transports can handle
 //!   commands concurrently without sharing a `&mut Dispatcher`.
-//! - Transports — [`vsock`] and [`websocket`] — feed the same envelope shape
-//!   into the same backend. [`transport`] holds the shared endpoint-parsing config.
+//! - Transports — [`local_socket`], [`vsock`] and [`websocket`] — feed the same
+//!   envelope shape into the same backend. [`local_socket`] is the only
+//!   listener in production; [`transport`] holds the shared endpoint-parsing
+//!   config.
 
 pub mod backend;
 pub mod command;
 pub mod crypto;
 pub mod dispatcher;
 pub mod identity;
+pub mod local_socket;
 pub mod messages;
 pub mod module_support;
 pub mod modules;

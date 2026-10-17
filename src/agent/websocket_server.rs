@@ -1,15 +1,19 @@
-//! Development inbound WebSocket server for dashboard-to-Tetra connections.
+//! Inbound authenticated WebSocket protocol for dashboard-to-Tetra connections.
+//!
+//! [`ServerState`] runs the protocol on any byte stream. In production it is
+//! served over the local Unix socket ([`super::local_socket`]); the TCP
+//! listener in [`WebSocketServerConfig::serve`] is for development only.
 //!
 //! This is intentionally separate from `websocket.rs`, which is the outbound
-//! production control-plane transport. The server requires an explicitly
-//! configured controller public key and authenticates before dispatching frames.
+//! control-plane transport. The server requires an explicitly configured
+//! controller public key and authenticates before dispatching frames.
 
 use std::{
     collections::BTreeMap,
     fs::File,
     io::BufReader,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -82,52 +86,29 @@ impl WebSocketServerConfig {
         let tls_acceptor = self.tls_acceptor()?;
         validate_listener_security(&self.listen, tls_acceptor.is_some())?;
 
-        let identity = HostIdentity::load_or_generate(&self.identity_dir)?;
-        let persisted_controller_key = identity.load_controller_key()?;
-        let controller_public_key =self.controller_public_key.map(|configured| {
-            if let Some(persisted) = &persisted_controller_key {
-                ensure!(
-                    persisted == &configured,
-                    "configured controller key differs from the enrolled key; rotate it explicitly"
-                );
-            } else {
-                // `--controller-public-key` is a bootstrap convenience. Keep
-                // it in the mutable identity store so the agent does not become
-                // unpaired on its next restart.
-                identity.enroll_controller_key(&configured)?;
-            }
-            Ok(configured)
-        }).transpose()?.or(persisted_controller_key)
-        .map(|key| parse_verifying_key(&key).context("invalid controller public key"))
-        .transpose()?;
+        let state = ServerState::load(
+            &self.identity_dir,
+            self.controller_public_key,
+            self.enrollment_token,
+        )?;
         let listener = TcpListener::bind(self.listen).await.with_context(|| {
             format!(
                 "failed to bind development WebSocket listener on {}",
                 self.listen
             )
         })?;
-        let dispatcher = crate::agent::Dispatcher::full();
-        let privileged_actions = build_privilege_map(&dispatcher);
-        let queue = DispatchQueue::spawn(AgentBackend::spawn(dispatcher), DEFAULT_QUEUE_CAPACITY);
 
         eprintln!(
             "serving authenticated Tetra WebSocket on {}://{}",
             if tls_acceptor.is_some() { "wss" } else { "ws" },
             self.listen
         );
-        eprintln!("host identity: {}", identity.path().display());
-        eprintln!(
-            "host fingerprint: {}",
-            public_key_fingerprint(&identity.verifying_key())
-        );
+        state.log_identity();
 
         loop {
             let (stream, peer) = listener.accept().await?;
-            let queue = queue.clone();
-            let identity = identity.clone();
-            let enrollment_token = self.enrollment_token.clone();
+            let state = state.clone();
             let tls_acceptor = tls_acceptor.clone();
-            let privileged_actions = privileged_actions.clone();
             tokio::spawn(async move {
                 let stream = match tls_acceptor {
                     Some(acceptor) => match acceptor.accept(stream).await {
@@ -139,27 +120,106 @@ impl WebSocketServerConfig {
                     },
                     None => Box::new(stream) as Box<dyn AsyncReadWrite>,
                 };
-                if let Err(error) = handle_connection(ConnectionHandler {
-                    stream,
-                    peer,
-                    queue,
-                    identity,
-                    controller_key: controller_public_key,
-                    enrollment_token,
-                    privileged_actions: privileged_actions.clone(),
-                })
-                .await
-                {
-                    eprintln!("WebSocket peer {peer} closed with error: {error:?}");
-                }
+                state.handle(stream, peer.to_string()).await;
             });
+        }
+    }
+}
+
+/// Everything an inbound connection needs, independent of the listener it
+/// arrived on (development TCP listener or the local Unix socket).
+#[derive(Clone)]
+pub struct ServerState {
+    queue: DispatchQueue,
+    identity: HostIdentity,
+    controller_key: Option<VerifyingKey>,
+    enrollment_token: Option<String>,
+    privileged_actions: BTreeMap<String, Vec<String>>,
+}
+
+impl ServerState {
+    /// Load the host identity and controller key, and spawn the dispatcher
+    /// that every connection (and the remote control-plane session) shares.
+    ///
+    /// `controller_public_key` is a bootstrap convenience: when no key is
+    /// enrolled yet it is persisted, and when one is it must match.
+    pub fn load(
+        identity_dir: &Path,
+        controller_public_key: Option<String>,
+        enrollment_token: Option<String>,
+    ) -> Result<Self> {
+        let identity = HostIdentity::load_or_generate(identity_dir)?;
+        let persisted_controller_key = identity.load_controller_key()?;
+        let controller_key = controller_public_key
+            .map(|configured| {
+                if let Some(persisted) = &persisted_controller_key {
+                    ensure!(
+                        persisted == &configured,
+                        "configured controller key differs from the enrolled key; rotate it explicitly"
+                    );
+                } else {
+                    // Keep it in the mutable identity store so the agent does
+                    // not become unpaired on its next restart.
+                    identity.enroll_controller_key(&configured)?;
+                }
+                Ok(configured)
+            })
+            .transpose()?
+            .or(persisted_controller_key)
+            .map(|key| parse_verifying_key(&key).context("invalid controller public key"))
+            .transpose()?;
+        let dispatcher = crate::agent::Dispatcher::full();
+        let privileged_actions = build_privilege_map(&dispatcher);
+        let queue = DispatchQueue::spawn(AgentBackend::spawn(dispatcher), DEFAULT_QUEUE_CAPACITY);
+        Ok(Self {
+            queue,
+            identity,
+            controller_key,
+            enrollment_token,
+            privileged_actions,
+        })
+    }
+
+    /// The dispatch queue shared by every transport served from this state.
+    #[must_use]
+    pub const fn queue(&self) -> &DispatchQueue {
+        &self.queue
+    }
+
+    pub fn log_identity(&self) {
+        eprintln!("host identity: {}", self.identity.path().display());
+        eprintln!(
+            "host fingerprint: {}",
+            public_key_fingerprint(&self.identity.verifying_key())
+        );
+    }
+
+    /// Run the authenticated WebSocket protocol on one accepted stream until
+    /// the peer disconnects. Errors are logged, not returned, so a misbehaving
+    /// client cannot take down the listener.
+    pub async fn handle<S>(self, stream: S, peer: String)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let result = handle_connection(ConnectionHandler {
+            stream: Box::new(stream),
+            peer: peer.clone(),
+            queue: self.queue,
+            identity: self.identity,
+            controller_key: self.controller_key,
+            enrollment_token: self.enrollment_token,
+            privileged_actions: self.privileged_actions,
+        })
+        .await;
+        if let Err(error) = result {
+            eprintln!("WebSocket peer {peer} closed with error: {error:?}");
         }
     }
 }
 
 struct ConnectionHandler {
     stream: Box<dyn AsyncReadWrite>,
-    peer: SocketAddr,
+    peer: String,
     queue: DispatchQueue,
     identity: HostIdentity,
     controller_key: Option<VerifyingKey>,
@@ -171,7 +231,7 @@ type WebSocket = tokio_tungstenite::WebSocketStream<Box<dyn AsyncReadWrite>>;
 
 struct AuthenticatedConnection {
     socket: WebSocket,
-    peer: SocketAddr,
+    peer: String,
     queue: DispatchQueue,
     session: AuthenticatedSession,
     privileged_actions: BTreeMap<String, Vec<String>>,
@@ -679,7 +739,7 @@ mod tests {
             let (stream, peer) = listener.accept().await.unwrap();
             handle_connection(ConnectionHandler {
                 stream: Box::new(stream),
-                peer,
+                peer: peer.to_string(),
                 queue,
                 identity,
                 controller_key: None,
@@ -759,7 +819,7 @@ mod tests {
             let (stream, peer) = listener.accept().await.unwrap();
             handle_connection(ConnectionHandler {
                 stream: Box::new(stream),
-                peer,
+                peer: peer.to_string(),
                 queue,
                 identity,
                 controller_key: Some(controller_key),

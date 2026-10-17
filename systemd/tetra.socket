@@ -1,0 +1,13 @@
+[Unit]
+Description=Tetra Host Agent local socket
+
+[Socket]
+ListenStream=/run/tetra/tetra.sock
+SocketUser=root
+SocketGroup=tetra
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

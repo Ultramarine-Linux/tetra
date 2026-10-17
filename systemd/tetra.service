@@ -1,17 +1,17 @@
 [Unit]
 Description=Tetra Host Agent
-After=network-online.target
+Requires=tetra.socket
+After=tetra.socket network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 Environment="RUST_LOG=info"
 Environment="TETRA_IDENTITY_DIR=/var/lib/tetra/identity"
-Environment="TETRA_LISTEN=0.0.0.0:7780"
-EnvironmentFile=-/etc/tetra/enrollment.env
-ExecStart=/usr/bin/tetra agent-ws-serve --listen ${TETRA_LISTEN} --identity-dir /var/lib/tetra/identity --tls-cert /etc/tetra/tetra.crt --tls-key /etc/tetra/tetra.key
+ExecStart=/usr/bin/tetra agent-serve --identity-dir /var/lib/tetra/identity
 Restart=on-failure
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
+Also=tetra.socket
