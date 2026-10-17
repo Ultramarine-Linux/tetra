@@ -14,6 +14,9 @@ tetra/
 │   ├── lib.rs           # Public API: agent + catalog + prelude
 │   ├── catalog.rs       # Recipe engine (YAML → Tera → Quadlet units)
 │   ├── types.rs          # Shared module payload types (serde)
+│   ├── enrollment/
+│   │   ├── mod.rs        # `tetra enroll` / `tetra unenroll` (CSR, device flow)
+│   │   └── store.rs      # Root-only enrollment record under /var/lib/tetra/remote
 │   └── agent/
 │       ├── mod.rs              # Re-exports and module-level docs
 │       ├── dispatcher.rs       # Command routing registry
@@ -220,7 +223,10 @@ firewall/NAT issues because the connection is outbound. It is gated by
 `remote.enabled` in `/etc/tetra/tetra.json` (default `false`). `agent-serve`
 re-reads the file on `SIGHUP`, starts the session when the gate opens and drops
 it when the gate closes. `agent-connect` runs the session standalone under the
-same gate.
+same gate. The client certificate, server CA, host id and URL come from the
+enrollment written by `tetra enroll` (see
+[remote-enrollment.md](remote-enrollment.md)) unless `remote.*` overrides them.
+Disabling the gate keeps the enrollment; `tetra unenroll` removes it.
 
 Key files:
 
@@ -283,7 +289,8 @@ Default mutable paths (bootc-friendly):
 
 | Path                       | Purpose                                     |
 | -------------------------- | ------------------------------------------- |
-| `/var/lib/tetra/identity/` | Host Ed25519 keypair and mTLS certificates. |
+| `/var/lib/tetra/identity/` | Host Ed25519 keypair and controller key.    |
+| `/var/lib/tetra/remote/`   | Remote-control client key, certificate, server CA and controller record (root-only). |
 | `/run/tetra/`              | Runtime/session data.                       |
 | `/var/lib/tetra/config/`   | Optional configuration overrides.           |
 

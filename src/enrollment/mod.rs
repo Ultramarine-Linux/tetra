@@ -1,38 +1,60 @@
-//! Host-initiated, device-code enrollment with an Ultramarine Dashboard.
+//! Host-initiated, device-code enrollment for outbound remote control.
+//!
+//! The host generates a key pair and a certificate signing request with the
+//! `clientAuth` extended key usage. Once an administrator approves the
+//! request, the controller signs it and returns the client certificate that
+//! `agent-connect` (or `agent-serve` with `remote.enabled`) presents over
+//! mTLS. Nothing is registered for inbound connections: the host only ever
+//! dials out. See `docs/remote-enrollment.md` for the controller side.
 
-use std::{env, io::Write, process::Command, time::Duration};
+pub mod store;
+
+use std::{env, io::Write, path::PathBuf, process::Command, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
+    KeyUsagePurpose, PublicKeyData,
+};
 use reqwest::Client;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
-use crate::agent::{crypto::public_key_fingerprint, identity::HostIdentity};
+use crate::agent::config::RuntimeConfig;
+use store::{ControllerRecord, Credentials, Enrollment};
+
+/// Version of the enrollment request/response shape. See
+/// `docs/remote-enrollment.md`.
+const ENROLLMENT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct Options {
     pub dashboard_url: Option<String>,
-    pub agent_url: Option<String>,
-    pub listen: Option<String>,
     pub display_name: Option<String>,
-    pub approval_file: Option<std::path::PathBuf>,
+    pub approval_file: Option<PathBuf>,
     pub verification_url: Option<String>,
-    pub identity_dir: String,
-    pub config_dir: String,
+    /// Runtime config whose `remote.enabled` gates enrollment.
+    pub runtime_config: PathBuf,
+    /// Where the key, certificate and controller record are stored.
+    pub enrollment_dir: PathBuf,
     pub hostname: Option<String>,
     pub insecure: bool,
     pub skip_service: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct UnenrollOptions {
+    pub enrollment_dir: PathBuf,
+    pub skip_service: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct CreateRequest<'a> {
+    enrollment_version: u32,
     display_name: &'a str,
     hostname: &'a str,
-    agent_url: &'a str,
-    host_public_key: &'a str,
-    tls_ca_certificate: &'a str,
+    csr: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,17 +70,49 @@ struct CreateResponse {
 #[derive(Debug, Deserialize)]
 struct PollResponse {
     status: String,
-    controller_public_key: Option<String>,
+    #[serde(flatten)]
+    approval: Option<Approval>,
 }
 
+/// Fields the controller returns with `"status": "approved"`.
+#[derive(Debug, Deserialize)]
+struct Approval {
+    host_id: String,
+    control_plane_url: String,
+    /// PEM client certificate signed from our CSR, leaf first.
+    client_certificate: String,
+    /// PEM CA bundle for the controller's WSS endpoint.
+    server_ca_certificate: String,
+}
+
+/// Enroll this host for outbound remote control.
+///
+/// Refuses to run while `remote.enabled` is off or while an enrollment (even a
+/// partial one) is already stored.
 #[allow(clippy::too_many_lines)]
 pub async fn run(mut options: Options) -> Result<()> {
+    let runtime = RuntimeConfig::load(&options.runtime_config)?;
+    ensure!(
+        runtime.remote.enabled,
+        "remote control is disabled; set remote.enabled to true in `{}` before enrolling",
+        options.runtime_config.display()
+    );
+    ensure!(
+        !Enrollment::exists(&options.enrollment_dir),
+        "this host is already enrolled (`{}`); run `tetra unenroll` first",
+        options.enrollment_dir.display()
+    );
+
     let dashboard_url = options
         .dashboard_url
         .take()
-        .unwrap_or_else(|| prompt("Dashboard URL", "http://127.0.0.1:3000"));
+        .unwrap_or_else(|| prompt("Controller URL", ""));
     let dashboard_url = dashboard_url.trim().trim_end_matches('/').to_owned();
-    ensure!(!dashboard_url.is_empty(), "Dashboard URL cannot be empty");
+    ensure!(!dashboard_url.is_empty(), "controller URL cannot be empty");
+    // The server CA arrives over this channel, so it must be authenticated.
+    if !dashboard_url.starts_with("https://") && !options.insecure {
+        bail!("controller URL must use https://; pass --insecure only for local development");
+    }
     let verification_url = options
         .verification_url
         .take()
@@ -72,62 +126,30 @@ pub async fn run(mut options: Options) -> Result<()> {
         .display_name
         .take()
         .unwrap_or_else(|| prompt("Host display name", &hostname));
-    let agent_url = options
-        .agent_url
-        .take()
-        .unwrap_or_else(|| prompt("Tetra WebSocket URL", &format!("wss://{hostname}:7780")));
-    let listen = options
-        .listen
-        .take()
-        .unwrap_or_else(|| prompt("Tetra listener address", "0.0.0.0:7780"));
-    ensure!(
-        listen.parse::<std::net::SocketAddr>().is_ok(),
-        "listener address must be in HOST:PORT format"
-    );
-    ensure!(
-        agent_url.starts_with("ws://") || agent_url.starts_with("wss://"),
-        "agent URL must use ws:// or wss://"
-    );
-    if agent_url.starts_with("ws://") && !options.insecure {
-        bail!("agent URL uses plaintext ws://; pass --insecure only for local development");
-    }
 
-    let identity = HostIdentity::load_or_generate(&options.identity_dir)?;
-    let host_public_key = URL_SAFE_NO_PAD.encode(identity.verifying_key().as_bytes());
-    let fingerprint = public_key_fingerprint(&identity.verifying_key());
-    let (tls_key, tls_cert) = generate_tls_material(&options.config_dir, &hostname)?;
+    let key_pair = KeyPair::generate().context("failed to generate client key pair")?;
+    let csr = certificate_signing_request(&key_pair, &hostname)?;
 
-    println!("Host identity: {}", identity.path().display());
-    println!("Host fingerprint: {fingerprint}");
-    println!("TLS certificate: {}", tls_cert.display());
-
-    let ca_certificate = std::fs::read_to_string(&tls_cert).with_context(|| {
-        format!(
-            "failed to read generated certificate `{}`",
-            tls_cert.display()
-        )
-    })?;
     let client = Client::builder()
         .danger_accept_invalid_certs(options.insecure)
         .build()
-        .context("failed to create Dashboard HTTP client")?;
+        .context("failed to create controller HTTP client")?;
     let response = client
         .post(format!("{dashboard_url}/api/tetra/device"))
         .json(&CreateRequest {
+            enrollment_version: ENROLLMENT_VERSION,
             display_name: &display_name,
             hostname: &hostname,
-            agent_url: &agent_url,
-            host_public_key: &host_public_key,
-            tls_ca_certificate: &ca_certificate,
+            csr: &csr,
         })
         .send()
         .await
-        .context("failed to create Dashboard enrollment request")?;
+        .context("failed to create enrollment request")?;
     let response = check_response(response).await?;
     let device: CreateResponse = response
         .json()
         .await
-        .context("invalid Dashboard enrollment response")?;
+        .context("invalid enrollment response")?;
     if let Some(path) = &options.approval_file {
         std::fs::write(
             path,
@@ -139,61 +161,160 @@ pub async fn run(mut options: Options) -> Result<()> {
         )?;
     }
 
-    println!();
     println!(
         "Open {}/tetra/device?code={}",
         verification_url.trim_end_matches('/'),
         device.user_code
     );
     println!("Enter enrollment code: {}", device.user_code);
-    println!("Waiting for Dashboard approval...");
+    println!("Waiting for approval...");
 
     let deadline = std::time::Instant::now()
         .checked_add(Duration::from_secs(device.expires_in))
         .context("enrollment expiry is outside the supported time range")?;
-    loop {
+    let approval = loop {
         let response = client
             .put(format!("{dashboard_url}/api/tetra/device"))
             .json(&serde_json::json!({ "device_code": device.device_code }))
             .send()
             .await
-            .context("failed to poll Dashboard enrollment")?;
+            .context("failed to poll enrollment")?;
         let status: PollResponse = check_response(response).await?.json().await?;
         match status.status.as_str() {
             "authorization_pending" => {
                 if std::time::Instant::now() >= deadline {
-                    bail!("Dashboard enrollment expired");
+                    bail!("enrollment expired");
                 }
                 sleep(Duration::from_secs(device.interval.max(1))).await;
             }
             "approved" => {
-                let controller_key = status
-                    .controller_public_key
-                    .context("Dashboard approval did not include a controller public key")?;
-                identity.enroll_controller_key(&controller_key)?;
-                write_enrollment_config(
-                    &options.config_dir,
-                    &agent_url,
-                    &tls_cert,
-                    &tls_key,
-                    &options.identity_dir,
-                    &listen,
-                )?;
-                if !options.skip_service {
-                    enable_service()?;
-                }
-                println!(
-                    "Enrollment approved. Controller key saved under {}.",
-                    options.identity_dir
-                );
-                println!("Enabled and started tetra.service.");
-                return Ok(());
+                break status
+                    .approval
+                    .context("approval is missing host_id, control_plane_url or certificates")?;
             }
-            "access_denied" => bail!("Dashboard denied the enrollment request"),
-            "expired_token" => bail!("Dashboard enrollment expired"),
-            other => bail!("Dashboard returned unknown enrollment status `{other}`"),
+            "access_denied" => bail!("the enrollment request was denied"),
+            "expired_token" => bail!("enrollment expired"),
+            other => bail!("controller returned unknown enrollment status `{other}`"),
         }
+    };
+
+    check_approval(&approval, &key_pair)?;
+    let enrollment = Enrollment::save(
+        &options.enrollment_dir,
+        ControllerRecord {
+            host_id: approval.host_id,
+            control_plane_url: approval.control_plane_url,
+            dashboard_url,
+        },
+        Credentials {
+            client_key: &key_pair.serialize_pem(),
+            client_certificate: &approval.client_certificate,
+            server_ca: &approval.server_ca_certificate,
+        },
+    )?;
+    println!(
+        "Enrollment approved as host `{}`. Client certificate: {}",
+        enrollment.controller.host_id,
+        enrollment.client_certificate_path().display()
+    );
+
+    if !options.skip_service {
+        systemctl(&["enable", "tetra.service"])?;
+        systemctl(&["reload-or-restart", "tetra.service"])?;
+        println!("tetra.service reloaded; it will connect out while remote.enabled is true.");
     }
+    Ok(())
+}
+
+/// Remove the stored client certificate, key and controller record.
+///
+/// Works whether or not remote control is enabled, and succeeds when the host
+/// is not enrolled.
+pub fn unenroll(options: &UnenrollOptions) -> Result<()> {
+    if !Enrollment::remove(&options.enrollment_dir)? {
+        println!("This host is not enrolled.");
+        return Ok(());
+    }
+    println!(
+        "Removed the enrollment in {}.",
+        options.enrollment_dir.display()
+    );
+    if !options.skip_service {
+        // Reloading makes a running agent drop its remote session.
+        systemctl(&["try-reload-or-restart", "tetra.service"])?;
+    }
+    Ok(())
+}
+
+/// PEM CSR for `key_pair`, requesting a `clientAuth`-only certificate.
+fn certificate_signing_request(key_pair: &KeyPair, hostname: &str) -> Result<String> {
+    let mut params = CertificateParams::default();
+    let mut subject = DistinguishedName::new();
+    subject.push(DnType::CommonName, hostname);
+    params.distinguished_name = subject;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    params
+        .serialize_request(key_pair)
+        .context("failed to create certificate signing request")?
+        .pem()
+        .context("failed to encode certificate signing request")
+}
+
+/// Check that the approval carries a usable outbound identity: a currently
+/// valid `clientAuth` certificate for our key and a server CA that loads.
+fn check_approval(approval: &Approval, key_pair: &KeyPair) -> Result<()> {
+    ensure!(
+        !approval.host_id.trim().is_empty() && !approval.host_id.contains(char::is_control),
+        "controller returned an invalid host id"
+    );
+    ensure!(
+        approval.control_plane_url.starts_with("wss://"),
+        "controller returned a control-plane URL that is not wss://"
+    );
+
+    let chain = pem_certificates(&approval.client_certificate, "client certificate")?;
+    let leaf = chain.first().context("client certificate is empty")?;
+    let (_, certificate) = x509_parser::parse_x509_certificate(leaf)
+        .map_err(|error| anyhow::anyhow!("failed to parse client certificate: {error}"))?;
+    ensure!(
+        certificate.public_key().raw == key_pair.subject_public_key_info().as_slice(),
+        "client certificate is not for the key generated by this host"
+    );
+    let client_auth = certificate
+        .extended_key_usage()
+        .context("failed to parse client certificate extended key usage")?
+        .is_some_and(|usage| usage.value.client_auth);
+    ensure!(client_auth, "client certificate does not allow clientAuth");
+    ensure!(
+        certificate.validity().is_valid(),
+        "client certificate is not currently valid"
+    );
+
+    let mut roots = rustls::RootCertStore::empty();
+    for ca in pem_certificates(&approval.server_ca_certificate, "server CA")? {
+        roots
+            .add(ca)
+            .context("failed to add server CA certificate")?;
+    }
+    ensure!(!roots.is_empty(), "server CA bundle is empty");
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+    // Explicit provider: library callers may not have installed a default.
+    rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .context("failed to configure TLS")?
+    .with_root_certificates(roots)
+    .with_client_auth_cert(chain, key)
+    .context("client certificate and key cannot be used for mTLS")?;
+    Ok(())
+}
+
+fn pem_certificates(pem: &str, what: &str) -> Result<Vec<CertificateDer<'static>>> {
+    rustls_pemfile::certs(&mut pem.as_bytes())
+        .collect::<std::result::Result<_, _>>()
+        .with_context(|| format!("failed to parse {what} PEM"))
 }
 
 async fn check_response(response: reqwest::Response) -> Result<reqwest::Response> {
@@ -202,11 +323,15 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
         return Ok(response);
     }
     let body = response.text().await.unwrap_or_default();
-    bail!("Dashboard request failed with HTTP {status}: {body}")
+    bail!("controller request failed with HTTP {status}: {body}")
 }
 
 fn prompt(label: &str, default: &str) -> String {
-    print!("{label} [{default}]: ");
+    if default.is_empty() {
+        print!("{label}: ");
+    } else {
+        print!("{label} [{default}]: ");
+    }
     std::mem::drop(std::io::stdout().flush());
     let mut value = String::new();
     if std::io::stdin().read_line(&mut value).is_err() {
@@ -220,62 +345,87 @@ fn prompt(label: &str, default: &str) -> String {
     }
 }
 
-fn generate_tls_material(
-    config_dir: &str,
-    hostname: &str,
-) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
-    std::fs::create_dir_all(config_dir)
-        .with_context(|| format!("failed to create `{config_dir}`"))?;
-    let key = std::path::Path::new(config_dir).join("tetra.key");
-    let cert = std::path::Path::new(config_dir).join("tetra.crt");
-    if key.exists() && cert.exists() {
-        return Ok((key, cert));
-    }
-    let status = Command::new("openssl")
-        .args([
-            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "365", "-subj",
-        ])
-        .arg(format!("/CN={hostname}"))
-        .args(["-addext", &format!("subjectAltName=DNS:{hostname}")])
-        .args(["-keyout"])
-        .arg(&key)
-        .args(["-out"])
-        .arg(&cert)
-        .status()
-        .context("failed to run openssl; install openssl before enrolling")?;
-    ensure!(status.success(), "openssl failed to generate TLS material");
-    Ok((key, cert))
-}
-
-fn enable_service() -> Result<()> {
+fn systemctl(args: &[&str]) -> Result<()> {
     let status = Command::new("systemctl")
-        .args(["enable", "--now", "tetra.service"])
+        .args(args)
         .status()
         .context("failed to run systemctl; is systemd installed?")?;
-    ensure!(
-        status.success(),
-        "systemctl failed to enable and start tetra.service"
-    );
+    ensure!(status.success(), "`systemctl {}` failed", args.join(" "));
     Ok(())
 }
 
-fn write_enrollment_config(
-    config_dir: &str,
-    agent_url: &str,
-    cert: &std::path::Path,
-    key: &std::path::Path,
-    identity_dir: &str,
-    listen: &str,
-) -> Result<()> {
-    let path = std::path::Path::new(config_dir).join("enrollment.json");
-    let value = serde_json::json!({
-        "agent_url": agent_url,
-        "tls_cert": cert,
-        "tls_key": key,
-        "identity_dir": identity_dir
-    });
-    std::fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
-    let environment_path = std::path::Path::new(config_dir).join("enrollment.env");
-    std::fs::write(environment_path, format!("TETRA_LISTEN={listen}\n"))?;
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use rcgen::{CertificateParams, IsCa, Issuer};
+    use x509_parser::prelude::FromDer;
+
+    use super::*;
+
+    fn approval_for(key_pair: &KeyPair, usage: ExtendedKeyUsagePurpose) -> Approval {
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let mut params = CertificateParams::default();
+        params.extended_key_usages = vec![usage];
+        let certificate = params.signed_by(key_pair, &issuer).unwrap();
+        Approval {
+            host_id: "host-01".into(),
+            control_plane_url: "wss://control.example.test/tetra/agent".into(),
+            client_certificate: certificate.pem(),
+            server_ca_certificate: ca.pem(),
+        }
+    }
+
+    #[test]
+    fn csr_requests_client_auth() {
+        let key_pair = KeyPair::generate().unwrap();
+        let csr = certificate_signing_request(&key_pair, "host.example.test").unwrap();
+        let der = rustls_pemfile::csr(&mut csr.as_bytes()).unwrap().unwrap();
+        let (_, request) =
+            x509_parser::certification_request::X509CertificationRequest::from_der(der.as_ref())
+                .unwrap();
+        let client_auth = request.requested_extensions().unwrap().any(|extension| {
+            matches!(
+                extension,
+                x509_parser::extensions::ParsedExtension::ExtendedKeyUsage(usage)
+                    if usage.client_auth && !usage.server_auth
+            )
+        });
+        assert!(client_auth);
+    }
+
+    #[test]
+    fn accepts_client_auth_certificate_for_our_key() {
+        let key_pair = KeyPair::generate().unwrap();
+        let approval = approval_for(&key_pair, ExtendedKeyUsagePurpose::ClientAuth);
+        check_approval(&approval, &key_pair).unwrap();
+    }
+
+    #[test]
+    fn rejects_server_certificate() {
+        let key_pair = KeyPair::generate().unwrap();
+        let approval = approval_for(&key_pair, ExtendedKeyUsagePurpose::ServerAuth);
+        let error = check_approval(&approval, &key_pair).unwrap_err();
+        assert!(error.to_string().contains("clientAuth"), "{error:#}");
+    }
+
+    #[test]
+    fn rejects_certificate_for_another_key() {
+        let key_pair = KeyPair::generate().unwrap();
+        let other = KeyPair::generate().unwrap();
+        let approval = approval_for(&other, ExtendedKeyUsagePurpose::ClientAuth);
+        let error = check_approval(&approval, &key_pair).unwrap_err();
+        assert!(error.to_string().contains("not for the key"), "{error:#}");
+    }
+
+    #[test]
+    fn rejects_plaintext_control_plane() {
+        let key_pair = KeyPair::generate().unwrap();
+        let mut approval = approval_for(&key_pair, ExtendedKeyUsagePurpose::ClientAuth);
+        approval.control_plane_url = "ws://control.example.test/tetra/agent".into();
+        check_approval(&approval, &key_pair).unwrap_err();
+    }
 }

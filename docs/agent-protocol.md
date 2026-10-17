@@ -36,9 +36,9 @@ Transport configuration:
 ```json
 {
   "control_plane_url": "wss://dashboard.example.com/tetra/agent",
-  "client_cert_path": "/etc/tetra/agent.crt",
-  "client_key_path": "/etc/tetra/agent.key",
-  "server_ca_path": "/etc/tetra/dashboard-ca.crt"
+  "client_cert_path": "/var/lib/tetra/remote/client.crt",
+  "client_key_path": "/var/lib/tetra/remote/client.key",
+  "server_ca_path": "/var/lib/tetra/remote/server-ca.crt"
 }
 ```
 
@@ -67,9 +67,11 @@ Fields:
 - `server_ca_path`: CA bundle used to verify the dashboard/control-plane server
   certificate. Required for WSS.
 
-Run the outbound agent:
+Run the outbound agent. After `tetra enroll` no flags are needed; `--config`
+and `--host-id` override the enrollment:
 
 ```sh
+tetra agent-connect
 tetra agent-connect --config /etc/tetra/agent-transport.json --host-id host-01
 ```
 
@@ -80,10 +82,10 @@ routing frames to the dashboard/control plane session for the matching VM.
 
 ### Recommended Lifecycle
 
-1. `enroll`: The host is added to the dashboard inventory and receives agent
-   credentials. This may be manual, QR/token based, or handled by a package
-   installer. Enrollment should produce a stable host id and mTLS client
-   credential.
+1. `enroll`: `tetra enroll` (only while `remote.enabled` is true) sends a CSR
+   with the `clientAuth` extended key usage. After approval the controller
+   returns the signed client certificate, its server CA, a stable host id and
+   the `wss://` URL. See [remote-enrollment.md](remote-enrollment.md).
 2. `connect`: The agent opens `control_plane_url`. For WSS, it uses mTLS and
    the dashboard verifies the client certificate. For vsock, the host-side
    acceptor maps the stream to the VM inventory record before forwarding frames

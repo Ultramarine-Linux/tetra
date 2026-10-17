@@ -33,6 +33,7 @@ to render.
 - [Agent protocol reference](docs/agent-protocol.md) — Connection negotiation, authentication, and the full module action catalog.
 - [Recipe authoring guide](docs/recipes.md) — How to write recipes, parameters, templates, and resources.
 - [Architecture overview](docs/architecture.md) — Crate layout, dispatcher, queue, transports, and how to add a module.
+- [Remote enrollment](docs/remote-enrollment.md) — The controller side of `tetra enroll` and the outbound mTLS connection.
 - [Troubleshooting](docs/troubleshooting.md) — Common issues with TLS, identity, WebSocket auth, recipe rendering, SELinux, and queue backpressure.
 
 ## Feature Flags
@@ -168,6 +169,15 @@ Remote control ships disabled. `agent-serve` connects out only while
 (override with `--config` or `TETRA_CONFIG`). A missing file means remote
 control is off, and an unreadable or invalid file turns it off too.
 
+After [`tetra enroll`](#host-enrollment), the gate is all the config needs; the
+host id, control-plane URL and mTLS material come from the enrollment:
+
+```json
+{ "remote": { "enabled": true } }
+```
+
+`remote.host_id` and `remote.transport` override the enrollment when set:
+
 ```json
 {
   "remote": {
@@ -175,9 +185,9 @@ control is off, and an unreadable or invalid file turns it off too.
     "host_id": "host-01",
     "transport": {
       "control_plane_url": "wss://dashboard.example.com/tetra/agent",
-      "client_cert_path": "/var/lib/tetra/identity/agent.crt",
-      "client_key_path": "/var/lib/tetra/identity/agent.key",
-      "server_ca_path": "/var/lib/tetra/identity/dashboard-ca.crt"
+      "client_cert_path": "/var/lib/tetra/remote/client.crt",
+      "client_key_path": "/var/lib/tetra/remote/client.key",
+      "server_ca_path": "/var/lib/tetra/remote/server-ca.crt"
     }
   }
 }
@@ -188,12 +198,14 @@ control is off, and an unreadable or invalid file turns it off too.
 session; disabling it drops any live session immediately. A reload that
 leaves `remote` unchanged keeps the current session.
 
-`agent-connect` runs the same outbound session on its own, with the transport
-config in a separate file. It obeys the same gate: it refuses to start unless
-`remote.enabled` is `true`, and it drops the session when a `SIGHUP` reload
-turns it off:
+`agent-connect` runs the same outbound session on its own. It uses the
+enrollment by default; `--config` (a transport file) and `--host-id` override
+it. It obeys the same gate: it refuses to start unless `remote.enabled` is
+`true`, and it drops the session when a `SIGHUP` reload turns it off or finds
+the enrollment removed:
 
 ```sh
+cargo run -- agent-connect --runtime-config examples/tetra.json
 cargo run -- agent-connect --config examples/transport.json --host-id myhost \
   --runtime-config examples/tetra.json
 ```
@@ -234,34 +246,67 @@ user is in `tetra`).
 
 ## Host enrollment
 
-The host-side `enroll` command uses a device authorization flow. It generates
-the host identity and TLS material, prints a Dashboard verification URL and
-short approval code, then waits for an authenticated Dashboard user to approve
-the request:
+Remote control is outbound only: the host dials the controller over WSS and
+authenticates with an mTLS client certificate. Nothing listens on the network
+and no inbound address is registered.
 
-```text
-tetra enroll --dashboard-url https://dashboard.example.com \\
-  --agent-url wss://host.example.com:9443 \\
-  --listen 0.0.0.0:9443 \\
-  --display-name host-01
+`tetra enroll` obtains that certificate with a device authorization flow:
+
+1. Tetra checks that `remote.enabled` is `true` in `/etc/tetra/tetra.json`
+   and refuses to run otherwise. It also refuses if the host is already
+   enrolled.
+2. It generates a fresh ECDSA P-256 key pair and a certificate signing request
+   with the `clientAuth` extended key usage. The private key never leaves the
+   host.
+3. It sends the CSR to the controller, prints a verification URL and a short
+   approval code, and waits for an administrator to approve the request.
+4. On approval the controller signs the CSR and returns the client
+   certificate, the CA bundle for its WSS endpoint, the host id and the
+   `wss://` control-plane URL. Tetra checks that the certificate is for its
+   key, allows `clientAuth` and is currently valid.
+5. Tetra stores everything root-only under `/var/lib/tetra/remote`
+   (directory `0700`, files `0600`) and reloads `tetra.service`, which then
+   connects out.
+
+```sh
+tetra enroll --dashboard-url https://control.example.com --display-name host-01
 ```
 
-The Dashboard stores the controller private key; Tetra stores only the
-controller public key. Use `--agent-url` for the address Dashboard should use
-to reach the host and `--listen` for the local bind address and port. The host's
-firewall or private network must allow the Dashboard to reach the configured
-WebSocket URL. If omitted, `--listen` defaults to `0.0.0.0:7780`.
+| File                                    | Contents                                        |
+| --------------------------------------- | ----------------------------------------------- |
+| `/var/lib/tetra/remote/client.key`      | Client private key, generated on the host.      |
+| `/var/lib/tetra/remote/client.crt`      | Client certificate signed by the controller.    |
+| `/var/lib/tetra/remote/server-ca.crt`   | CA bundle that verifies the controller's WSS.   |
+| `/var/lib/tetra/remote/controller.json` | Host id, control-plane URL and enrollment URL.  |
 
-`tetra.service` no longer runs a TCP listener, so the `--listen` and
-`--agent-url` values recorded by `enroll` are not served by the default
-install. `agent-ws-serve` is a development-only listener (`dev-listener`
-feature) and is not part of release builds.
+The controller URL must use `https://`, because the server CA is delivered over
+that connection. `--insecure` allows `http://` and invalid TLS for local
+development only. `--skip-service` skips the `systemctl` calls, for containers
+and the OOBE. `--enrollment-dir` (or `TETRA_ENROLLMENT_DIR`) changes the
+storage directory for `enroll`, `unenroll`, `agent-serve` and `agent-connect`.
+
+Setting `remote.enabled` back to `false` (and reloading) stops the connection
+but keeps the enrollment, so turning it on again reconnects without
+re-enrolling. To remove the enrollment, run:
+
+```sh
+tetra unenroll
+```
+
+This deletes the client key, certificate, server CA and controller record and
+reloads `tetra.service`, which drops any live session. It works whether or not
+remote control is enabled. It does not contact the controller; remove or
+revoke the host there as well.
+
+The controller-side API is described in
+[docs/remote-enrollment.md](docs/remote-enrollment.md).
 
 ## Authentication and Elevation
 
 Tetra uses Ed25519 asymmetric key authentication for inbound WebSocket
 sessions. The dashboard stores the private key server-side; Tetra stores only
-the controller public key. Outbound WSS uses mTLS for transport identity.
+the controller public key. Outbound WSS uses mTLS for transport identity, with
+the client certificate issued by `tetra enroll`.
 
 Mutating host actions execute by default. Privileged actions require an
 in-memory, session-bound elevation grant obtained by verifying the
