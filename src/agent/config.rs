@@ -4,20 +4,14 @@
 //! and every remote-facing feature defaults to off. Tetra re-reads the file on
 //! `SIGHUP` (`systemctl reload tetra.service`).
 //!
+//! After `tetra enroll`, turning remote control on only needs the gate; the
+//! host id and transport come from the enrollment record:
+//!
 //! ```json
-//! {
-//!   "remote": {
-//!     "enabled": true,
-//!     "host_id": "host-01",
-//!     "transport": {
-//!       "control_plane_url": "wss://control.example.com/tetra/agent",
-//!       "client_cert_path": "/var/lib/tetra/identity/agent.crt",
-//!       "client_key_path": "/var/lib/tetra/identity/agent.key",
-//!       "server_ca_path": "/var/lib/tetra/identity/control-ca.crt"
-//!     }
-//!   }
-//! }
+//! { "remote": { "enabled": true } }
 //! ```
+//!
+//! `remote.host_id` and `remote.transport` override the enrollment when set.
 
 use std::{fs, io::ErrorKind, path::Path};
 
@@ -25,6 +19,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::{transport::TransportConfig, websocket::WebSocketAgentConfig};
+use crate::enrollment::store::Enrollment;
 
 /// Default runtime configuration path.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/tetra/tetra.json";
@@ -41,9 +36,10 @@ pub struct RuntimeConfig {
 pub struct RemoteConfig {
     /// Whether Tetra may connect out at all. Off by default.
     pub enabled: bool,
-    /// Stable control-plane host id for this agent.
+    /// Stable control-plane host id for this agent. Defaults to the enrolled
+    /// host id.
     pub host_id: Option<String>,
-    /// Control-plane URL and mTLS material.
+    /// Control-plane URL and mTLS material. Defaults to the enrollment.
     pub transport: Option<TransportConfig>,
     /// Reconnect with backoff when the session closes.
     pub reconnect: bool,
@@ -89,19 +85,28 @@ impl RuntimeConfig {
 
 impl RemoteConfig {
     /// The outbound connection to run, or `None` when remote control is
-    /// disabled. Errors when it is enabled but incomplete.
-    pub fn connection(&self) -> Result<Option<WebSocketAgentConfig>> {
+    /// disabled. Settings missing from the config come from `enrollment`.
+    /// Errors when it is enabled but neither supplies them.
+    ///
+    /// Disabling remote control leaves the enrollment in place; it only stops
+    /// the connection.
+    pub fn connection(
+        &self,
+        enrollment: Option<&Enrollment>,
+    ) -> Result<Option<WebSocketAgentConfig>> {
         if !self.enabled {
             return Ok(None);
         }
         let host_id = self
             .host_id
             .clone()
-            .context("remote.enabled is true but remote.host_id is not set")?;
+            .or_else(|| enrollment.map(|enrollment| enrollment.controller.host_id.clone()))
+            .context("remote.enabled is true but this host is not enrolled; run `tetra enroll` or set remote.host_id")?;
         let transport = self
             .transport
             .clone()
-            .context("remote.enabled is true but remote.transport is not set")?;
+            .or_else(|| enrollment.map(Enrollment::transport))
+            .context("remote.enabled is true but this host is not enrolled; run `tetra enroll` or set remote.transport")?;
         Ok(Some(WebSocketAgentConfig {
             transport,
             host_id,
@@ -119,7 +124,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = RuntimeConfig::load(&dir.path().join("tetra.json")).unwrap();
         assert!(!config.remote.enabled);
-        assert_eq!(config.remote.connection().unwrap(), None);
+        assert_eq!(config.remote.connection(None).unwrap(), None);
     }
 
     #[test]
@@ -137,7 +142,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        remote.connection().unwrap_err();
+        remote.connection(None).unwrap_err();
     }
 
     #[test]
@@ -150,8 +155,56 @@ mod tests {
             } }"#,
         )
         .unwrap();
-        let connection = config.remote.connection().unwrap().unwrap();
+        let connection = config.remote.connection(None).unwrap().unwrap();
         assert_eq!(connection.host_id, "host-01");
         assert!(connection.reconnect);
+    }
+
+    fn enrollment() -> Enrollment {
+        Enrollment {
+            directory: "/var/lib/tetra/remote".into(),
+            controller: crate::enrollment::store::ControllerRecord {
+                host_id: "enrolled-host".into(),
+                control_plane_url: "wss://control.example.test/tetra/agent".into(),
+                dashboard_url: "https://control.example.test".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn enabled_remote_uses_the_enrollment() {
+        let config: RuntimeConfig =
+            serde_json::from_str(r#"{ "remote": { "enabled": true } }"#).unwrap();
+        let enrollment = enrollment();
+        let connection = config
+            .remote
+            .connection(Some(&enrollment))
+            .unwrap()
+            .unwrap();
+        assert_eq!(connection.host_id, "enrolled-host");
+        assert_eq!(connection.transport, enrollment.transport());
+    }
+
+    #[test]
+    fn disabled_remote_keeps_the_enrollment_but_does_not_connect() {
+        let config: RuntimeConfig =
+            serde_json::from_str(r#"{ "remote": { "enabled": false } }"#).unwrap();
+        assert_eq!(config.remote.connection(Some(&enrollment())).unwrap(), None);
+    }
+
+    #[test]
+    fn explicit_settings_override_the_enrollment() {
+        let config: RuntimeConfig = serde_json::from_str(
+            r#"{ "remote": { "enabled": true, "host_id": "configured-host" } }"#,
+        )
+        .unwrap();
+        let enrollment = enrollment();
+        let connection = config
+            .remote
+            .connection(Some(&enrollment))
+            .unwrap()
+            .unwrap();
+        assert_eq!(connection.host_id, "configured-host");
+        assert_eq!(connection.transport, enrollment.transport());
     }
 }

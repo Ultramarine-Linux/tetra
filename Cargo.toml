@@ -77,9 +77,13 @@ libc = "0.2"
 preinterpret = "0.2.1"
 phf = { version = "0.14.0", features = ["macros"] }
 enum_dispatch = "0.3.13"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+x509-parser = "0.18.1"
 
 [dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 tempfile = "3"
+tokio-rustls = "0.26"
 
 [lints]
 workspace = true

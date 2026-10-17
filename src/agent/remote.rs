@@ -5,7 +5,10 @@
 //! holds `Some`, and drops it (closing the socket) as soon as the value
 //! changes, so disabling remote control at runtime cuts any live session.
 
-use std::{future::Future, path::PathBuf};
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
 use tokio::{
@@ -18,6 +21,7 @@ use super::{
     queue::DispatchQueue,
     websocket::{self, WebSocketAgentConfig},
 };
+use crate::enrollment::store::Enrollment;
 
 /// Run the outbound connection whenever `settings` holds one, sharing `queue`
 /// with the local transports. Returns when the sender is dropped.
@@ -88,14 +92,23 @@ where
     Ok(())
 }
 
-/// The connection the daemon should run for `config`, logging (and treating
-/// as disabled) a remote section that is enabled but incomplete.
+/// The connection the daemon should run for `config` and the enrollment in
+/// `enrollment_dir`, logging (and treating as disabled) a remote section that
+/// is enabled but incomplete or an unreadable enrollment.
 #[must_use]
-pub fn connection_from(config: &RuntimeConfig) -> Option<WebSocketAgentConfig> {
-    config.remote.connection().unwrap_or_else(|error| {
-        eprintln!("{error:#}; remote control disabled");
-        None
-    })
+pub fn connection_from(
+    config: &RuntimeConfig,
+    enrollment_dir: &Path,
+) -> Option<WebSocketAgentConfig> {
+    if !config.remote.enabled {
+        return None;
+    }
+    Enrollment::load(enrollment_dir)
+        .and_then(|enrollment| config.remote.connection(enrollment.as_ref()))
+        .unwrap_or_else(|error| {
+            eprintln!("{error:#}; remote control disabled");
+            None
+        })
 }
 
 #[cfg(test)]
