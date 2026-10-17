@@ -536,6 +536,6 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(operations.is_empty());
+        assert_eq!(operations, Vec::<Value>::new());
     }
 }

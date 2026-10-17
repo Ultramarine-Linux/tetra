@@ -56,23 +56,26 @@ impl Actor for AgentBackend {
     type Args = Dispatcher;
     type Error = Infallible;
 
-    async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        Ok(Self::new(args))
+    fn on_start(
+        args: Self::Args,
+        _actor_ref: ActorRef<Self>,
+    ) -> impl Future<Output = Result<Self, Self::Error>> {
+        std::future::ready(Ok(Self::new(args)))
     }
 }
 
 impl Message<DispatchCommand> for AgentBackend {
     type Reply = Result<AgentResponse>;
 
-    async fn handle(
+    fn handle(
         &mut self,
         DispatchCommand(command): DispatchCommand,
         _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
+    ) -> impl Future<Output = Self::Reply> {
         // Dispatcher::dispatch takes &self, so the actor's `&mut self` here is
         // only used by Kameo to serialize messages — the dispatcher itself
         // stays freely shareable.
-        Ok(self.dispatcher.dispatch(command))
+        std::future::ready(Ok(self.dispatcher.dispatch(command)))
     }
 }
 
