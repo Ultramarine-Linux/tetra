@@ -30,7 +30,8 @@ tetra/
 │       ├── verify_password.rs  # Shadow password verification
 │       ├── transport.rs        # Shared endpoint/TLS configuration
 │       ├── websocket.rs        # Outbound WSS control-plane client
-│       ├── websocket_server.rs # Authenticated WebSocket protocol + dev TCP listener
+│       ├── websocket_server.rs # Authenticated WebSocket protocol (ServerState)
+│       ├── dev_listener.rs     # Dev-only TCP listener (`dev-listener` feature)
 │       ├── vsock.rs            # Virtio-vsock smoke-test transport
 │       ├── module_support.rs   # Shared module helpers
 │       └── modules/            # One module per host-management surface
@@ -230,13 +231,16 @@ Key files:
 
 ### Inbound WebSocket (`agent-ws-serve`)
 
-Development transport. An authenticated WebSocket listener that accepts
+Development transport, compiled only with the `dev-listener` Cargo feature.
+Release builds leave it off, so production binaries cannot listen on the
+network. An authenticated WebSocket listener that accepts
 Ed25519-signed command frames from a controller client. Requires an explicitly
 configured controller public key before accepting commands.
 
 - Loopback `ws://` is allowed without TLS.
 - Non-loopback addresses require `--tls-cert` and `--tls-key`.
-- `websocket_server.rs` — inbound listener, challenge/auth handshake, session management.
+- `dev_listener.rs` — TCP bind, optional TLS, loopback-or-TLS check.
+- `websocket_server.rs` — challenge/auth handshake and session management, shared with the local socket.
 
 ### Vsock (`agent-vsock-serve`)
 

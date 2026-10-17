@@ -1,7 +1,6 @@
 use std::{
     fs,
     io::{self, Read},
-    net::SocketAddr,
     path::PathBuf,
 };
 
@@ -19,7 +18,7 @@ use tetra::{
         transport::TransportConfig,
         vsock::VsockAgentConfig,
         websocket::WebSocketAgentConfig,
-        websocket_server::{self, ServerState, WebSocketServerConfig},
+        websocket_server::ServerState,
     },
     catalog::{RenderOptions, RenderedResource},
     enrollment,
@@ -36,7 +35,8 @@ use tetra::{
 ///   `agent-connect`, `agent-ws-serve`) — the same Kameo-backed dispatcher
 ///   exposed through different surfaces: the local Unix socket daemon, a
 ///   one-shot CLI, a vsock smoke-test listener, an outbound WSS control-plane
-///   connection, and a development TCP WebSocket listener.
+///   connection, and (with the `dev-listener` feature) a development TCP
+///   WebSocket listener.
 #[derive(Debug, Parser)]
 #[command(
     author,
@@ -66,6 +66,7 @@ enum Commands {
     AgentConnect(AgentConnectCli),
 
     /// Serve an authenticated WebSocket over TCP (development only).
+    #[cfg(feature = "dev-listener")]
     AgentWsServe(AgentWsServeCli),
 
     /// Enroll this host with an Ultramarine Dashboard.
@@ -123,11 +124,12 @@ struct AgentServeCli {
     identity_dir: PathBuf,
 }
 
+#[cfg(feature = "dev-listener")]
 #[derive(Debug, Parser)]
 struct AgentWsServeCli {
     /// Loopback address for the WebSocket listener.
     #[arg(long, default_value = "127.0.0.1:7780")]
-    listen: SocketAddr,
+    listen: std::net::SocketAddr,
 
     /// URL-safe base64 Ed25519 public key enrolled for the dashboard controller.
     #[arg(long, env = "TETRA_CONTROLLER_PUBLIC_KEY")]
@@ -228,6 +230,7 @@ async fn main() -> Result<()> {
         Commands::AgentDispatch(cli) => agent_dispatch(cli).await,
         Commands::AgentVsockServe(cli) => cli.serve(),
         Commands::AgentConnect(cli) => agent_connect(cli).await,
+        #[cfg(feature = "dev-listener")]
         Commands::AgentWsServe(cli) => agent_ws_serve(cli).await,
         Commands::Enroll(cli) => {
             enrollment::run(enrollment::Options {
@@ -316,6 +319,7 @@ async fn agent_serve(cli: AgentServeCli) -> Result<()> {
     }
 }
 
+#[cfg(feature = "dev-listener")]
 async fn agent_ws_serve(
     AgentWsServeCli {
         listen,
@@ -330,13 +334,15 @@ async fn agent_ws_serve(
         tls_cert.as_ref().xor(tls_key.as_ref()).is_none(),
         "--tls-cert and --tls-key must be supplied together"
     );
-    websocket_server::WebSocketServerConfig::serve(WebSocketServerConfig {
-        listen,
-        controller_public_key,
-        enrollment_token,
-        identity_dir,
-        tls_cert_key_path: tls_cert.zip(tls_key),
-    })
+    tetra::agent::dev_listener::WebSocketServerConfig::serve(
+        tetra::agent::dev_listener::WebSocketServerConfig {
+            listen,
+            controller_public_key,
+            enrollment_token,
+            identity_dir,
+            tls_cert_key_path: tls_cert.zip(tls_key),
+        },
+    )
     .await
 }
 

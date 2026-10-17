@@ -22,6 +22,8 @@ pub mod backend;
 pub mod command;
 pub mod config;
 pub mod crypto;
+#[cfg(feature = "dev-listener")]
+pub mod dev_listener;
 pub mod dispatcher;
 pub mod identity;
 pub mod local_socket;

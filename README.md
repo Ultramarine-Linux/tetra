@@ -17,7 +17,8 @@ off unless `remote.enabled` is set in `/etc/tetra/tetra.json`. When the agent ru
 be carried over a virtio-vsock stream.
 
 For development, `agent-ws-serve` runs the same authenticated WebSocket
-protocol on a TCP listener.
+protocol on a TCP listener. It is only compiled with the `dev-listener`
+feature, so release builds cannot listen on the network.
 
 The local `agent-dispatch` command accepts the same command envelope shape for
 one-shot debugging. See [docs/agent-protocol.md](docs/agent-protocol.md) for
@@ -55,6 +56,8 @@ Default build features:
 Additional optional features:
 
 - `virtual-machines`
+- `dev-listener`: the development TCP listener (`agent-ws-serve`). Leave it
+  off in release builds.
 
 Build with every module:
 
@@ -138,12 +141,13 @@ ignored. With Node's `ws`, use `ws+unix:///run/tetra/tetra.sock`.
 
 ### Inbound WebSocket server (development)
 
-`agent-ws-serve` runs an authenticated WebSocket for dashboard clients. It
-requires an enrolled controller Ed25519 public key before accepting commands.
+`agent-ws-serve` runs an authenticated WebSocket on TCP. It is only built
+with the `dev-listener` feature (add `--features dev-listener` to the commands
+below). It requires an enrolled controller Ed25519 public key before accepting commands.
 The host identity is automatically generated under `/var/lib/tetra/identity`:
 
 ```sh
-cargo run -- agent-ws-serve \
+cargo run --features dev-listener -- agent-ws-serve \
   --listen 127.0.0.1:7780 \
   --controller-public-key "$TETRA_CONTROLLER_PUBLIC_KEY"
 ```
@@ -151,7 +155,7 @@ cargo run -- agent-ws-serve \
 For non-loopback addresses, TLS is required:
 
 ```sh
-cargo run -- agent-ws-serve \
+cargo run --features dev-listener -- agent-ws-serve \
   --listen 0.0.0.0:7780 \
   --tls-cert /etc/tetra/tetra.crt \
   --tls-key /etc/tetra/tetra.key
@@ -250,8 +254,8 @@ WebSocket URL. If omitted, `--listen` defaults to `0.0.0.0:7780`.
 
 `tetra.service` no longer runs a TCP listener, so the `--listen` and
 `--agent-url` values recorded by `enroll` are not served by the default
-install. Run `agent-ws-serve` yourself if a Dashboard must reach this host
-over the network.
+install. `agent-ws-serve` is a development-only listener (`dev-listener`
+feature) and is not part of release builds.
 
 ## Authentication and Elevation
 
