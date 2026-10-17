@@ -19,7 +19,9 @@ tetra/
 │       ├── dispatcher.rs       # Command routing registry
 │       ├── backend.rs          # Kameo actor wrapping the dispatcher
 │       ├── queue.rs            # Bounded transport-to-dispatch queue
+│       ├── remote.rs           # remote.enabled gate for the outbound session
 │       ├── command.rs          # AgentCommand / AgentResponse types
+│       ├── config.rs           # Runtime config (/etc/tetra/tetra.json)
 │       ├── messages.rs         # Internal actor message types
 │       ├── protocol.rs         # JSON frame protocol for transports
 │       ├── crypto.rs           # Ed25519 signing/verification
@@ -210,13 +212,19 @@ itself. It carries the same authenticated WebSocket protocol as
 - `local_socket.rs` — socket activation, fallback bind, accept loop.
 - `websocket_server.rs` — `ServerState`, the per-connection protocol shared with the TCP listener.
 
-### Outbound WSS (`agent-connect`)
+### Outbound WSS (remote control)
 
-Tetra dials out to the dashboard/control plane over WSS
-using mTLS. This avoids firewall/NAT issues because the connection is outbound.
+Tetra dials out to a control plane over WSS using mTLS. This avoids
+firewall/NAT issues because the connection is outbound. It is gated by
+`remote.enabled` in `/etc/tetra/tetra.json` (default `false`). `agent-serve`
+re-reads the file on `SIGHUP`, starts the session when the gate opens and drops
+it when the gate closes. `agent-connect` runs the session standalone under the
+same gate.
 
 Key files:
 
+- `config.rs` — runtime config (`remote.*`), fails closed on invalid files.
+- `remote.rs` — supervisor that runs or drops the session as the setting changes, and the `SIGHUP` reload.
 - `websocket.rs` — outbound WSS client with reconnection.
 - `transport.rs` — shared config parsing (`control_plane_url`, client cert/key paths, CA path).
 

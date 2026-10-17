@@ -12,8 +12,8 @@ listener a production install runs; Tetra does not listen on the network.
 The socket carries the authenticated WebSocket protocol, with Ed25519-signed
 command frames.
 
-An outbound mTLS WSS connection to a remote control plane (`agent-connect`)
-also exists. When the agent runs inside a VM, the same JSON frame protocol can
+An outbound mTLS WSS connection to a remote control plane also exists. It is
+off unless `remote.enabled` is set in `/etc/tetra/tetra.json`. When the agent runs inside a VM, the same JSON frame protocol can
 be carried over a virtio-vsock stream.
 
 For development, `agent-ws-serve` runs the same authenticated WebSocket
@@ -157,24 +157,41 @@ cargo run -- agent-ws-serve \
   --tls-key /etc/tetra/tetra.key
 ```
 
-### Outbound WSS control plane (production)
+### Outbound WSS control plane (remote control)
 
-`agent-connect` dials out to the dashboard/control plane and maintains a
-persistent connection:
-
-```sh
-cargo run -- agent-connect --config examples/transport.json --host-id myhost
-```
-
-The transport config JSON contains:
+Remote control ships disabled. `agent-serve` connects out only while
+`remote.enabled` is `true` in the runtime config, `/etc/tetra/tetra.json`
+(override with `--config` or `TETRA_CONFIG`). A missing file means remote
+control is off, and an unreadable or invalid file turns it off too.
 
 ```json
 {
-  "control_plane_url": "wss://dashboard.example.com/tetra/agent",
-  "client_cert_path": "/var/lib/tetra/identity/agent.crt",
-  "client_key_path": "/var/lib/tetra/identity/agent.key",
-  "server_ca_path": "/var/lib/tetra/identity/dashboard-ca.crt"
+  "remote": {
+    "enabled": true,
+    "host_id": "host-01",
+    "transport": {
+      "control_plane_url": "wss://dashboard.example.com/tetra/agent",
+      "client_cert_path": "/var/lib/tetra/identity/agent.crt",
+      "client_key_path": "/var/lib/tetra/identity/agent.key",
+      "server_ca_path": "/var/lib/tetra/identity/dashboard-ca.crt"
+    }
+  }
 }
+```
+
+`examples/tetra.json` has the full shape. Tetra re-reads the file on `SIGHUP`
+(`systemctl reload tetra.service`). Enabling remote control starts the mTLS
+session; disabling it drops any live session immediately. A reload that
+leaves `remote` unchanged keeps the current session.
+
+`agent-connect` runs the same outbound session on its own, with the transport
+config in a separate file. It obeys the same gate: it refuses to start unless
+`remote.enabled` is `true`, and it drops the session when a `SIGHUP` reload
+turns it off:
+
+```sh
+cargo run -- agent-connect --config examples/transport.json --host-id myhost \
+  --runtime-config examples/tetra.json
 ```
 
 ### Vsock smoke test

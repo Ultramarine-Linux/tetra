@@ -20,6 +20,7 @@
 
 pub mod backend;
 pub mod command;
+pub mod config;
 pub mod crypto;
 pub mod dispatcher;
 pub mod identity;
@@ -29,6 +30,7 @@ pub mod module_support;
 pub mod modules;
 pub mod protocol;
 pub mod queue;
+pub mod remote;
 pub mod transport;
 pub mod verify_password;
 pub mod vsock;

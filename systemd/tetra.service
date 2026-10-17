@@ -9,6 +9,7 @@ Type=simple
 Environment="RUST_LOG=info"
 Environment="TETRA_IDENTITY_DIR=/var/lib/tetra/identity"
 ExecStart=/usr/bin/tetra agent-serve --identity-dir /var/lib/tetra/identity
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 

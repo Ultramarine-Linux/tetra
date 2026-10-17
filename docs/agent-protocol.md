@@ -4,7 +4,7 @@ This document describes the JSON protocol used between an outside
 dashboard/controller and the Tetra host agent.
 
 The local CLI command `tetra agent-dispatch` accepts the same command envelope
-that the production transport is expected to carry over outbound WSS.
+that the transports carry.
 
 For host-to-guest virtio-vsock smoke testing, `tetra agent-vsock-serve` runs a
 Linux-only guest listener that accepts one raw `AgentCommand` JSON object per
@@ -14,13 +14,20 @@ dashboard session protocol.
 
 ## Connection Negotiation
 
-The production connection model is agent-outbound: each host agent opens and
-maintains a connection to the dashboard/control plane. On regular hosts this is
-WSS with mTLS. When the agent runs inside a VM, the same JSON frame protocol may
+Local clients (the dashboard container and the server OOBE) connect to Tetra
+over the Unix socket `/run/tetra/tetra.sock` (`tetra agent-serve`) and speak the
+authenticated WebSocket protocol on it. Production installs do not listen on
+the network.
+
+An outbound connection to a remote control plane is optional and ships
+disabled. It runs only while `remote.enabled` is `true` in
+`/etc/tetra/tetra.json`, and turning it off drops a live session. On regular
+hosts this is WSS with mTLS. When the agent runs inside a VM, the same JSON frame protocol may
 be carried over a virtio-vsock stream to the VM host so the VM can be controlled
 from the same dashboard interface without exposing guest networking.
 
-The repository includes an outbound WSS client via `tetra agent-connect`. The
+The repository includes an outbound WSS client, run by `tetra agent-serve` when
+`remote.enabled` is set, or standalone via `tetra agent-connect`. The
 JSON command envelope documented below is the stable application payload that
 the transport carries.
 

@@ -7,13 +7,18 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tokio::sync::watch;
 
 use tetra::{
     agent::{
-        AgentCommand, backend, local_socket,
+        AgentBackend, AgentCommand, backend,
+        config::{self, RuntimeConfig},
+        local_socket,
+        queue::{DEFAULT_QUEUE_CAPACITY, DispatchQueue},
+        remote,
         transport::TransportConfig,
         vsock::VsockAgentConfig,
-        websocket::{self, WebSocketAgentConfig},
+        websocket::WebSocketAgentConfig,
         websocket_server::{self, ServerState, WebSocketServerConfig},
     },
     catalog::{RenderOptions, RenderedResource},
@@ -97,6 +102,10 @@ struct AgentDispatchCli {
 
 #[derive(Debug, Parser)]
 struct AgentServeCli {
+    /// Runtime config (`remote.enabled`, ...). Re-read on SIGHUP.
+    #[arg(long, env = "TETRA_CONFIG", default_value = config::DEFAULT_CONFIG_PATH)]
+    config: PathBuf,
+
     /// Unix socket to bind when not started by systemd socket activation.
     #[arg(long, env = "TETRA_SOCKET", default_value = local_socket::DEFAULT_SOCKET_PATH)]
     socket: PathBuf,
@@ -198,11 +207,20 @@ struct AgentConnectCli {
     /// Reconnect with exponential backoff when the control-plane session closes.
     #[arg(long, default_value_t = true)]
     reconnect: bool,
+
+    /// Runtime config whose `remote.enabled` gates this connection. Re-read on SIGHUP.
+    #[arg(long, env = "TETRA_CONFIG", default_value = config::DEFAULT_CONFIG_PATH)]
+    runtime_config: PathBuf,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Both rustls providers are compiled in (reqwest pulls in ring), so rustls
+    // cannot pick one itself and would panic on first TLS use.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("a rustls crypto provider was already installed"))?;
 
     match cli.command {
         Commands::Render(cli) => render(cli),
@@ -287,7 +305,15 @@ async fn agent_serve(cli: AgentServeCli) -> Result<()> {
     )?;
     let listener = local_socket::listener(&cli.socket)?;
     state.log_identity();
-    local_socket::serve(listener, state).await
+
+    let initial = remote::connection_from(&RuntimeConfig::load_or_disabled(&cli.config));
+    let (sender, settings) = watch::channel(initial);
+    let queue = state.queue().clone();
+    tokio::select! {
+        result = local_socket::serve(listener, state) => result,
+        () = remote::supervise(settings, queue) => Ok(()),
+        result = remote::reload_on_hangup(cli.config, sender, remote::connection_from) => result,
+    }
 }
 
 async fn agent_ws_serve(
@@ -319,11 +345,22 @@ async fn agent_connect(cli: AgentConnectCli) -> Result<()> {
         .with_context(|| format!("failed to read config `{}`", cli.config.display()))?;
     let transport: TransportConfig =
         serde_json::from_str(&text).context("failed to parse transport config JSON")?;
-
-    websocket::run(WebSocketAgentConfig {
+    let connection = WebSocketAgentConfig {
         transport,
         host_id: cli.host_id,
         reconnect: cli.reconnect,
-    })
-    .await
+    };
+
+    anyhow::ensure!(
+        RuntimeConfig::load(&cli.runtime_config)?.remote.enabled,
+        "remote control is disabled; set remote.enabled to true in `{}`",
+        cli.runtime_config.display()
+    );
+    let (sender, settings) = watch::channel(Some(connection.clone()));
+    let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), DEFAULT_QUEUE_CAPACITY);
+    let select = move |config: &RuntimeConfig| config.remote.enabled.then(|| connection.clone());
+    tokio::select! {
+        () = remote::supervise(settings, queue) => Ok(()),
+        result = remote::reload_on_hangup(cli.runtime_config, sender, select) => result,
+    }
 }
