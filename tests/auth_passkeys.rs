@@ -236,7 +236,7 @@ async fn access_set_writes_the_dashboard_site_and_needs_an_admin() {
     let site = host.config.caddy_sites_dir.join(DASHBOARD_SITE_FILE);
     let contents = std::fs::read_to_string(&site).unwrap();
     assert!(contents.contains("server.example.com {"), "{contents}");
-    assert!(contents.contains("reverse_proxy 127.0.0.1:3000"));
+    assert!(contents.contains("reverse_proxy 127.0.0.1:3972"));
 
     ok(
         &host.service,

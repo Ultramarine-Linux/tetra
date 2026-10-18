@@ -274,7 +274,7 @@ administrator.
   HTTPS and enables passkeys, with the hostname as the RP ID and
   `https://hostname[:port]` as the origin.
 - IP mode uses `tls internal` and disables passkeys.
-- `dashboard_upstream` defaults to `127.0.0.1:3000`.
+- `dashboard_upstream` defaults to `127.0.0.1:3972`.
 - Changing the hostname invalidates passkeys registered under the old one.
 
 `setup.complete` requires at least one eligible administrator. It writes

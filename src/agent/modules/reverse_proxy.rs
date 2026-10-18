@@ -380,7 +380,7 @@ pub struct DashboardSite {
     /// `https://192.0.2.10` or `https://[2001:db8::1]:8443`.
     pub address: String,
     pub tls: DashboardTls,
-    /// Where the dashboard container listens, such as `127.0.0.1:3000`.
+    /// Where the dashboard container listens, such as `127.0.0.1:3972`.
     pub upstream: String,
 }
 
@@ -499,16 +499,16 @@ mod tests {
         let domain = DashboardSite {
             address: "server.example.com".into(),
             tls: DashboardTls::Automatic,
-            upstream: "127.0.0.1:3000".into(),
+            upstream: "127.0.0.1:3972".into(),
         };
         assert_eq!(
             domain.render().unwrap(),
-            format!("{DASHBOARD_HEADER}\nserver.example.com {{\n\treverse_proxy 127.0.0.1:3000\n}}\n")
+            format!("{DASHBOARD_HEADER}\nserver.example.com {{\n\treverse_proxy 127.0.0.1:3972\n}}\n")
         );
         let ip = DashboardSite {
             address: "https://[2001:db8::1]".into(),
             tls: DashboardTls::Internal,
-            upstream: "127.0.0.1:3000".into(),
+            upstream: "127.0.0.1:3972".into(),
         };
         assert!(ip.render().unwrap().contains("https://[2001:db8::1] {\n\ttls internal\n"));
         let injected = DashboardSite {
@@ -524,7 +524,7 @@ mod tests {
         let site = DashboardSite {
             address: "server.example.com".into(),
             tls: DashboardTls::Automatic,
-            upstream: "127.0.0.1:3000".into(),
+            upstream: "127.0.0.1:3972".into(),
         };
         write_dashboard_site(dir.path(), &site, false, false).unwrap();
         assert!(dir.path().join(DASHBOARD_SITE_FILE).exists());
@@ -576,7 +576,7 @@ mod tests {
         let response = Write {
             config_dir: dir.path().to_path_buf(),
             domain: "demo.example.com".into(),
-            upstream: "127.0.0.1:3000".into(),
+            upstream: "127.0.0.1:3972".into(),
             tls: true,
             dry_run: true,
             reload: false,

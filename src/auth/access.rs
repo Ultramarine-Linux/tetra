@@ -27,7 +27,7 @@ use super::store::{self, Extra, Header, Record};
 /// Where the dashboard container listens unless `tetra agent-serve
 /// --dashboard-upstream` or `access.set` says otherwise. To be confirmed
 /// against the dashboard Quadlet's published port.
-pub const DEFAULT_DASHBOARD_UPSTREAM: &str = "127.0.0.1:3000";
+pub const DEFAULT_DASHBOARD_UPSTREAM: &str = "127.0.0.1:3972";
 /// Relying party name shown by browsers and authenticators.
 pub const RP_NAME: &str = "Ultramarine Server";
 const HTTPS_PORT: u16 = 443;
