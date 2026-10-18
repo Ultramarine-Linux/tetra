@@ -115,8 +115,10 @@ certificate.
 - Bind the certificate to the host. For example, set the subject CN to
   `host_id`, or add a `URI` SAN such as `urn:ultramarine:tetra:host:<host_id>`.
   Record the serial number and SPKI fingerprint against the host.
-- Choose a validity period that matches the renewal story (see open questions
-  below). Tetra does not renew certificates yet.
+- Choose a validity period with renewal in mind. Tetra renews at two-thirds
+  of the lifetime (see [Certificate renewal](#certificate-renewal)), so
+  90 days gives a 30-day window to fix a broken renewal before the host drops
+  off.
 
 ## WSS endpoint
 
@@ -129,13 +131,100 @@ The endpoint at `control_plane_url` must:
 3. Check that the `host_id` in the first `hello` frame matches the host the
    certificate maps to, and close the connection otherwise.
 
-The frame protocol after the handshake is unchanged; see
-[agent-protocol.md](agent-protocol.md).
+The frame protocol after the handshake is described in
+[agent-protocol.md](agent-protocol.md). Hosts that renew certificates send
+`protocol_version` `2026-10-18` or later in `hello`.
+
+## Certificate renewal
+
+The host renews its client certificate over the existing mTLS session, with
+no administrator involved. The controller authorizes a renewal by the
+certificate the session was opened with: a host may only renew its own
+certificate.
+
+### When the host renews
+
+At two-thirds of the current certificate's lifetime (`notBefore` plus
+two-thirds of `notAfter - notBefore`), the host generates a new ECDSA P-256
+key and sends a CSR for it. If a host connects after that point, it renews
+right after `hello`. After a failed attempt it waits a tenth of the remaining
+lifetime, at least one minute and at most one hour, before trying again, even
+across reconnects.
+
+### Frames
+
+Host to controller:
+
+```json
+{
+  "type": "renew",
+  "csr": "-----BEGIN CERTIFICATE REQUEST-----\n...\n-----END CERTIFICATE REQUEST-----\n"
+}
+```
+
+The CSR has the same shape as the enrollment CSR: a new key (never the
+current one), key usage `digitalSignature`, extended key usage `clientAuth`.
+The host has at most one renewal in flight per session.
+
+Controller to host, on success:
+
+```json
+{
+  "type": "renewed",
+  "client_certificate": "-----BEGIN CERTIFICATE-----\n...leaf...\n-----END CERTIFICATE-----\n"
+}
+```
+
+On failure:
+
+```json
+{ "type": "renew_failed", "error": "human-readable reason" }
+```
+
+If the controller does not answer within five minutes, the host treats the
+attempt as failed. A controller that does not support renewal should answer
+`renew_failed` rather than close the connection.
+
+### Controller rules
+
+1. Verify the CSR signature, and refuse a CSR whose public key equals the
+   current certificate's key.
+2. Sign it with the client CA under the same [signing rules](#signing-rules)
+   as enrollment, bound to the `host_id` of the certificate that opened the
+   session. Never take the identity from the CSR.
+3. Record the new serial and SPKI fingerprint against the host **before**
+   sending `renewed`. The host reconnects with the new certificate right away,
+   and the WSS endpoint has to accept it.
+4. Keep the old certificate valid. The host goes back to it if the new one is
+   refused, so revoking it on issue can strand the host. Revoke the old
+   certificate once the host has completed a handshake with the new one, or
+   let it expire.
+
+Renewal does not change the server CA. Rotating `server_ca_certificate` still
+needs a re-enrollment.
+
+### What the host does with the answer
+
+The host checks that the returned leaf is for the key it just generated,
+allows `clientAuth`, and is currently valid. If any check fails, nothing is
+written and the attempt counts as failed. Otherwise it:
+
+1. writes the new certificate and key next to the current ones as
+   `client.crt.next` and `client.key.next`,
+2. closes the session and reconnects with the new pair,
+3. if the WebSocket upgrade succeeds, renames the new files over
+   `client.crt` and `client.key` and carries on with that session,
+4. if it fails but the old pair still connects, deletes the `.next` files and
+   keeps using the old certificate. If neither connects, it keeps both and
+   tries the new pair first on the next reconnect.
+
+The renames are ordered so that a crash at any point leaves either the old or
+the new pair, never a key that does not match its certificate.
 
 ## Unenrollment and revocation
 
 `tetra unenroll` is local. It deletes the key, certificate, server CA and
-controller record, and makes the running agent drop its session. It does not
+controller record (and any renewal in progress), and makes the running agent drop its session. It does not
 call the controller. The controller should:
 
 - let an administrator remove a host, which revokes its certificate so the
@@ -149,10 +238,6 @@ disappear.
 
 ## Open questions
 
-- **Renewal.** There is no renewal yet. Options: a `renew` frame over the
-  existing mTLS session carrying a new CSR, or re-running `tetra enroll` after
-  `tetra unenroll`. Until this exists, certificates need a validity long enough
-  to cover the host's life, or an operator has to re-enroll.
 - **Unenroll notification.** A future `DELETE` endpoint, authenticated with
   the client certificate, would let `tetra unenroll` revoke the certificate
   itself.
