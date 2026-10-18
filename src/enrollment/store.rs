@@ -7,6 +7,8 @@
 //! - `client.crt`: client certificate (and any chain) signed by the controller.
 //! - `server-ca.crt`: CA bundle that verifies the controller's WSS endpoint.
 //! - `controller.json`: host id, control-plane URL and enrollment URL.
+//! - `client.crt.next`, `client.key.next`: a renewed certificate and its key,
+//!   present only while a renewal is being tried (see [`super::renewal`]).
 //!
 //! `controller.json` is written last and removed first, so its presence is
 //! what marks the host as enrolled.
@@ -31,6 +33,9 @@ const FILES: [&str; 4] = [
     CLIENT_KEY_FILE,
     SERVER_CA_FILE,
 ];
+/// Renewal files staged next to the credentials, in the order
+/// [`Enrollment::remove`] deletes them (key first, like a discarded renewal).
+const STAGED_FILES: [&str; 2] = ["client.key.next", "client.crt.next"];
 
 /// The controller this host is enrolled with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,7 +89,10 @@ impl Enrollment {
     /// interrupted enrollment.
     #[must_use]
     pub fn exists(directory: &Path) -> bool {
-        FILES.iter().any(|file| directory.join(file).exists())
+        FILES
+            .iter()
+            .chain(&STAGED_FILES)
+            .any(|file| directory.join(file).exists())
     }
 
     /// Write the credentials and record into `directory`, creating it
@@ -123,7 +131,7 @@ impl Enrollment {
     /// anything was removed.
     pub fn remove(directory: &Path) -> Result<bool> {
         let mut removed = false;
-        for file in FILES {
+        for file in FILES.into_iter().chain(STAGED_FILES) {
             let path = directory.join(file);
             match fs::remove_file(&path) {
                 Ok(()) => removed = true,
@@ -163,7 +171,7 @@ impl Enrollment {
 }
 
 /// Atomically write `contents` to `path` with mode `0600`.
-fn write_private(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &str) -> Result<()> {
     let file_name = path
         .file_name()
         .context("enrollment path has no file name")?
@@ -238,6 +246,23 @@ mod tests {
         assert!(!Enrollment::exists(&directory));
         assert_eq!(Enrollment::load(&directory).unwrap(), None);
         assert!(!Enrollment::remove(&directory).unwrap());
+    }
+
+    #[test]
+    fn remove_deletes_a_staged_renewal() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("remote");
+        let saved = Enrollment::save(&directory, record(), CREDENTIALS).unwrap();
+        let files =
+            crate::enrollment::renewal::ClientFiles::from_transport(&saved.transport()).unwrap();
+        files.stage("new key", "new cert").unwrap();
+        for file in STAGED_FILES {
+            assert!(directory.join(file).exists(), "{file}");
+        }
+
+        assert!(Enrollment::remove(&directory).unwrap());
+        assert!(!Enrollment::exists(&directory));
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
     }
 
     #[test]

@@ -101,6 +101,10 @@ routing frames to the dashboard/control plane session for the matching VM.
    stale connections can be closed.
 7. `reconnect`: On disconnect, the agent reconnects with backoff and repeats
    hello/capability negotiation.
+8. `renew`: At two-thirds of its client certificate's lifetime, the agent
+   sends a `renew` frame with a new CSR. The controller answers `renewed` or
+   `renew_failed`, and the agent reconnects with the new certificate. See
+   [remote-enrollment.md](remote-enrollment.md#certificate-renewal).
 
 ### Transport Frames
 
@@ -111,7 +115,7 @@ A simple frame format is enough for the first WSS implementation:
   "type": "hello",
   "host_id": "host-01",
   "agent_version": "0.1.0",
-  "protocol_version": "2026-06-29",
+  "protocol_version": "2026-10-18",
   "hostname": "fedora-server",
   "os": "linux",
   "arch": "x86_64"

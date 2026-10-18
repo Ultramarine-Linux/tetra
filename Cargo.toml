@@ -83,6 +83,7 @@ x509-parser = "0.18.1"
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 tempfile = "3"
+time = "0.3"
 tokio-rustls = "0.26"
 
 [lints]

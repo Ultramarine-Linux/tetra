@@ -7,6 +7,7 @@
 //! mTLS. Nothing is registered for inbound connections: the host only ever
 //! dials out. See `docs/remote-enrollment.md` for the controller side.
 
+pub mod renewal;
 pub mod store;
 
 use std::{env, io::Write, path::PathBuf, process::Command, time::Duration};
@@ -247,7 +248,7 @@ pub fn unenroll(options: &UnenrollOptions) -> Result<()> {
 }
 
 /// PEM CSR for `key_pair`, requesting a `clientAuth`-only certificate.
-fn certificate_signing_request(key_pair: &KeyPair, hostname: &str) -> Result<String> {
+pub(crate) fn certificate_signing_request(key_pair: &KeyPair, hostname: &str) -> Result<String> {
     let mut params = CertificateParams::default();
     let mut subject = DistinguishedName::new();
     subject.push(DnType::CommonName, hostname);
@@ -273,7 +274,22 @@ fn check_approval(approval: &Approval, key_pair: &KeyPair) -> Result<()> {
         "controller returned a control-plane URL that is not wss://"
     );
 
-    let chain = pem_certificates(&approval.client_certificate, "client certificate")?;
+    check_client_certificate(&approval.client_certificate, key_pair)?;
+
+    let mut roots = rustls::RootCertStore::empty();
+    for ca in pem_certificates(&approval.server_ca_certificate, "server CA")? {
+        roots
+            .add(ca)
+            .context("failed to add server CA certificate")?;
+    }
+    ensure!(!roots.is_empty(), "server CA bundle is empty");
+    Ok(())
+}
+
+/// Check that `pem` holds a currently valid `clientAuth` certificate for
+/// `key_pair` that can be used for mTLS.
+pub(crate) fn check_client_certificate(pem: &str, key_pair: &KeyPair) -> Result<()> {
+    let chain = pem_certificates(pem, "client certificate")?;
     let leaf = chain.first().context("client certificate is empty")?;
     let (_, certificate) = x509_parser::parse_x509_certificate(leaf)
         .map_err(|error| anyhow::anyhow!("failed to parse client certificate: {error}"))?;
@@ -291,13 +307,6 @@ fn check_approval(approval: &Approval, key_pair: &KeyPair) -> Result<()> {
         "client certificate is not currently valid"
     );
 
-    let mut roots = rustls::RootCertStore::empty();
-    for ca in pem_certificates(&approval.server_ca_certificate, "server CA")? {
-        roots
-            .add(ca)
-            .context("failed to add server CA certificate")?;
-    }
-    ensure!(!roots.is_empty(), "server CA bundle is empty");
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
     // Explicit provider: library callers may not have installed a default.
     rustls::ClientConfig::builder_with_provider(
@@ -305,7 +314,7 @@ fn check_approval(approval: &Approval, key_pair: &KeyPair) -> Result<()> {
     )
     .with_safe_default_protocol_versions()
     .context("failed to configure TLS")?
-    .with_root_certificates(roots)
+    .with_root_certificates(rustls::RootCertStore::empty())
     .with_client_auth_cert(chain, key)
     .context("client certificate and key cannot be used for mTLS")?;
     Ok(())
