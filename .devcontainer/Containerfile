@@ -8,6 +8,8 @@ RUN dnf do -y --action=install \
     iproute \
     make \
     ninja \
+    openssl-devel \
+    pam-devel \
     pkgconf-pkg-config \
     rustup \
     systemd \

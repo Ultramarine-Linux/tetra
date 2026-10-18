@@ -1,0 +1,22 @@
+[Unit]
+Description=Show the Ultramarine Server setup code on the console
+Documentation=https://github.com/Ultramarine-Linux/tetra/blob/main/docs/auth-protocol.md
+# Only until the OOBE finishes setup.
+ConditionPathExists=!/var/lib/tetra/setup-complete
+# The store key may be sealed to the TPM.
+After=tpm2.target
+# Before the login prompts read /run/issue.d.
+Before=systemd-user-sessions.service getty.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Generates the code on first boot (sealed in /var/lib/tetra) and writes it
+# to /run/tetra/setup-code and /run/issue.d. The same code is republished on
+# every boot until setup completes.
+ExecStart=/usr/bin/tetra setup code --publish
+StateDirectory=tetra
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

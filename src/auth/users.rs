@@ -1,0 +1,222 @@
+//! Per-user credential records, one file per UID under
+//! `/var/lib/tetra/auth/users/<uid>.json`.
+//!
+//! A record also stores the username it was created for. If the account is
+//! deleted and its UID reused, the names no longer match and the old record
+//! is ignored (and replaced on the next write), so a new account never
+//! inherits someone else's second factor or passkeys.
+
+use webauthn_rs::prelude::{Passkey, Uuid};
+
+use crate::prelude::*;
+
+use super::{
+    seal::Sealed,
+    store::{self, Extra, Header, Record, StoreLock},
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserRecord {
+    #[serde(flatten)]
+    header: Header,
+    pub uid: u32,
+    pub username: String,
+    /// Bumped to invalidate every existing session of this user.
+    #[serde(default)]
+    pub session_epoch: u64,
+    /// Stable WebAuthn user handle, assigned on first passkey registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webauthn_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp: Option<TotpRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_codes: Vec<RecoveryCode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passkeys: Vec<PasskeyRecord>,
+    #[serde(flatten)]
+    extra: Extra,
+}
+
+impl Record for UserRecord {
+    fn header(&self) -> &Header {
+        &self.header
+    }
+    fn header_mut(&mut self) -> &mut Header {
+        &mut self.header
+    }
+}
+
+impl UserRecord {
+    #[must_use]
+    pub fn new(uid: u32, username: &str) -> Self {
+        Self {
+            header: Header::default(),
+            uid,
+            username: username.to_owned(),
+            session_epoch: 0,
+            webauthn_id: None,
+            totp: None,
+            recovery_codes: Vec::new(),
+            passkeys: Vec::new(),
+            extra: Extra::new(),
+        }
+    }
+
+    /// Unused recovery codes left.
+    #[must_use]
+    pub fn recovery_codes_left(&self) -> usize {
+        self.recovery_codes
+            .iter()
+            .filter(|code| code.used_at.is_none())
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TotpRecord {
+    /// The shared secret, encrypted with the store key.
+    pub secret: Sealed,
+    pub enrolled_at: i64,
+    /// Last accepted time step; a code is never accepted twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_step: Option<u64>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryCode {
+    /// SHA-256 of the normalized code.
+    pub hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_at: Option<i64>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasskeyRecord {
+    /// Base64url credential ID.
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<i64>,
+    /// Public key and signature counter. Not secret.
+    pub passkey: Passkey,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// The `users/` directory.
+#[derive(Debug, Clone)]
+pub struct UserStore {
+    dir: PathBuf,
+}
+
+impl UserStore {
+    #[must_use]
+    pub const fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    fn path(&self, uid: u32) -> PathBuf {
+        self.dir.join(format!("{uid}.json"))
+    }
+
+    /// The record for `uid`, if one exists and was created for `username`.
+    ///
+    /// # Errors
+    /// Fails when the record exists but cannot be read.
+    pub fn get(&self, uid: u32, username: &str) -> Result<Option<UserRecord>> {
+        Ok(store::read::<UserRecord>(&self.path(uid))?
+            .filter(|record| record.uid == uid && record.username == username))
+    }
+
+    /// Read-modify-write the record for `uid` under the store lock, starting
+    /// from an empty record when there is none (or it belonged to a previous
+    /// owner of the UID). The record is written only when `change` succeeds.
+    ///
+    /// # Errors
+    /// Fails when `change` fails or the record cannot be read or written.
+    pub fn update<R, F>(&self, uid: u32, username: &str, change: F) -> Result<R>
+    where
+        F: FnOnce(&mut UserRecord) -> Result<R>,
+    {
+        let _lock = StoreLock::acquire(&self.dir)?;
+        let mut record = self
+            .get(uid, username)?
+            .unwrap_or_else(|| UserRecord::new(uid, username));
+        let result = change(&mut record)?;
+        store::write(&self.path(uid), &mut record)?;
+        Ok(result)
+    }
+
+    /// Every stored record. Unreadable files are logged and skipped.
+    ///
+    /// # Errors
+    /// Fails when the directory exists but cannot be listed.
+    pub fn all(&self) -> Result<Vec<UserRecord>> {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to list `{}`", self.dir.display()));
+            }
+        };
+        let mut records = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(OsStr::to_str) != Some("json") {
+                continue;
+            }
+            match store::read::<UserRecord>(&path) {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => {}
+                Err(error) => eprintln!("skipping user record: {error:#}"),
+            }
+        }
+        Ok(records)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_round_trip_and_ignore_a_previous_owner_of_the_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let users = UserStore::new(dir.path().join("users"));
+        assert!(users.get(1000, "alice").unwrap().is_none());
+        users
+            .update(1000, "alice", |record| {
+                record.session_epoch = 3;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(users.get(1000, "alice").unwrap().unwrap().session_epoch, 3);
+
+        // alice was deleted and bob got her UID.
+        assert!(users.get(1000, "bob").unwrap().is_none());
+        let epoch = users
+            .update(1000, "bob", |record| Ok(record.session_epoch))
+            .unwrap();
+        assert_eq!(epoch, 0);
+        assert!(users.get(1000, "alice").unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_updates_write_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let users = UserStore::new(dir.path().join("users"));
+        users
+            .update(1000, "alice", |record| -> Result<()> {
+                record.session_epoch = 1;
+                bail!("rejected")
+            })
+            .unwrap_err();
+        assert!(users.get(1000, "alice").unwrap().is_none());
+    }
+}

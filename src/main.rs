@@ -2,6 +2,8 @@ use std::{
     fs,
     io::{self, Read},
     path::PathBuf,
+    sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -12,13 +14,25 @@ use tetra::{
     agent::{
         AgentBackend, AgentCommand, backend,
         config::{self, RuntimeConfig},
+        crypto::public_key_fingerprint,
+        identity::HostIdentity,
+        local_protocol::LocalServer,
         local_socket,
+        peer::{self, PeerPolicy},
         queue::{DEFAULT_QUEUE_CAPACITY, DispatchQueue},
         remote,
         transport::TransportConfig,
         vsock::VsockAgentConfig,
         websocket::WebSocketAgentConfig,
-        websocket_server::ServerState,
+    },
+    auth::{
+        self, AuthConfig, AuthService, Backends,
+        access::DEFAULT_DASHBOARD_UPSTREAM,
+        accounts::{DEFAULT_EXCLUDED, LoginPolicy, SystemAccounts},
+        audit::{self as action_log, AuditLog},
+        clock::SystemClock,
+        pam::{self as tetra_pam, LibPam},
+        seal::SystemdCreds,
     },
     catalog::{RenderOptions, RenderedResource},
     enrollment::{self, store::DEFAULT_ENROLLMENT_DIR, store::Enrollment},
@@ -74,7 +88,67 @@ enum Commands {
 
     /// Remove this host's remote-control certificate and controller record.
     Unenroll(UnenrollCli),
+
+    /// Console recovery for dashboard logins (root only).
+    #[command(subcommand)]
+    Auth(AuthCommand),
+
+    /// First-boot setup: show the setup code, or finish setup (root only).
+    #[command(subcommand)]
+    Setup(SetupCommand),
 }
+
+#[derive(Debug, Subcommand)]
+enum SetupCommand {
+    /// Print the setup code, or publish it to the console.
+    Code(SetupCodeCli),
+    /// Finish setup without the OOBE, on a host that already has an eligible
+    /// administrator (upgrades, development machines).
+    Complete(SetupCompleteCli),
+}
+
+#[derive(Debug, Parser)]
+struct SetupCompleteCli {
+    /// Tetra state directory.
+    #[arg(long, env = "TETRA_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
+    state_dir: PathBuf,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommand {
+    /// Remove a user's TOTP and recovery codes and log out all their sessions.
+    #[command(name = "reset-2fa")]
+    ResetSecondFactor(ResetSecondFactorCli),
+}
+
+#[derive(Debug, Parser)]
+struct ResetSecondFactorCli {
+    /// Account name.
+    user: String,
+
+    /// Also remove the user's passkeys.
+    #[arg(long)]
+    passkeys: bool,
+
+    /// Tetra state directory.
+    #[arg(long, env = "TETRA_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
+    state_dir: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+struct SetupCodeCli {
+    /// Write the code to /run/tetra/setup-code and the getty banner instead of
+    /// printing it (run at boot by tetra-setup-code.service).
+    #[arg(long)]
+    publish: bool,
+
+    /// Tetra state directory.
+    #[arg(long, env = "TETRA_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
+    state_dir: PathBuf,
+}
+
+/// Root-only state: credentials, grants, sessions, the setup marker.
+const DEFAULT_STATE_DIR: &str = "/var/lib/tetra";
 
 #[derive(Debug, Parser)]
 struct RenderCli {
@@ -114,17 +188,35 @@ struct AgentServeCli {
     #[arg(long, env = "TETRA_SOCKET", default_value = local_socket::DEFAULT_SOCKET_PATH)]
     socket: PathBuf,
 
-    /// URL-safe base64 Ed25519 public key enrolled for the dashboard controller.
-    #[arg(long, env = "TETRA_CONTROLLER_PUBLIC_KEY")]
-    controller_public_key: Option<String>,
-
-    /// One-time token accepted to enroll a controller while no key is stored.
-    #[arg(long, env = "TETRA_ENROLLMENT_TOKEN")]
-    enrollment_token: Option<String>,
-
     /// Mutable identity directory. Defaults to /var/lib/tetra/identity.
     #[arg(long, default_value = "/var/lib/tetra/identity")]
     identity_dir: PathBuf,
+
+    /// Root-only state directory for credentials, grants and sessions.
+    #[arg(long, env = "TETRA_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
+    state_dir: PathBuf,
+
+    /// Account whose UID identifies the dashboard on the local socket.
+    #[arg(long, env = "TETRA_DASHBOARD_USER", default_value = peer::DEFAULT_DASHBOARD_USER)]
+    dashboard_user: String,
+
+    /// Account whose UID identifies the server OOBE on the local socket.
+    #[arg(long, env = "TETRA_OOBE_USER", default_value = peer::DEFAULT_OOBE_USER)]
+    oobe_user: String,
+
+    /// PAM service used to verify dashboard passwords.
+    #[arg(long, default_value = tetra_pam::DEFAULT_SERVICE)]
+    pam_service: String,
+
+    /// Caddy site directory where `access.set` writes the dashboard site.
+    #[arg(long, default_value = "/etc/caddy/tetra-sites")]
+    caddy_sites_dir: PathBuf,
+
+    /// Where the dashboard container listens, used for the dashboard's Caddy
+    /// site when `access.set` does not name one. Must match the dashboard
+    /// Quadlet's published port.
+    #[arg(long, env = "TETRA_DASHBOARD_UPSTREAM", default_value = DEFAULT_DASHBOARD_UPSTREAM)]
+    dashboard_upstream: String,
 
     /// Remote-control enrollment written by `tetra enroll`.
     #[arg(long, env = "TETRA_ENROLLMENT_DIR", default_value = DEFAULT_ENROLLMENT_DIR)]
@@ -267,7 +359,96 @@ async fn main() -> Result<()> {
             enrollment_dir: cli.enrollment_dir,
             skip_service: cli.skip_service,
         }),
+        Commands::Auth(AuthCommand::ResetSecondFactor(cli)) => reset_second_factor(&cli),
+        Commands::Setup(SetupCommand::Code(cli)) => setup_code(cli),
+        Commands::Setup(SetupCommand::Complete(cli)) => setup_complete(cli),
     }
+}
+
+fn require_root(what: &str) -> Result<()> {
+    anyhow::ensure!(
+        nix::unistd::geteuid().is_root(),
+        "{what} must be run as root"
+    );
+    Ok(())
+}
+
+fn login_policy() -> Result<LoginPolicy> {
+    LoginPolicy::load(
+        "/etc/login.defs".as_ref(),
+        "/etc/shells".as_ref(),
+        DEFAULT_EXCLUDED
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
+    )
+}
+
+fn system_auth(
+    config: AuthConfig,
+    pam_service: String,
+    queue: DispatchQueue,
+) -> Result<AuthService> {
+    AuthService::new(
+        config,
+        Backends {
+            accounts: Arc::new(SystemAccounts::default()),
+            passwords: Arc::new(LibPam {
+                service: pam_service,
+            }),
+            sealer: Arc::new(SystemdCreds),
+            clock: Arc::new(SystemClock),
+            policy: login_policy()?,
+        },
+        queue,
+    )
+}
+
+fn reset_second_factor(cli: &ResetSecondFactorCli) -> Result<()> {
+    require_root("tetra auth reset-2fa")?;
+    let result = auth::service::reset_second_factor(
+        &cli.state_dir,
+        &SystemAccounts::default(),
+        &cli.user,
+        cli.passkeys,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+/// The auth service for a one-shot console command.
+fn console_auth(state_dir: PathBuf) -> Result<AuthService> {
+    let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), 1);
+    system_auth(
+        AuthConfig::system(state_dir),
+        tetra_pam::DEFAULT_SERVICE.into(),
+        queue,
+    )
+}
+
+fn setup_complete(cli: SetupCompleteCli) -> Result<()> {
+    require_root("tetra setup complete")?;
+    console_auth(cli.state_dir)?.complete_setup_from_console()?;
+    println!("setup completed; the setup code is disabled");
+    Ok(())
+}
+
+fn setup_code(cli: SetupCodeCli) -> Result<()> {
+    require_root("tetra setup code")?;
+    let service = console_auth(cli.state_dir)?;
+    if cli.publish {
+        match service.publish_setup_code()? {
+            Some(_) => eprintln!("published the setup code to the console"),
+            None => eprintln!("setup is complete; nothing to publish"),
+        }
+    } else {
+        // Printing must not create a code that the console does not show.
+        match service.publish_setup_code()? {
+            Some(code) => println!("{code}"),
+            None => eprintln!("setup is complete; there is no setup code"),
+        }
+    }
+    Ok(())
 }
 
 fn render(cli: RenderCli) -> Result<()> {
@@ -319,24 +500,46 @@ async fn agent_dispatch(cli: AgentDispatchCli) -> Result<()> {
     Ok(())
 }
 
+/// How often in-memory session activity is written to disk.
+const SESSION_FLUSH_INTERVAL: Duration = Duration::from_mins(1);
+
 async fn agent_serve(cli: AgentServeCli) -> Result<()> {
-    let state = ServerState::load(
-        &cli.identity_dir,
-        cli.controller_public_key,
-        cli.enrollment_token,
+    let identity = HostIdentity::load_or_generate(&cli.identity_dir)?;
+    let host_fingerprint = public_key_fingerprint(&identity.verifying_key());
+    eprintln!("host identity: {}", identity.path().display());
+    eprintln!("host fingerprint: {host_fingerprint}");
+
+    let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), DEFAULT_QUEUE_CAPACITY);
+    let auth = system_auth(
+        AuthConfig {
+            caddy_sites_dir: cli.caddy_sites_dir,
+            dashboard_upstream: cli.dashboard_upstream,
+            ..AuthConfig::system(cli.state_dir)
+        },
+        cli.pam_service,
+        queue.clone(),
     )?;
+    let audit = auth.audit();
+    let server = LocalServer {
+        auth: auth.clone(),
+        peers: PeerPolicy::from_users(&cli.dashboard_user, &cli.oobe_user),
+        host_fingerprint,
+    };
     let listener = local_socket::listener(&cli.socket)?;
-    state.log_identity();
+    peer::check_socket_group();
 
     let enrollment_dir = cli.enrollment_dir;
     let select = move |config: &RuntimeConfig| remote::connection_from(config, &enrollment_dir);
     let (sender, settings) = watch::channel(select(&RuntimeConfig::load_or_disabled(&cli.config)));
-    let queue = state.queue().clone();
-    tokio::select! {
-        result = local_socket::serve(listener, state) => result,
-        () = remote::supervise(settings, queue) => Ok(()),
+    let result = tokio::select! {
+        result = local_socket::serve(listener, server) => result,
+        () = remote::supervise(settings, queue, audit) => Ok(()),
         result = remote::reload_on_hangup(cli.config, sender, select) => result,
-    }
+        () = auth.flush_sessions_every(SESSION_FLUSH_INTERVAL) => Ok(()),
+        result = tokio::signal::ctrl_c() => result.map_err(Into::into),
+    };
+    auth.flush_sessions()?;
+    result
 }
 
 #[cfg(feature = "dev-listener")]
@@ -406,6 +609,7 @@ async fn agent_connect(cli: AgentConnectCli) -> Result<()> {
 
     let (sender, settings) = watch::channel(Some(resolve()?));
     let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), DEFAULT_QUEUE_CAPACITY);
+    let audit = AuditLog::new(action_log::DEFAULT_DIR.into());
     let select = move |config: &RuntimeConfig| {
         config
             .remote
@@ -417,7 +621,7 @@ async fn agent_connect(cli: AgentConnectCli) -> Result<()> {
             .ok()
     };
     tokio::select! {
-        () = remote::supervise(settings, queue) => Ok(()),
+        () = remote::supervise(settings, queue, audit) => Ok(()),
         result = remote::reload_on_hangup(cli.runtime_config, sender, select) => result,
     }
 }

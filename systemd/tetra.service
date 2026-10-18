@@ -12,6 +12,9 @@ ExecStart=/usr/bin/tetra agent-serve --identity-dir /var/lib/tetra/identity
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
+# Credentials, grants, sessions and the setup marker. Root only.
+StateDirectory=tetra
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target

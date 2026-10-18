@@ -1,0 +1,20 @@
+#%PAM-1.0
+# Ultramarine Server dashboard logins. Tetra runs this stack to verify
+# passwords (auth + account) and, for passkey logins, the account stack only.
+#
+# pam_faillock shares its tally with console and SSH logins, so repeated
+# failures lock the account everywhere. Tune deny= and unlock_time= in
+# /etc/security/faillock.conf. Shipped by the tetra package.
+auth        required      pam_faillock.so preauth
+auth        [success=1 default=bad] pam_unix.so
+auth        [default=die] pam_faillock.so authfail
+auth        sufficient    pam_faillock.so authsucc
+auth        required      pam_deny.so
+
+account     required      pam_nologin.so
+account     required      pam_faillock.so
+account     required      pam_unix.so
+
+# Tetra never changes passwords or opens sessions through this service.
+password    required      pam_deny.so
+session     required      pam_deny.so

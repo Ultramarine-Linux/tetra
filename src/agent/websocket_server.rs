@@ -1,9 +1,9 @@
-//! Inbound authenticated WebSocket protocol for dashboard-to-Tetra connections.
+//! Inbound controller-key WebSocket protocol.
 //!
-//! [`ServerState`] runs the protocol on any byte stream. In production it is
-//! served over the local Unix socket ([`super::local_socket`]). A TCP
-//! listener for development lives in `dev_listener`, compiled only with the
-//! `dev-listener` feature.
+//! [`ServerState`] runs the protocol on any byte stream. It is served only by
+//! the development TCP listener (`dev_listener`, compiled with the
+//! `dev-listener` feature). The local Unix socket no longer accepts it; local
+//! clients use the session protocol in [`super::local_protocol`].
 //!
 //! This is intentionally separate from `websocket.rs`, which is the outbound
 //! control-plane transport. The server requires an explicitly configured

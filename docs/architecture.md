@@ -14,6 +14,20 @@ tetra/
 │   ├── lib.rs           # Public API: agent + catalog + prelude
 │   ├── catalog.rs       # Recipe engine (YAML → Tera → Quadlet units)
 │   ├── types.rs          # Shared module payload types (serde)
+│   ├── auth/             # Login, sessions, authorization (see auth-protocol.md)
+│   │   ├── service.rs    # AuthService: every local-socket operation
+│   │   ├── api.rs        # Request/response/error types
+│   │   ├── accounts.rs   # Login eligibility and admin groups
+│   │   ├── pam.rs        # PAM password verification
+│   │   ├── totp.rs, recovery.rs, passkey.rs  # Second factor and passkeys
+│   │   ├── sessions.rs   # Session tokens
+│   │   ├── authz.rs      # Permission table, grants, setup allowlist
+│   │   ├── access.rs     # access.json, WebAuthn relying party, dashboard site
+│   │   ├── setup.rs      # First-boot setup code
+│   │   ├── audit.rs      # Action log
+│   │   ├── seal.rs       # systemd-creds store key
+│   │   ├── store.rs      # Versioned root-only JSON files
+│   │   └── testing.rs    # Fakes for PAM, accounts, sealing, clock
 │   ├── enrollment/
 │   │   ├── mod.rs        # `tetra enroll` / `tetra unenroll` (CSR, device flow)
 │   │   └── store.rs      # Root-only enrollment record under /var/lib/tetra/remote
@@ -30,10 +44,12 @@ tetra/
 │       ├── crypto.rs           # Ed25519 signing/verification
 │       ├── identity.rs         # Host keypair generation and persistence
 │       ├── local_socket.rs     # Local Unix socket listener (production)
-│       ├── verify_password.rs  # Shadow password verification
+│       ├── local_protocol.rs   # Session protocol frames for local clients
+│       ├── peer.rs             # SO_PEERCRED client identification
+│       ├── verify_password.rs  # Shadow password verification (dev listener)
 │       ├── transport.rs        # Shared endpoint/TLS configuration
 │       ├── websocket.rs        # Outbound WSS control-plane client
-│       ├── websocket_server.rs # Authenticated WebSocket protocol (ServerState)
+│       ├── websocket_server.rs # Controller-key WebSocket protocol (dev listener)
 │       ├── dev_listener.rs     # Dev-only TCP listener (`dev-listener` feature)
 │       ├── vsock.rs            # Virtio-vsock smoke-test transport
 │       ├── module_support.rs   # Shared module helpers
@@ -210,11 +226,14 @@ Production transport for local clients (the dashboard container and the server
 OOBE), and the only listener `tetra.service` runs. The socket at
 `/run/tetra/tetra.sock` is created by `tetra.socket` as `root:tetra 0660` and
 passed in through systemd socket activation; outside systemd Tetra binds it
-itself. It carries the same authenticated WebSocket protocol as
-`agent-ws-serve`.
+itself. Each connection is identified by its peer credentials (dashboard or
+OOBE) and speaks the session protocol: every request carries a Tetra-issued
+token, and `auth::AuthService` authenticates and authorizes it. See
+[auth-protocol.md](auth-protocol.md).
 
 - `local_socket.rs` — socket activation, fallback bind, accept loop.
-- `websocket_server.rs` — `ServerState`, the per-connection protocol shared with the TCP listener.
+- `peer.rs` — maps the peer UID to the dashboard or the OOBE.
+- `local_protocol.rs` — `hello`, `request` and `response` frames.
 
 ### Outbound WSS (remote control)
 
@@ -246,7 +265,7 @@ configured controller public key before accepting commands.
 - Loopback `ws://` is allowed without TLS.
 - Non-loopback addresses require `--tls-cert` and `--tls-key`.
 - `dev_listener.rs` — TCP bind, optional TLS, loopback-or-TLS check.
-- `websocket_server.rs` — challenge/auth handshake and session management, shared with the local socket.
+- `websocket_server.rs` — challenge/auth handshake and session management.
 
 ### Vsock (`agent-vsock-serve`)
 
@@ -261,27 +280,22 @@ same dispatcher. Useful for debugging and integration testing.
 
 ## Authentication and elevation
 
-### Transport identity
+### Local clients
 
-- Outbound WSS uses mTLS (client certificate + server CA verification).
-- Inbound WebSocket uses Ed25519 challenge-response: Tetra generates a host
-  identity keypair on first start and stores it under `/var/lib/tetra/identity`.
-  The dashboard stores the controller private key server-side.
+Users log in through Tetra (PAM password plus TOTP, or a passkey) and get a
+session token; the local socket identifies the client from its peer
+credentials. Every module action is authorized from the user's admin status
+and grants (`auth::authz`). Unprivileged actions run as the session user via
+`runuser`; privileged ones as root. See [auth-protocol.md](auth-protocol.md).
 
-### Command authorization
+### Remote and development transports
 
-- Authenticated commands include session id, sequence, timestamp, nonce,
-  command id, module, action, payload, and signature.
-- Default timestamp skew allowance: five minutes.
-- Nonces are replay-protected with bounded per-session state.
-
-### Privilege elevation
-
-Tetra can run as root. Unprivileged actions optionally run as
-`TETRA_UNPRIVILEGED_USER` via `runuser`. Privileged actions require an
-in-memory, session-bound elevation grant obtained by verifying the administrator
-password against the host shadow database (`unix_chkpwd`). The grant expires
-after a configurable TTL (default 30 minutes).
+- Outbound WSS uses mTLS (client certificate + server CA verification). Its
+  commands are authorized as the remote controller and logged as remote
+  actions.
+- The development TCP listener uses Ed25519 challenge-response with
+  signed commands (session id, sequence, timestamp, nonce; five-minute skew;
+  bounded replay cache) and the old password elevation.
 
 ## Data paths
 
@@ -290,6 +304,8 @@ Default mutable paths (bootc-friendly):
 | Path                       | Purpose                                     |
 | -------------------------- | ------------------------------------------- |
 | `/var/lib/tetra/identity/` | Host Ed25519 keypair and controller key.    |
+| `/var/lib/tetra/auth/`     | Login state: sealed store key, per-user credentials, grants, sessions, setup code (root-only). |
+| `/var/lib/tetra/access.json`, `setup-complete`, `audit/` | Access mode, setup marker, action log. |
 | `/var/lib/tetra/remote/`   | Remote-control client key, certificate, server CA and controller record (root-only). |
 | `/run/tetra/`              | Runtime/session data.                       |
 | `/var/lib/tetra/config/`   | Optional configuration overrides.           |

@@ -11,3 +11,8 @@ jobs:
             contents: read
             packages: read
         uses: FyraLabs/actions/.github/workflows/rust.yml@main
+        with:
+            # pam-client generates libpam bindings with bindgen at build time.
+            # The CI image already ships openssl-devel for webauthn-rs.
+            clippy-pre: dnf install --assumeyes pam-devel clang-devel
+            test-pre: dnf install --assumeyes pam-devel clang-devel

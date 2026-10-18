@@ -9,15 +9,17 @@ module is always compiled so the control plane can discover basic host facts.
 Local clients (the dashboard container and the server OOBE) talk to Tetra over
 a Unix socket at `/run/tetra/tetra.sock` (`agent-serve`). This is the only
 listener a production install runs; Tetra does not listen on the network.
-The socket carries the authenticated WebSocket protocol, with Ed25519-signed
-command frames.
+Tetra identifies the client from the socket's peer credentials and is the only
+authority for login and authorization: users log in with a password (PAM) plus
+TOTP, or a passkey, and every request carries a Tetra-issued session token. See
+[docs/auth-protocol.md](docs/auth-protocol.md).
 
 An outbound mTLS WSS connection to a remote control plane also exists. It is
 off unless `remote.enabled` is set in `/etc/tetra/tetra.json`. When the agent runs inside a VM, the same JSON frame protocol can
 be carried over a virtio-vsock stream.
 
-For development, `agent-ws-serve` runs the same authenticated WebSocket
-protocol on a TCP listener. It is only compiled with the `dev-listener`
+For development, `agent-ws-serve` runs the older controller-key WebSocket
+protocol (Ed25519-signed command frames) on a TCP listener. It is only compiled with the `dev-listener`
 feature, so release builds cannot listen on the network.
 
 The local `agent-dispatch` command accepts the same command envelope shape for
@@ -31,6 +33,8 @@ to render.
 ## Documentation
 
 - [Agent protocol reference](docs/agent-protocol.md) — Connection negotiation, authentication, and the full module action catalog.
+- [Session protocol](docs/auth-protocol.md) — Login, sessions, permissions and first-boot setup on the local socket.
+- [Dashboard auth guide](docs/dashboard-auth-guide.md) — How the dashboard and OOBE should call Tetra for login and authorization.
 - [Recipe authoring guide](docs/recipes.md) — How to write recipes, parameters, templates, and resources.
 - [Architecture overview](docs/architecture.md) — Crate layout, dispatcher, queue, transports, and how to add a module.
 - [Remote enrollment](docs/remote-enrollment.md) — The controller side of `tetra enroll` and the outbound mTLS connection.
@@ -125,8 +129,10 @@ inline recipe into an installed app bundle.
 
 ### Local socket (production)
 
-`agent-serve` is the host agent daemon. It serves the authenticated WebSocket
-protocol to local clients over a Unix socket. Under systemd the socket comes
+`agent-serve` is the host agent daemon. It serves the session protocol
+([docs/auth-protocol.md](docs/auth-protocol.md)) to local clients over a Unix
+socket. Only the `ultramarine-dashboard` and `ultramarine-oobe` accounts may
+connect (`--dashboard-user`/`--oobe-user`). Under systemd the socket comes
 from `tetra.socket` through socket activation; otherwise Tetra binds
 `--socket` (default `/run/tetra/tetra.sock`) with mode `0660`:
 
@@ -134,7 +140,7 @@ from `tetra.socket` through socket activation; otherwise Tetra binds
 cargo run -- agent-serve \
   --socket /tmp/tetra.sock \
   --identity-dir /tmp/tetra-identity \
-  --controller-public-key "$TETRA_CONTROLLER_PUBLIC_KEY"
+  --state-dir /tmp/tetra-state
 ```
 
 Clients open a WebSocket over the Unix stream; the HTTP `Host` and path are
@@ -235,14 +241,22 @@ dispatch over vsock.
 
 `systemd/tetra.socket` creates `/run/tetra/tetra.sock` as `root:tetra`, mode
 `0660`, and socket-activates `systemd/tetra.service`, which runs
-`agent-serve` and persists identity under `/var/lib/tetra/identity`. The
-service does not bind a TCP port.
+`agent-serve` and persists identity under `/var/lib/tetra/identity` and login
+state under `/var/lib/tetra` (root only). The service does not bind a TCP port.
+`systemd/tetra-setup-code.service` shows the first-boot setup code on the
+console until setup completes. `pam/ultramarine-dashboard` is the PAM service
+used for dashboard passwords and belongs in `/etc/pam.d`.
 
-`systemd/tetra.sysusers.conf` creates the `tetra` group. To let the dashboard
-container reach Tetra, bind-mount the socket into the container and run it
-with the `tetra` group (for a Quadlet, `Volume=/run/tetra/tetra.sock:/run/tetra/tetra.sock`
-and `GroupAdd=tetra`, or `GroupAdd=keep-groups` for a rootless container whose
-user is in `tetra`).
+`systemd/tetra.sysusers.conf` creates the `tetra` group with the fixed GID
+**241**, chosen from Fedora's system range (201–999) outside the 0–200 range
+the `setup` package reserves. The dashboard's rootful container must keep the
+host UID of `ultramarine-dashboard` and receive the group by number: in its
+Quadlet, `Volume=/run/tetra/tetra.sock:/run/tetra/tetra.sock` and
+`GroupAdd=241`. The OOBE service uses `SupplementaryGroups=tetra`. A host whose
+`tetra` group already existed with another GID keeps it (`systemd-sysusers`
+does not change existing groups, and falls back to a dynamic GID if 241 is
+taken); `agent-serve` logs a warning in that case, and the group has to be
+fixed with `groupmod -g 241 tetra`.
 
 ## Host enrollment
 
@@ -301,17 +315,20 @@ revoke the host there as well.
 The controller-side API is described in
 [docs/remote-enrollment.md](docs/remote-enrollment.md).
 
-## Authentication and Elevation
+## Authentication and Authorization
 
-Tetra uses Ed25519 asymmetric key authentication for inbound WebSocket
-sessions. The dashboard stores the private key server-side; Tetra stores only
-the controller public key. Outbound WSS uses mTLS for transport identity, with
-the client certificate issued by `tetra enroll`.
+Local clients authenticate users through Tetra and send a session token with
+every request; Tetra authorizes each action from the user's admin status
+(`ultramarine-admin` or `wheel`) and per-page grants. See
+[docs/auth-protocol.md](docs/auth-protocol.md). Outbound WSS uses mTLS for
+transport identity, with the client certificate issued by `tetra enroll`; its
+commands run with full rights and are recorded as remote actions. The
+development TCP listener still uses Ed25519 controller-key authentication.
 
-Mutating host actions execute by default. Privileged actions require an
-in-memory, session-bound elevation grant obtained by verifying the
-administrator password against the host shadow database. The grant expires
-after a configurable TTL (default 30 minutes).
+Console recovery: `sudo tetra auth reset-2fa <user>` removes a user's TOTP and
+recovery codes, and `sudo tetra setup code` prints the first-boot setup code. On a host that
+already has an eligible administrator, `sudo tetra setup complete` finishes
+setup without the OOBE.
 
 To discover enabled modules and actions, send:
 
