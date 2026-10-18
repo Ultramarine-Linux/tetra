@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::prelude::*;
 
-use super::store::{self, Extra, Header, Record};
+use super::store::{self, Extra, Header, Record, Tolerant};
 
 /// Prefix that makes tokens easy to recognize in logs and secret scanners.
 pub const TOKEN_PREFIX: &str = "tts_";
@@ -122,8 +122,10 @@ pub enum SessionError {
 struct SessionsFile {
     #[serde(flatten)]
     header: Header,
+    /// Sessions with a client, kind or method this build does not know
+    /// (issued by a newer build) are kept as they are, but never accepted.
     #[serde(default)]
-    sessions: Vec<Session>,
+    sessions: Vec<Tolerant<Session>>,
     #[serde(flatten)]
     extra: Extra,
 }
@@ -139,6 +141,8 @@ impl Record for SessionsFile {
 
 struct State {
     sessions: HashMap<String, Session>,
+    /// Sessions from a newer build, written back unchanged until they expire.
+    opaque: Vec<Value>,
     extra: Extra,
     dirty: bool,
 }
@@ -171,17 +175,28 @@ impl SessionStore {
     /// Fails when the file exists but cannot be read.
     pub fn load(path: PathBuf, policy: SessionPolicy, now: i64) -> Result<Self> {
         let file = store::read::<SessionsFile>(&path)?.unwrap_or_default();
-        let sessions = file
-            .sessions
-            .into_iter()
-            .filter(|session| live(&policy, session, now))
-            .map(|session| (session.token_hash.clone(), session))
-            .collect();
+        let mut sessions = HashMap::new();
+        let mut opaque = Vec::new();
+        for session in file.sessions {
+            match session {
+                Tolerant::Known(session) => {
+                    if live(&policy, &session, now) {
+                        sessions.insert(session.token_hash.clone(), session);
+                    }
+                }
+                Tolerant::Unknown(session) => {
+                    if !opaque_expired(&session, now) {
+                        opaque.push(session);
+                    }
+                }
+            }
+        }
         Ok(Self {
             path,
             policy,
             state: Mutex::new(State {
                 sessions,
+                opaque,
                 extra: file.extra,
                 dirty: false,
             }),
@@ -316,7 +331,9 @@ impl SessionStore {
         state
             .sessions
             .retain(|_, session| live(&self.policy, session, now));
-        if state.sessions.len() != before {
+        let opaque = state.opaque.len();
+        state.opaque.retain(|session| !opaque_expired(session, now));
+        if state.sessions.len() != before || state.opaque.len() != opaque {
             state.dirty = true;
         }
     }
@@ -324,6 +341,11 @@ impl SessionStore {
     fn persist(&self, state: &mut State) -> Result<()> {
         let mut sessions: Vec<_> = state.sessions.values().cloned().collect();
         sessions.sort_by_key(|session| session.created_at);
+        let sessions = sessions
+            .into_iter()
+            .map(Tolerant::Known)
+            .chain(state.opaque.iter().cloned().map(Tolerant::Unknown))
+            .collect();
         store::write(
             &self.path,
             &mut SessionsFile {
@@ -341,6 +363,15 @@ impl SessionStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Whether a session this build cannot read has passed its `expires_at`.
+/// One without a readable `expires_at` is kept for the build that wrote it.
+fn opaque_expired(session: &Value, now: i64) -> bool {
+    session
+        .get("expires_at")
+        .and_then(Value::as_i64)
+        .is_some_and(|expires_at| now >= expires_at)
 }
 
 const fn live(policy: &SessionPolicy, session: &Session, now: i64) -> bool {
@@ -494,6 +525,57 @@ mod tests {
         let file = fs::read_to_string(&path).unwrap();
         assert!(!file.contains(&hash_token(&abandoned)));
         assert!(file.contains(&hash_token(&kept)));
+    }
+
+    #[test]
+    fn sessions_from_a_newer_build_are_kept_but_never_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let future = |id: &str, expires_at: i64| {
+            serde_json::json!({
+                "id": id, "token_hash": hash_token(&format!("{TOKEN_PREFIX}{id}")),
+                "uid": 1000, "client": "dashboard", "kind": "user", "method": "future_method",
+                "epoch": 0, "created_at": 0, "expires_at": expires_at, "last_seen": 0,
+            })
+        };
+        fs::write(
+            &path,
+            serde_json::json!({
+                "schema": 2, "compat": 1,
+                "sessions": [future("current", 1000), future("old", 50), {"id": "odd", "kind": {"new": true}}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let sessions = SessionStore::load(path.clone(), SessionPolicy::default(), 100).unwrap();
+        assert_eq!(
+            sessions.validate(
+                &format!("{TOKEN_PREFIX}current"),
+                ClientKind::Dashboard,
+                100
+            ),
+            Err(SessionError::Invalid)
+        );
+        assert_eq!(sessions.list(|_| true, 100), []);
+
+        sessions
+            .issue(new_user(ClientKind::Dashboard), 100)
+            .unwrap();
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let written = written["sessions"].as_array().unwrap();
+        assert_eq!(written.len(), 3);
+        assert!(written.contains(&future("current", 1000)));
+        assert!(written.contains(&serde_json::json!({"id": "odd", "kind": {"new": true}})));
+        // Expired ones go, like any other session.
+        assert!(!written.contains(&future("old", 50)));
+        sessions.flush(1000).unwrap();
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            !written["sessions"]
+                .as_array()
+                .unwrap()
+                .contains(&future("current", 1000))
+        );
     }
 
     #[test]

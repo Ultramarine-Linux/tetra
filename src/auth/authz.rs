@@ -5,9 +5,10 @@
 //! `manage` implies `view`.
 //!
 //! - Administrators (`ultramarine-admin` or `wheel`) may run everything.
-//! - Other users get `services: view` by default, plus whatever an
-//!   administrator granted them, stored per UID in
-//!   `/var/lib/tetra/auth/grants.json`.
+//! - Other users get `launcher: view` by default (the apps they can open),
+//!   plus whatever an administrator granted them, stored per UID in
+//!   `/var/lib/tetra/auth/grants.json`. `system_services` (systemd units and
+//!   their journal) is administrator-only unless granted.
 //! - Actions that are root-equivalent are [`Requirement::AdminOnly`] and can
 //!   never be granted: managing users, reading or writing files (the files
 //!   module runs as root on any path), changing settings and
@@ -26,13 +27,17 @@ use std::collections::BTreeMap;
 
 use crate::prelude::*;
 
-use super::store::{self, Extra, Header, Record, StoreLock};
+use super::store::{self, Extra, Header, Record, StoreLock, Tolerant};
 
 /// A dashboard page that permissions are grouped by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Page {
-    Services,
+    /// The apps a user can open (`launcher.*` operations).
+    Launcher,
+    /// Systemd units and their logs. Earlier builds called it `services`.
+    #[serde(alias = "services")]
+    SystemServices,
     Apps,
     Containers,
     Storage,
@@ -45,8 +50,27 @@ pub enum Page {
 }
 
 impl Page {
-    pub const ALL: [Self; 10] = [
-        Self::Services,
+    /// Name shown in the dashboard's grant editor.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Launcher => "Services",
+            Self::SystemServices => "System services",
+            Self::Apps => "Apps",
+            Self::Containers => "Containers",
+            Self::Storage => "Storage",
+            Self::Sharing => "Sharing",
+            Self::Network => "Network",
+            Self::VirtualMachines => "Virtual machines",
+            Self::Settings => "Settings",
+            Self::Users => "Users",
+            Self::Files => "Files",
+        }
+    }
+
+    pub const ALL: [Self; 11] = [
+        Self::Launcher,
+        Self::SystemServices,
         Self::Apps,
         Self::Containers,
         Self::Storage,
@@ -76,7 +100,8 @@ pub enum Requirement {
 
 use Level::{Manage, View};
 use Page::{
-    Apps, Containers, Network, Services, Settings, Sharing, Storage, Users, VirtualMachines,
+    Apps, Containers, Launcher, Network, Settings, Sharing, Storage, SystemServices, Users,
+    VirtualMachines,
 };
 use Requirement::{AdminOnly, Authenticated};
 
@@ -88,11 +113,20 @@ const fn page(page: Page, level: Level) -> Requirement {
 const TABLE: &[(&str, &str, Requirement)] = &[
     ("settings", "get_system", Authenticated),
     ("settings", "set_hostname", AdminOnly),
-    // Services are system units: viewing is the default permission,
-    // managing them is admin-only.
-    ("services", "list", page(Services, View)),
-    ("services", "status", page(Services, View)),
-    ("services", "logs", page(Services, View)),
+    // The launcher is a session operation (`launcher.*`), not a module, but
+    // it is authorized through this table too. Which entries a user sees is
+    // decided per entry (`src/auth/launcher.rs`).
+    ("launcher", "list", page(Launcher, View)),
+    ("launcher", "get", page(Launcher, View)),
+    ("launcher", "set", AdminOnly),
+    ("launcher", "remove", AdminOnly),
+    ("launcher", "public_get", AdminOnly),
+    ("launcher", "public_set", AdminOnly),
+    // System units and their journal: viewing can be granted, managing them
+    // is admin-only.
+    ("services", "list", page(SystemServices, View)),
+    ("services", "status", page(SystemServices, View)),
+    ("services", "logs", page(SystemServices, View)),
     ("services", "daemon_reload", AdminOnly),
     ("services", "start", AdminOnly),
     ("services", "stop", AdminOnly),
@@ -264,7 +298,7 @@ pub type Permissions = BTreeMap<Page, Level>;
 /// Permissions every non-admin has.
 #[must_use]
 pub fn default_permissions() -> Permissions {
-    BTreeMap::from([(Services, View)])
+    BTreeMap::from([(Launcher, View)])
 }
 
 /// Who is asking.
@@ -305,13 +339,38 @@ impl Principal {
     }
 }
 
+/// One user's grants as stored: page names as written, so pages and levels
+/// from a newer build survive a rewrite. Only the entries this build
+/// understands grant anything ([`known_permissions`]).
+pub type StoredGrants = BTreeMap<String, Tolerant<Level>>;
+
+/// The page a stored key names, if this build knows it (earlier names
+/// included).
+fn parse_page(key: &str) -> Option<Page> {
+    serde_json::from_value(Value::String(key.to_owned())).ok()
+}
+
+/// The pages and levels of `stored` that this build knows. Unknown entries
+/// grant nothing.
+#[must_use]
+pub fn known_permissions(stored: &StoredGrants) -> Permissions {
+    let mut permissions = Permissions::new();
+    for (key, level) in stored {
+        if let (Some(page), Some(level)) = (parse_page(key), level.known()) {
+            let entry = permissions.entry(page).or_insert(*level);
+            *entry = (*entry).max(*level);
+        }
+    }
+    permissions
+}
+
 /// Stored grants, keyed by UID.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GrantsFile {
     #[serde(flatten)]
     header: Header,
     #[serde(default)]
-    pub grants: BTreeMap<u32, Permissions>,
+    pub grants: BTreeMap<u32, StoredGrants>,
     #[serde(flatten)]
     extra: Extra,
 }
@@ -352,7 +411,11 @@ impl GrantStore {
     pub fn all(&self) -> Result<BTreeMap<u32, Permissions>> {
         Ok(store::read::<GrantsFile>(&self.path)?
             .unwrap_or_default()
-            .grants)
+            .grants
+            .iter()
+            .map(|(uid, stored)| (*uid, known_permissions(stored)))
+            .filter(|(_, permissions)| !permissions.is_empty())
+            .collect())
     }
 
     /// Default permissions merged with `uid`'s grants.
@@ -394,13 +457,18 @@ impl GrantStore {
         let mut file = store::read::<GrantsFile>(&self.path)?.unwrap_or_default();
         let grants = file.grants.entry(uid).or_default();
         for (page, level) in changes {
-            match level {
-                Some(level) => grants.insert(*page, *level),
-                None => grants.remove(page),
-            };
+            // Also drops the page's entries under earlier names.
+            grants.retain(|key, _| parse_page(key) != Some(*page));
+            if let Some(level) = level {
+                let key = serde_json::to_value(page)?
+                    .as_str()
+                    .context("page names are strings")?
+                    .to_owned();
+                grants.insert(key, Tolerant::Known(*level));
+            }
         }
-        let result = grants.clone();
-        if result.is_empty() {
+        let result = known_permissions(grants);
+        if grants.is_empty() {
             file.grants.remove(&uid);
         }
         store::write(&self.path, &mut file)?;
@@ -416,6 +484,7 @@ pub fn catalog() -> Value {
         .map(|page| {
             jsonf! {
                 "page": page,
+                "label": page.label(),
                 "grantable": [View, Manage].into_iter().filter(|level| grantable(*page, *level)).collect::<Vec<_>>(),
                 "default": default_permissions().get(page),
             }
@@ -457,11 +526,15 @@ mod tests {
     }
 
     #[test]
-    fn non_admins_can_view_services_by_default() {
+    fn non_admins_only_get_the_launcher_by_default() {
         let alice = user(false, default_permissions());
-        assert!(alice.allows("services", "list"));
+        assert!(alice.allows("launcher", "list"));
+        assert!(alice.allows("launcher", "get"));
+        assert!(!alice.allows("launcher", "set"));
         assert!(alice.allows("services", "capabilities"));
-        assert!(!alice.allows("services", "restart"));
+        for action in ["list", "status", "logs", "restart"] {
+            assert!(!alice.allows("services", action), "services.{action}");
+        }
         assert!(!alice.allows("storage", "list"));
         assert!(!alice.allows("users", "create"));
     }
@@ -488,7 +561,8 @@ mod tests {
             Users,
             Page::Files,
             Settings,
-            Services,
+            Launcher,
+            SystemServices,
             Apps,
             Containers,
             VirtualMachines,
@@ -510,6 +584,15 @@ mod tests {
         let alice = user(false, BTreeMap::from([(Storage, View)]));
         assert!(alice.allows("storage", "list"));
         assert!(!alice.allows("storage", "mount"));
+    }
+
+    #[test]
+    fn system_services_can_be_granted_view() {
+        assert!(!default_permissions().contains_key(&SystemServices));
+        assert!(grantable(SystemServices, View));
+        let alice = user(false, BTreeMap::from([(SystemServices, View)]));
+        assert!(alice.allows("services", "logs"));
+        assert!(!alice.allows("services", "restart"));
     }
 
     #[test]
@@ -560,12 +643,13 @@ mod tests {
         grants
             .set(
                 1000,
-                &BTreeMap::from([(Network, Some(Manage)), (Services, Some(View))]),
+                &BTreeMap::from([(Network, Some(Manage)), (SystemServices, Some(View))]),
             )
             .unwrap();
         let effective = grants.effective(1000).unwrap();
         assert_eq!(effective.get(&Network), Some(&Manage));
-        assert_eq!(effective.get(&Services), Some(&View));
+        assert_eq!(effective.get(&SystemServices), Some(&View));
+        assert_eq!(effective.get(&Launcher), Some(&View));
         assert_eq!(grants.effective(1001).unwrap(), default_permissions());
 
         grants
@@ -590,6 +674,72 @@ mod tests {
         let effective = GrantStore::new(path).effective(1000).unwrap();
         assert_eq!(effective.get(&Page::Files), None);
         assert_eq!(effective.get(&Storage), Some(&View));
+    }
+
+    #[test]
+    fn grants_for_pages_and_levels_from_a_newer_build_grant_nothing_and_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grants.json");
+        fs::write(
+            &path,
+            r#"{"schema": 2, "compat": 1, "grants": {
+                "1000": {"future_page": "manage", "storage": "view", "network": "superpower"},
+                "1001": {"future_page": {"level": "view", "scope": ["x"]}}
+            }}"#,
+        )
+        .unwrap();
+        let grants = GrantStore::new(path.clone());
+        let effective = grants.effective(1000).unwrap();
+        assert_eq!(
+            effective,
+            BTreeMap::from([(Launcher, View), (Storage, View)])
+        );
+        assert_eq!(grants.effective(1001).unwrap(), default_permissions());
+        assert_eq!(
+            grants.all().unwrap(),
+            BTreeMap::from([(1000, BTreeMap::from([(Storage, View)]))])
+        );
+
+        grants
+            .set(
+                1000,
+                &BTreeMap::from([(Sharing, Some(Manage)), (Storage, None)]),
+            )
+            .unwrap();
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            written["grants"],
+            serde_json::json!({
+                "1000": {"future_page": "manage", "network": "superpower", "sharing": "manage"},
+                "1001": {"future_page": {"level": "view", "scope": ["x"]}}
+            })
+        );
+        assert_eq!(
+            grants.get(1000).unwrap(),
+            BTreeMap::from([(Sharing, Manage)])
+        );
+    }
+
+    #[test]
+    fn grants_of_the_old_services_page_mean_system_services() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grants.json");
+        fs::write(
+            &path,
+            r#"{"schema": 1, "compat": 1, "grants": {"1000": {"services": "view"}}}"#,
+        )
+        .unwrap();
+        let grants = GrantStore::new(path.clone());
+        assert_eq!(
+            grants.effective(1000).unwrap().get(&SystemServices),
+            Some(&View)
+        );
+        // Changing the page replaces the entry under its old name.
+        grants
+            .set(1000, &BTreeMap::from([(SystemServices, None)]))
+            .unwrap();
+        assert_eq!(grants.get(1000).unwrap(), Permissions::new());
+        assert!(!fs::read_to_string(&path).unwrap().contains("services"));
     }
 
     #[test]

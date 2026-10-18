@@ -237,6 +237,9 @@ async fn access_set_writes_the_dashboard_site_and_needs_an_admin() {
     let contents = std::fs::read_to_string(&site).unwrap();
     assert!(contents.contains("server.example.com {"), "{contents}");
     assert!(contents.contains("reverse_proxy 127.0.0.1:3972"));
+    // The launcher's public page is routed even while it is disabled; Tetra
+    // only writes the file once an administrator turns it on.
+    assert!(contents.contains("handle_path /public/*"), "{contents}");
 
     ok(
         &host.service,

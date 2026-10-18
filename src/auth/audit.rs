@@ -163,6 +163,30 @@ mod tests {
     }
 
     #[test]
+    fn entries_from_a_newer_build_are_skipped_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = AuditLog::new(dir.path().to_path_buf());
+        let mut future = serde_json::to_value(entry(Origin::Local, "future")).unwrap();
+        future["origin"] = "federated".into();
+        let line = format!("{future}\n");
+        fs::write(dir.path().join(FILE), &line).unwrap();
+        log.record(&entry(Origin::Local, "list"));
+        let actions: Vec<_> = log
+            .recent(10, None)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.action)
+            .collect();
+        assert_eq!(actions, ["list"]);
+        // The log is append-only, so the line stays for the build that wrote it.
+        assert!(
+            fs::read_to_string(dir.path().join(FILE))
+                .unwrap()
+                .starts_with(&line)
+        );
+    }
+
+    #[test]
     fn rotates_large_logs() {
         let dir = tempfile::tempdir().unwrap();
         let log = AuditLog::new(dir.path().to_path_buf());

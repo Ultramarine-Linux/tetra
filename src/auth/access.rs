@@ -22,7 +22,7 @@ use webauthn_rs::{Webauthn, WebauthnBuilder, prelude::Url};
 
 use crate::prelude::*;
 
-use super::store::{self, Extra, Header, Record};
+use super::store::{self, Extra, Header, Record, Tolerant};
 
 /// Where the dashboard container listens unless `tetra agent-serve
 /// --dashboard-upstream` or `access.set` says otherwise. To be confirmed
@@ -62,6 +62,24 @@ fn default_upstream() -> String {
 }
 
 impl Record for AccessConfig {
+    fn header(&self) -> &Header {
+        &self.header
+    }
+    fn header_mut(&mut self) -> &mut Header {
+        &mut self.header
+    }
+}
+
+/// Just the mode of `access.json`, to recognize a mode from a newer build
+/// before parsing the rest. Only read, never written.
+#[derive(Serialize, Deserialize)]
+struct ModeProbe {
+    #[serde(flatten)]
+    header: Header,
+    mode: Tolerant<AccessMode>,
+}
+
+impl Record for ModeProbe {
     fn header(&self) -> &Header {
         &self.header
     }
@@ -121,10 +139,28 @@ impl AccessConfig {
         })
     }
 
+    /// The stored configuration. A mode this build does not know (written by
+    /// a newer build) reads as no configuration, so passkeys are off and app
+    /// URLs are not built; the file is left as it is until `access.set`
+    /// replaces it.
+    ///
     /// # Errors
     /// Fails when the file exists but cannot be read.
     pub fn load(path: &Path) -> Result<Option<Self>> {
-        store::read(path)
+        match store::read::<ModeProbe>(path)? {
+            None => Ok(None),
+            Some(ModeProbe {
+                mode: Tolerant::Unknown(mode),
+                ..
+            }) => {
+                eprintln!(
+                    "`{}` uses access mode {mode}, which this Tetra does not know; ignoring it",
+                    path.display()
+                );
+                Ok(None)
+            }
+            Some(_) => store::read(path),
+        }
     }
 
     /// # Errors
@@ -133,7 +169,9 @@ impl AccessConfig {
         store::write(path, self)
     }
 
-    fn host_for_url(&self) -> String {
+    /// The hostname as it appears in a URL: IPv6 addresses in brackets.
+    #[must_use]
+    pub fn url_host(&self) -> String {
         match self.hostname.parse::<IpAddr>() {
             Ok(IpAddr::V6(address)) => format!("[{address}]"),
             _ => self.hostname.clone(),
@@ -146,7 +184,7 @@ impl AccessConfig {
     /// Fails only for a hostname that is not a valid URL host.
     pub fn origin(&self) -> Result<Url> {
         let port = self.port.map(|port| format!(":{port}")).unwrap_or_default();
-        Url::parse(&format!("https://{}{port}", self.host_for_url()))
+        Url::parse(&format!("https://{}{port}", self.url_host()))
             .context("invalid dashboard origin")
     }
 
@@ -173,10 +211,14 @@ impl AccessConfig {
         Ok(Some(webauthn))
     }
 
-    /// The dashboard's Caddy site for this configuration.
+    /// The dashboard's Caddy site for this configuration, serving the
+    /// launcher's public page from `public_root` when given.
     #[cfg(feature = "reverse-proxy")]
     #[must_use]
-    pub fn dashboard_site(&self) -> crate::agent::modules::reverse_proxy::DashboardSite {
+    pub fn dashboard_site(
+        &self,
+        public_root: Option<&Path>,
+    ) -> crate::agent::modules::reverse_proxy::DashboardSite {
         use crate::agent::modules::reverse_proxy::{DashboardSite, DashboardTls};
         let port = self.port.map(|port| format!(":{port}")).unwrap_or_default();
         match self.mode {
@@ -184,11 +226,13 @@ impl AccessConfig {
                 address: format!("{}{port}", self.hostname),
                 tls: DashboardTls::Automatic,
                 upstream: self.dashboard_upstream.clone(),
+                public_root: public_root.map(Path::to_path_buf),
             },
             AccessMode::Ip => DashboardSite {
-                address: format!("https://{}{port}", self.host_for_url()),
+                address: format!("https://{}{port}", self.url_host()),
                 tls: DashboardTls::Internal,
                 upstream: self.dashboard_upstream.clone(),
+                public_root: public_root.map(Path::to_path_buf),
             },
         }
     }
@@ -314,7 +358,7 @@ mod tests {
             DEFAULT_DASHBOARD_UPSTREAM,
         )
         .unwrap()
-        .dashboard_site();
+        .dashboard_site(None);
         assert_eq!(domain.address, "server.example.com");
         assert_eq!(domain.tls, DashboardTls::Automatic);
         let ip = AccessConfig::from_request(
@@ -322,7 +366,7 @@ mod tests {
             DEFAULT_DASHBOARD_UPSTREAM,
         )
         .unwrap()
-        .dashboard_site();
+        .dashboard_site(None);
         assert_eq!(ip.address, "https://192.0.2.10:8443");
         assert_eq!(ip.tls, DashboardTls::Internal);
     }
@@ -339,6 +383,16 @@ mod tests {
         explicit.dashboard_upstream = Some("127.0.0.1:9000".into());
         let explicit = AccessConfig::from_request(explicit, "127.0.0.1:8080").unwrap();
         assert_eq!(explicit.dashboard_upstream, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn an_unknown_mode_reads_as_no_configuration_and_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.json");
+        let future = r#"{"schema": 2, "compat": 1, "mode": "onion", "hostname": "x.onion"}"#;
+        fs::write(&path, future).unwrap();
+        assert_eq!(AccessConfig::load(&path).unwrap(), None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), future);
     }
 
     #[test]

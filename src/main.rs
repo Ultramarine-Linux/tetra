@@ -218,6 +218,11 @@ struct AgentServeCli {
     #[arg(long, env = "TETRA_DASHBOARD_UPSTREAM", default_value = DEFAULT_DASHBOARD_UPSTREAM)]
     dashboard_upstream: String,
 
+    /// Directory of the launcher's public page, which the dashboard's Caddy
+    /// site serves under `/public/`. Must be readable by Caddy.
+    #[arg(long, default_value = auth::launcher::DEFAULT_PUBLIC_DIR)]
+    public_dir: PathBuf,
+
     /// Remote-control enrollment written by `tetra enroll`.
     #[arg(long, env = "TETRA_ENROLLMENT_DIR", default_value = DEFAULT_ENROLLMENT_DIR)]
     enrollment_dir: PathBuf,
@@ -508,6 +513,7 @@ async fn agent_serve(cli: AgentServeCli) -> Result<()> {
         AuthConfig {
             caddy_sites_dir: cli.caddy_sites_dir,
             dashboard_upstream: cli.dashboard_upstream,
+            public_dir: cli.public_dir,
             ..AuthConfig::system(cli.state_dir)
         },
         cli.pam_service,

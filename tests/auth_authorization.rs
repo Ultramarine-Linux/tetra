@@ -33,14 +33,18 @@ async fn allowed(
 }
 
 #[tokio::test]
-async fn non_admins_only_view_services_by_default() {
+async fn non_admins_only_get_the_launcher_by_default() {
     let dir = tempfile::tempdir().unwrap();
     let host = host(dir.path());
     let alice = login(&host.service, "alice").await;
-    assert!(allowed(&host.service, &alice, "services", "list").await);
     assert!(allowed(&host.service, &alice, "settings", "get_system").await);
     assert!(allowed(&host.service, &alice, "storage", "capabilities").await);
+    assert!(allowed(&host.service, &alice, "services", "capabilities").await);
     for (module, action) in [
+        // System units and the journal are administrator-only by default.
+        ("services", "list"),
+        ("services", "status"),
+        ("services", "logs"),
         ("services", "restart"),
         ("storage", "list"),
         ("users", "create"),
@@ -107,7 +111,7 @@ async fn admins_grant_page_permissions_per_uid() {
     .await;
     assert_eq!(
         set["effective"],
-        json!({"services": "view", "storage": "view", "network": "manage"})
+        json!({"launcher": "view", "storage": "view", "network": "manage"})
     );
 
     // Grants apply to existing sessions right away.
@@ -147,7 +151,8 @@ async fn root_equivalent_permissions_cannot_be_granted() {
         "users",
         "files",
         "settings",
-        "services",
+        "system_services",
+        "launcher",
         "apps",
         "containers",
         "storage",
@@ -177,6 +182,50 @@ async fn root_equivalent_permissions_cannot_be_granted() {
         .find(|page| page["page"] == "users")
         .unwrap();
     assert_eq!(users["grantable"], json!(["view"]));
+    let system_services = catalog["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|page| page["page"] == "system_services")
+        .unwrap();
+    assert_eq!(system_services["label"], "System services");
+    assert_eq!(system_services["grantable"], json!(["view"]));
+    assert_eq!(system_services["default"], json!(null));
+}
+
+#[tokio::test]
+async fn system_services_view_can_be_granted() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(dir.path());
+    let alice = login(&host.service, "alice").await;
+    let admin = login(&host.service, "admin").await;
+    let denied = call(
+        &host.service,
+        Dashboard,
+        Some(&alice),
+        "module.dispatch",
+        json!({"module": "services", "action": "logs", "payload": {"unit": "sshd.service"}}),
+    )
+    .await
+    .error
+    .unwrap();
+    assert_eq!(denied.code, ErrorCode::Forbidden);
+    assert!(
+        denied.message.contains("system_services"),
+        "{}",
+        denied.message
+    );
+
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "admin.grants_set",
+        json!({"uid": 1000, "grants": {"system_services": "view"}}),
+    )
+    .await;
+    assert!(allowed(&host.service, &alice, "services", "logs").await);
+    assert!(!allowed(&host.service, &alice, "services", "restart").await);
 }
 
 #[tokio::test]

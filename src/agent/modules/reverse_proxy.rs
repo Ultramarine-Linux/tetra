@@ -382,6 +382,10 @@ pub struct DashboardSite {
     pub tls: DashboardTls,
     /// Where the dashboard container listens, such as `127.0.0.1:3972`.
     pub upstream: String,
+    /// Directory of the launcher's public page, served under `/public/`
+    /// without a login. Tetra removes the page while it is disabled, so the
+    /// route then answers 404.
+    pub public_root: Option<PathBuf>,
 }
 
 impl DashboardSite {
@@ -403,8 +407,24 @@ impl DashboardSite {
             DashboardTls::Automatic => "",
             DashboardTls::Internal => "\ttls internal\n",
         };
+        let public = match &self.public_root {
+            Some(root) => {
+                let root = root.to_str().unwrap_or_default();
+                ensure!(
+                    root.starts_with('/')
+                        && root.chars().all(|ch| {
+                            ch.is_ascii_alphanumeric() || matches!(ch, '/' | '-' | '_' | '.')
+                        }),
+                    "invalid public page directory `{root}`"
+                );
+                format!(
+                    "\tredir /public /public/\n\thandle_path /public/* {{\n\t\troot * {root}\n\t\tfile_server\n\t}}\n"
+                )
+            }
+            None => String::new(),
+        };
         Ok(format!(
-            "{DASHBOARD_HEADER}\n{} {{\n{tls}\treverse_proxy {upstream}\n}}\n",
+            "{DASHBOARD_HEADER}\n{} {{\n{tls}{public}\treverse_proxy {upstream}\n}}\n",
             self.address
         ))
     }
@@ -500,6 +520,7 @@ mod tests {
             address: "server.example.com".into(),
             tls: DashboardTls::Automatic,
             upstream: "127.0.0.1:3972".into(),
+            public_root: None,
         };
         assert_eq!(
             domain.render().unwrap(),
@@ -509,10 +530,23 @@ mod tests {
             address: "https://[2001:db8::1]".into(),
             tls: DashboardTls::Internal,
             upstream: "127.0.0.1:3972".into(),
+            public_root: None,
         };
         assert!(ip.render().unwrap().contains("https://[2001:db8::1] {\n\ttls internal\n"));
         let injected = DashboardSite {
             address: "evil.example.com {\n".into(),
+            ..domain.clone()
+        };
+        injected.render().unwrap_err();
+        let public = DashboardSite {
+            public_root: Some("/var/lib/tetra-public".into()),
+            ..domain.clone()
+        };
+        assert!(public.render().unwrap().contains(
+            "\thandle_path /public/* {\n\t\troot * /var/lib/tetra-public\n\t\tfile_server\n\t}\n\treverse_proxy"
+        ));
+        let injected = DashboardSite {
+            public_root: Some("/srv {\n".into()),
             ..domain
         };
         injected.render().unwrap_err();
@@ -525,6 +559,7 @@ mod tests {
             address: "server.example.com".into(),
             tls: DashboardTls::Automatic,
             upstream: "127.0.0.1:3972".into(),
+            public_root: None,
         };
         write_dashboard_site(dir.path(), &site, false, false).unwrap();
         assert!(dir.path().join(DASHBOARD_SITE_FILE).exists());

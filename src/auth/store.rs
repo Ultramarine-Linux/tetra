@@ -13,6 +13,10 @@
 //! - Records keep fields they do not know in an `extra` map (`#[serde(flatten)]`),
 //!   so an older build that rewrites a file does not drop data a newer build
 //!   added.
+//! - Enums stored on disk are read through [`Tolerant`]: a variant this build
+//!   does not know (a new page, mode or kind) is kept as opaque JSON that
+//!   grants nothing and is written back unchanged, instead of making the
+//!   whole file unreadable.
 //!
 //! Writes are atomic (temporary file, `fsync`, `rename`), files are created
 //! `0600` and directories `0700`. [`StoreLock`] serializes read-modify-write
@@ -38,6 +42,39 @@ const LOCK_FILE: &str = ".lock";
 
 /// Unknown fields preserved across a read-modify-write cycle.
 pub type Extra = Map<String, Value>;
+
+/// A stored value that may come from a newer build: [`Tolerant::Known`] when
+/// this build understands it, the raw JSON otherwise. Serializes back to
+/// exactly what was read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Tolerant<T> {
+    Known(T),
+    Unknown(Value),
+}
+
+impl<T> Tolerant<T> {
+    /// The value, if this build understands it.
+    #[must_use]
+    pub const fn known(&self) -> Option<&T> {
+        match self {
+            Self::Known(value) => Some(value),
+            Self::Unknown(_) => None,
+        }
+    }
+}
+
+impl<T: Default> Default for Tolerant<T> {
+    fn default() -> Self {
+        Self::Known(T::default())
+    }
+}
+
+impl<T> From<T> for Tolerant<T> {
+    fn from(value: T) -> Self {
+        Self::Known(value)
+    }
+}
 
 /// Version header present at the top level of every stored file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +324,24 @@ mod tests {
         let future = json!({"schema": SCHEMA + 1, "compat": SCHEMA + 1});
         fs::write(&path, future.to_string()).unwrap();
         read::<Example>(&path).unwrap_err();
+    }
+
+    #[test]
+    fn tolerant_values_round_trip_unknown_variants() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Mode {
+            Old,
+        }
+        let known: Tolerant<Mode> = serde_json::from_value(json!("old")).unwrap();
+        assert_eq!(known.known(), Some(&Mode::Old));
+        let unknown: Tolerant<Mode> =
+            serde_json::from_value(json!({"kind": "new", "x": 1})).unwrap();
+        assert_eq!(unknown.known(), None);
+        assert_eq!(
+            serde_json::to_value(&unknown).unwrap(),
+            json!({"kind": "new", "x": 1})
+        );
     }
 
     #[test]

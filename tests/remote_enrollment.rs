@@ -558,6 +558,14 @@ impl Host {
             .arg(self.root.path().join("identity"))
             .arg("--enrollment-dir")
             .arg(&self.enrollment_dir)
+            // Keep the daemon's state out of /var/lib, so this runs without
+            // root.
+            .arg("--state-dir")
+            .arg(self.root.path().join("state"))
+            .arg("--caddy-sites-dir")
+            .arg(self.root.path().join("caddy-sites"))
+            .arg("--public-dir")
+            .arg(self.root.path().join("public"))
             .env("LISTEN_FDS", "1")
             .env_remove("TETRA_CONTROLLER_PUBLIC_KEY")
             .env_remove("TETRA_ENROLLMENT_TOKEN")
