@@ -51,6 +51,29 @@ Common causes:
 - The `server_ca_path` does not match the CA that signed the server certificate.
 - The hostname in `control_plane_url` does not match the certificate SAN.
 
+### Leftover files in `/etc/tetra` from the old `tetra enroll`
+
+Hosts enrolled before outbound enrollment may still have these files from the
+old inbound flow:
+
+- `/etc/tetra/enrollment.json`
+- `/etc/tetra/enrollment.env`
+- `/etc/tetra/tetra.key`
+- `/etc/tetra/tetra.crt`
+
+Tetra no longer reads any of them (unless you pass the key and certificate to
+the development `agent-ws-serve` listener yourself); the current enrollment
+lives in `/var/lib/tetra/remote`. They can be deleted:
+
+```sh
+sudo rm -f /etc/tetra/enrollment.json /etc/tetra/enrollment.env \
+  /etc/tetra/tetra.key /etc/tetra/tetra.crt
+```
+
+Keep `/etc/tetra/tetra.json`, which is the runtime config. A host enrolled the
+old way has no outbound enrollment, so run `tetra enroll` again if it should be
+remotely controlled.
+
 ### `unrecognized subcommand 'agent-ws-serve'`
 
 The TCP listener is development-only and is compiled only with the
