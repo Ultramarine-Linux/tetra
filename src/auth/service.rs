@@ -22,22 +22,25 @@ use crate::{
 };
 
 use super::{
-    access::{AccessConfig, AccessRequest},
+    access::{AccessConfig, AccessRequest, AcmeChallenge},
     accounts::{Account, AccountSource, LoginPolicy},
     api::{ApiError, ApiResult, ErrorCode, Request, Response, params},
     audit::{self, AuditLog, Origin},
     authz::{self, GrantStore, Level, Page, Principal},
     clock::Clock,
+    dns::{self, StoredDnsCredentials},
+    host::HostControl,
     launcher::{ChangeError, EntryInput, LauncherStore, Viewer},
     pam::{PamOutcome, PasswordBackend},
     passkey::{self, Authentication, AuthenticationState, CEREMONY_TTL, Pending, Registration},
     recovery,
     seal::{Sealer, StoreKey},
+    secrets::{DNS_CREDENTIALS, SecretStore},
     sessions::{
         AuthMethod, ClientKind, NewSession, Session, SessionError, SessionKind, SessionPolicy,
         SessionStore,
     },
-    setup::{RedeemError, Setup, SetupPaths},
+    setup::{AddressThrottle, RedeemError, Setup, SetupPaths, address_key},
     totp,
     users::{PasskeyRecord, TotpRecord, UserRecord, UserStore},
 };
@@ -57,6 +60,24 @@ const ENROLLMENT_TTL: i64 = 600;
 const PAM_CONCURRENCY: usize = 4;
 const MAX_PASSKEY_NAME: usize = 64;
 const DEFAULT_ACTION_LOG_LIMIT: usize = 100;
+/// terra-caddy's drop-in directory, imported by its default Caddyfile as
+/// `import Caddyfile.d/*.caddyfile`.
+pub const CADDY_SITES_DIR: &str = "/etc/caddy/Caddyfile.d";
+/// Seconds between `setup.complete` answering and the OOBE being stopped, so
+/// it can show its final screen.
+pub const HANDOFF_SECONDS: u32 = 5;
+/// The dashboard's unit, generated from its Quadlet.
+pub const DASHBOARD_UNIT: &str = "ultramarine-dashboard.service";
+/// The server OOBE's unit.
+pub const OOBE_UNIT: &str = "ultramarine-server-oobe.service";
+/// The boot unit that publishes the setup code.
+pub const SETUP_CODE_UNIT: &str = "tetra-setup-code.service";
+const CADDY_UNIT: &str = "caddy.service";
+/// Transient unit that finishes the handoff.
+const HANDOFF_UNIT: &str = "tetra-setup-handoff";
+/// `caddy.service` drop-in that loads the DNS-01 environment file.
+#[cfg(feature = "reverse-proxy")]
+const CADDY_DROP_IN: &str = "caddy.service.d/50-tetra.conf";
 
 /// Filesystem locations.
 #[derive(Debug, Clone)]
@@ -67,10 +88,20 @@ pub struct AuthConfig {
     pub run_dir: PathBuf,
     /// `/run/issue.d`.
     pub issue_dir: PathBuf,
-    /// Caddy site directory for the dashboard site.
+    /// Caddy site directory (terra-caddy's `/etc/caddy/Caddyfile.d`) for the
+    /// dashboard's and the OOBE's sites.
     pub caddy_sites_dir: PathBuf,
-    /// Reload Caddy after `access.set` writes the dashboard site.
-    pub reload_caddy: bool,
+    /// DNS-01 credentials for Caddy (`/etc/caddy/tetra-dns.env`).
+    pub caddy_env_file: PathBuf,
+    /// The root certificate of Caddy's internal CA, whose fingerprint the
+    /// console shows during setup.
+    pub caddy_root_ca: PathBuf,
+    /// Unit drop-ins (`/etc/systemd/system`).
+    pub systemd_dir: PathBuf,
+    /// The dashboard container's environment (`/etc/ultramarine-dashboard/env`).
+    pub dashboard_env_file: PathBuf,
+    /// This binary, run by the handoff timer.
+    pub tetra_binary: PathBuf,
     /// Dashboard address for the Caddy site when `access.set` does not name
     /// one.
     pub dashboard_upstream: String,
@@ -87,8 +118,15 @@ impl AuthConfig {
             state_dir,
             run_dir: "/run/tetra".into(),
             issue_dir: "/run/issue.d".into(),
-            caddy_sites_dir: "/etc/caddy/tetra-sites".into(),
-            reload_caddy: true,
+            caddy_sites_dir: CADDY_SITES_DIR.into(),
+            caddy_env_file: "/etc/caddy/tetra-dns.env".into(),
+            // `caddy.service` runs as `caddy` with HOME=/var/lib/caddy, so
+            // its data directory is ~/.local/share/caddy.
+            caddy_root_ca: "/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt"
+                .into(),
+            systemd_dir: "/etc/systemd/system".into(),
+            dashboard_env_file: "/etc/ultramarine-dashboard/env".into(),
+            tetra_binary: "/usr/bin/tetra".into(),
             dashboard_upstream: super::access::DEFAULT_DASHBOARD_UPSTREAM.to_owned(),
             public_dir: super::launcher::DEFAULT_PUBLIC_DIR.into(),
             session_policy: SessionPolicy::default(),
@@ -103,6 +141,12 @@ impl AuthConfig {
     #[must_use]
     pub fn access_path(&self) -> PathBuf {
         self.state_dir.join("access.json")
+    }
+
+    /// Sealed credentials for other services.
+    #[must_use]
+    pub fn secrets_dir(&self) -> PathBuf {
+        self.state_dir.join("secrets")
     }
 
     #[must_use]
@@ -133,6 +177,8 @@ pub struct Backends {
     pub sealer: Arc<dyn Sealer>,
     pub clock: Arc<dyn Clock>,
     pub policy: LoginPolicy,
+    /// systemctl and systemd-run.
+    pub host: Arc<dyn HostControl>,
 }
 
 struct PendingLogin {
@@ -158,12 +204,14 @@ struct Inner {
     sealer: Arc<dyn Sealer>,
     clock: Arc<dyn Clock>,
     policy: LoginPolicy,
+    host: Arc<dyn HostControl>,
     queue: DispatchQueue,
     users: UserStore,
     grants: GrantStore,
     launcher: LauncherStore,
     sessions: SessionStore,
     setup: Setup,
+    redeem_throttle: AddressThrottle,
     audit: AuditLog,
     key: Mutex<Option<Arc<StoreKey>>>,
     webauthn: RwLock<Option<Arc<Webauthn>>>,
@@ -337,6 +385,7 @@ impl AuthService {
                 grants: GrantStore::new(auth_dir.join("grants.json")),
                 launcher,
                 setup: Setup::new(config.setup_paths()),
+                redeem_throttle: AddressThrottle::default(),
                 audit: AuditLog::new(config.state_dir.join("audit")),
                 sessions,
                 accounts: backends.accounts,
@@ -344,6 +393,7 @@ impl AuthService {
                 sealer: backends.sealer,
                 clock: backends.clock,
                 policy: backends.policy,
+                host: backends.host,
                 queue,
                 config,
                 key: Mutex::new(None),
@@ -418,6 +468,12 @@ impl AuthService {
             _ => {}
         }
         let caller = self.authenticate(client, request.token.as_deref())?;
+        if caller.principal == Principal::Setup && !authz::setup_allows_operation(&request.op) {
+            return Err(ApiError::forbidden(format!(
+                "the setup session may not use `{}`",
+                request.op
+            )));
+        }
         match request.op.as_str() {
             "session.info" => Ok(Self::session_info(&caller)),
             "session.logout" => self.session_logout(&caller),
@@ -445,7 +501,7 @@ impl AuthService {
             "launcher.public_set" => self.launcher_public_set(&caller, params(p)?),
             "access.get" => self.access_get(),
             "access.set" => self.access_set(&caller, params(p)?).await,
-            "setup.complete" => self.setup_complete(&caller),
+            "setup.complete" => self.setup_complete(&caller).await,
             "module.dispatch" => self.dispatch(&caller, &request.id, params(p)?).await,
             op => Err(ApiError::new(
                 ErrorCode::UnknownOperation,
@@ -1016,20 +1072,55 @@ impl AuthService {
 
     fn setup_redeem(&self, client: ClientKind, p: &RedeemParams) -> ApiResult {
         require_client(client, ClientKind::Oobe)?;
+        // Logged with every attempt; escaped, as the OOBE passes it through.
+        let from = p.remote_addr.as_deref().map_or_else(
+            || "an unknown address".to_owned(),
+            |addr| {
+                addr.chars()
+                    .take(64)
+                    .collect::<String>()
+                    .escape_debug()
+                    .to_string()
+            },
+        );
+        // The per-address throttle only applies when the OOBE says who is
+        // asking; otherwise every browser would share one bucket.
+        let throttle_key = p.remote_addr.as_deref().map(address_key);
+        let now = self.now();
+        if let Some(key) = &throttle_key
+            && let Err(retry_after) = self.inner.redeem_throttle.check(key, now)
+        {
+            eprintln!(
+                "setup code attempt from {from}: refused, this address must wait {retry_after}s"
+            );
+            return Err(ApiError::rate_limited(retry_after));
+        }
         let key = self.key()?;
-        match self.inner.setup.redeem(&key, &p.code, self.now())? {
-            Ok(()) => {}
+        match self.inner.setup.redeem(&key, &p.code, now)? {
+            Ok(()) => {
+                eprintln!("setup code attempt from {from}: accepted");
+                if let Some(key) = &throttle_key {
+                    self.inner.redeem_throttle.succeeded(key);
+                }
+            }
             Err(RedeemError::Complete) => {
+                eprintln!("setup code attempt from {from}: setup has already completed");
                 return Err(ApiError::new(
                     ErrorCode::SetupComplete,
                     "setup has already completed",
                 ));
             }
             Err(RedeemError::RateLimited { retry_after }) => {
+                eprintln!(
+                    "setup code attempt from {from}: refused, all addresses must wait {retry_after}s"
+                );
                 return Err(ApiError::rate_limited(retry_after));
             }
             Err(RedeemError::Invalid) => {
-                eprintln!("wrong setup code submitted");
+                eprintln!("setup code attempt from {from}: wrong code");
+                if let Some(key) = &throttle_key {
+                    self.inner.redeem_throttle.failed(key, now);
+                }
                 return Err(ApiError::invalid_credentials());
             }
         }
@@ -1053,14 +1144,119 @@ impl AuthService {
         })
     }
 
-    fn setup_complete(&self, caller: &Caller) -> ApiResult {
+    /// Write the setup marker, then hand over to the dashboard: start it,
+    /// and stop the OOBE [`HANDOFF_SECONDS`] later from a transient timer,
+    /// so this response (with the dashboard's URL) reaches the OOBE first.
+    async fn setup_complete(&self, caller: &Caller) -> ApiResult {
         caller.require_setup_or_admin()?;
         let by = caller.user().ok().map(|(_, name)| name.to_owned());
         self.finish_setup(by.as_deref())?;
         self.inner
             .sessions
             .revoke(|session| session.kind == SessionKind::Setup)?;
-        Ok(jsonf! { "complete": true })
+        let this = self.clone();
+        let handoff = tokio::task::spawn_blocking(move || this.start_handoff(true))
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        Ok(jsonf! {
+            "complete": true,
+            "dashboard_url": self.dashboard_url(),
+            "handoff_in_seconds": HANDOFF_SECONDS,
+            handoff,
+        })
+    }
+
+    /// The dashboard's URL from the access configuration, if there is one.
+    fn dashboard_url(&self) -> Option<String> {
+        AccessConfig::load(&self.inner.config.access_path())
+            .ok()
+            .flatten()
+            .and_then(|access| access.origin_string().ok())
+    }
+
+    /// Start the dashboard and stop the OOBE: after [`HANDOFF_SECONDS`]
+    /// through a transient timer when `delayed`, right away otherwise.
+    /// Failures are reported, not returned: setup is already complete.
+    fn start_handoff(&self, delayed: bool) -> Value {
+        let host = &self.inner.host;
+        let dashboard_error = host
+            .systemctl(&["start", DASHBOARD_UNIT])
+            .err()
+            .map(|error| format!("{error:#}"));
+        if let Some(error) = &dashboard_error {
+            eprintln!("setup handoff: failed to start the dashboard: {error}");
+        }
+        let finish = if delayed {
+            let on_active = format!("--on-active={HANDOFF_SECONDS}");
+            let unit = format!("--unit={HANDOFF_UNIT}");
+            let binary = self
+                .inner
+                .config
+                .tetra_binary
+                .to_string_lossy()
+                .into_owned();
+            host.run(
+                "systemd-run",
+                &[
+                    &on_active,
+                    &unit,
+                    "--description=Hand over from the Ultramarine Server setup to the dashboard",
+                    "--collect",
+                    &binary,
+                    "setup",
+                    "finish-handoff",
+                ],
+            )
+            .map(|()| Value::Null)
+        } else {
+            self.finish_handoff()
+        };
+        let finish_error = finish.err().map(|error| format!("{error:#}"));
+        if let Some(error) = &finish_error {
+            eprintln!("setup handoff: failed to stop the OOBE: {error}");
+        }
+        jsonf! {
+            "dashboard_started": dashboard_error.is_none(),
+            dashboard_error,
+            "oobe_stop_scheduled": delayed && finish_error.is_none(),
+            "oobe_error": finish_error,
+        }
+    }
+
+    /// The end of the handoff, run by the transient timer
+    /// (`tetra setup finish-handoff`): stop and disable the OOBE and the
+    /// setup-code unit, and remove the OOBE's Caddy site.
+    ///
+    /// # Errors
+    /// Fails before setup has completed, or when a step fails (the other
+    /// steps still run).
+    pub fn finish_handoff(&self) -> Result<Value> {
+        ensure!(
+            self.inner.setup.is_complete(),
+            "setup has not completed; the OOBE is still needed"
+        );
+        let host = &self.inner.host;
+        let mut errors = Vec::new();
+        if let Err(error) = host.systemctl(&["disable", "--now", OOBE_UNIT, SETUP_CODE_UNIT]) {
+            errors.push(format!("{error:#}"));
+        }
+        #[cfg(feature = "reverse-proxy")]
+        let site_removed = match crate::agent::modules::reverse_proxy::remove_setup_site(
+            &self.inner.config.caddy_sites_dir,
+        ) {
+            Ok(removed) => removed,
+            Err(error) => {
+                errors.push(format!("{error:#}"));
+                false
+            }
+        };
+        #[cfg(not(feature = "reverse-proxy"))]
+        let site_removed = false;
+        if site_removed && let Err(error) = host.systemctl(&["try-reload-or-restart", CADDY_UNIT]) {
+            errors.push(format!("{error:#}"));
+        }
+        ensure!(errors.is_empty(), "{}", errors.join("; "));
+        Ok(jsonf! { "oobe_stopped": true, "setup_site_removed": site_removed })
     }
 
     /// Write the setup marker once an eligible administrator exists.
@@ -1091,16 +1287,18 @@ impl AuthService {
     /// # Errors
     /// Fails when setup has already completed, no eligible administrator
     /// exists, or the marker cannot be written.
-    pub fn complete_setup_from_console(&self) -> Result<()> {
+    pub fn complete_setup_from_console(&self) -> Result<Value> {
         self.finish_setup(Some("console"))
-            .map_err(|error| anyhow::anyhow!(error.message))
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        Ok(self.start_handoff(false))
     }
 
-    /// Generate (if needed) and publish the setup code for the console.
-    /// Returns `None` once setup has completed.
+    /// Generate (if needed) and publish the setup code for the console, and
+    /// write the OOBE's Caddy site. Returns `None` once setup has completed.
     ///
     /// # Errors
-    /// Fails when the code cannot be stored or published.
+    /// Fails when the code cannot be stored or published. A Caddy failure is
+    /// only logged: the console must still show the code.
     pub fn publish_setup_code(&self) -> Result<Option<String>> {
         let key = self.key()?;
         let code = self.inner.setup.ensure_code(&key, self.now())?;
@@ -1108,7 +1306,41 @@ impl AuthService {
             Some(code) => self.inner.setup.publish(code)?,
             None => self.inner.setup.unpublish()?,
         }
+        #[cfg(feature = "reverse-proxy")]
+        if let Err(error) = self.sync_setup_site(code.is_some()) {
+            eprintln!("failed to update the OOBE's Caddy site: {error:#}");
+        }
         Ok(code)
+    }
+
+    /// Write (during setup) or remove (after it) the OOBE's Caddy site and
+    /// reload Caddy if it changed. `--no-block`: at boot this runs before
+    /// Caddy starts.
+    #[cfg(feature = "reverse-proxy")]
+    fn sync_setup_site(&self, setup: bool) -> Result<()> {
+        use crate::agent::modules::reverse_proxy::{remove_setup_site, write_setup_site};
+        let dir = &self.inner.config.caddy_sites_dir;
+        let changed = if setup {
+            write_setup_site(dir)?
+        } else {
+            remove_setup_site(dir)?
+        };
+        if changed {
+            self.inner
+                .host
+                .systemctl(&["--no-block", "try-reload-or-restart", CADDY_UNIT])?;
+        }
+        Ok(())
+    }
+
+    /// SHA-256 fingerprint of Caddy's internal CA root, as `AA:BB:...`, for
+    /// the console to show next to the OOBE's address. `None` until Caddy has
+    /// created its CA (on its first start with a `tls internal` site).
+    #[must_use]
+    pub fn internal_ca_fingerprint(&self) -> Option<String> {
+        let pem = fs::read(&self.inner.config.caddy_root_ca).ok()?;
+        let der = rustls_pemfile::certs(&mut pem.as_slice()).next()?.ok()?;
+        Some(fingerprint(&der))
     }
 
     // --- Sessions --------------------------------------------------------
@@ -1127,7 +1359,10 @@ impl AuthService {
             Principal::User { admin: true, .. } => jsonf! { "all": true },
             Principal::User { permissions, .. } => json_value(permissions),
             Principal::Setup => {
-                jsonf! { "setup": authz::SETUP_ALLOWED.iter().map(|(m, a)| format!("{m}.{a}")).collect::<Vec<_>>() }
+                jsonf! {
+                    "setup": authz::SETUP_ALLOWED.iter().map(|(m, a)| format!("{m}.{a}")).collect::<Vec<_>>(),
+                    "operations": authz::SETUP_OPERATIONS,
+                }
             }
             Principal::RemoteController => Value::Null,
         };
@@ -1524,20 +1759,21 @@ impl AuthService {
         Ok(jsonf! { access, "passkeys_available": self.webauthn().is_ok() })
     }
 
-    // Without `reverse-proxy` there is no dashboard site to write.
-    #[cfg_attr(
-        not(feature = "reverse-proxy"),
-        allow(clippy::unused_async, clippy::unused_async_trait_impl)
-    )]
-    async fn access_set(&self, caller: &Caller, request: AccessRequest) -> ApiResult {
+    async fn access_set(&self, caller: &Caller, mut request: AccessRequest) -> ApiResult {
         caller.require_setup_or_admin()?;
+        let given = request.dns_credentials.take();
         let mut config = AccessConfig::from_request(request, &self.inner.config.dashboard_upstream)
             .map_err(ApiError::bad_request)?;
         let webauthn = config.webauthn().map_err(ApiError::bad_request)?;
-        #[cfg(feature = "reverse-proxy")]
-        let dashboard_site = self.write_dashboard_site(&config).await?;
-        #[cfg(not(feature = "reverse-proxy"))]
-        let dashboard_site = Value::Null;
+        let dns = self.dns_credentials(&config, given)?;
+        let origin = config.origin_string().map_err(ApiError::bad_request)?;
+        let this = self.clone();
+        let applied = {
+            let config = config.clone();
+            tokio::task::spawn_blocking(move || this.apply_access(&config, dns.as_ref(), &origin))
+                .await
+                .map_err(|error| anyhow::anyhow!(error))??
+        };
         config.save(&self.inner.config.access_path())?;
         *self
             .inner
@@ -1556,20 +1792,173 @@ impl AuthService {
         Ok(jsonf! {
             "access": config,
             "passkeys_available": self.webauthn().is_ok(),
-            dashboard_site,
+            "dashboard_url": applied["dashboard_url"],
+            "dashboard_site": applied["dashboard_site"],
+            "caddy": applied["caddy"],
+            "dashboard_env": applied["dashboard_env"],
         })
     }
 
-    #[cfg(feature = "reverse-proxy")]
-    async fn write_dashboard_site(&self, config: &AccessConfig) -> Result<Value, ApiError> {
-        let site = config.dashboard_site(Some(&self.inner.config.public_dir));
-        let dir = self.inner.config.caddy_sites_dir.clone();
-        let reload = self.inner.config.reload_caddy;
-        Ok(tokio::task::spawn_blocking(move || {
-            crate::agent::modules::reverse_proxy::write_dashboard_site(&dir, &site, false, reload)
+    /// The DNS-01 credentials for `config`: the ones given, or the ones
+    /// stored for the same provider.
+    fn dns_credentials(
+        &self,
+        config: &AccessConfig,
+        given: Option<dns::DnsCredentials>,
+    ) -> Result<Option<StoredDnsCredentials>, ApiError> {
+        let (AcmeChallenge::Dns01, Some(provider)) = (config.challenge, config.dns_provider) else {
+            return Ok(None);
+        };
+        if let Some(credentials) = given {
+            return Ok(Some(StoredDnsCredentials {
+                provider,
+                credentials,
+            }));
+        }
+        let secrets = SecretStore::new(self.inner.config.secrets_dir());
+        let stored = secrets
+            .get(self.inner.sealer.as_ref(), DNS_CREDENTIALS)?
+            .map(|bytes| serde_json::from_slice::<StoredDnsCredentials>(&bytes))
+            .transpose()
+            .context("stored DNS credentials are unreadable")?
+            .filter(|stored| stored.provider == provider);
+        stored.map(Some).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "dns_credentials are required for {}",
+                provider.name()
+            ))
         })
-        .await
-        .map_err(|error| anyhow::anyhow!(error))??)
+    }
+
+    /// Write everything `access.set` changes on the host: the DNS-01
+    /// credentials for Caddy, the dashboard's site, the dashboard's
+    /// `ORIGIN`; then reload or restart what uses them.
+    #[cfg_attr(not(feature = "reverse-proxy"), allow(unused_variables))]
+    fn apply_access(
+        &self,
+        config: &AccessConfig,
+        dns: Option<&StoredDnsCredentials>,
+        origin: &str,
+    ) -> Result<Value, ApiError> {
+        #[cfg(feature = "reverse-proxy")]
+        let (dashboard_site, caddy) = self.write_caddy_config(config, dns)?;
+        #[cfg(not(feature = "reverse-proxy"))]
+        let (dashboard_site, caddy) = (Value::Null, Value::Null);
+        let dashboard_env = self.write_dashboard_env(origin)?;
+        Ok(jsonf! { "dashboard_url": origin, dashboard_site, caddy, dashboard_env })
+    }
+
+    /// Seal or forget the DNS-01 credentials, write Caddy's environment file
+    /// and drop-in to match, write the dashboard's site, then reload Caddy,
+    /// or restart it (without waiting, as this request may be passing
+    /// through it) when its environment changed.
+    #[cfg(feature = "reverse-proxy")]
+    fn write_caddy_config(
+        &self,
+        config: &AccessConfig,
+        dns: Option<&StoredDnsCredentials>,
+    ) -> Result<(Value, Value), ApiError> {
+        let paths = &self.inner.config;
+        let secrets = SecretStore::new(paths.secrets_dir());
+        let drop_in = paths.systemd_dir.join(CADDY_DROP_IN);
+        let (env_changed, drop_in_changed) = if let Some(stored) = dns {
+            secrets.put(
+                self.inner.sealer.as_ref(),
+                DNS_CREDENTIALS,
+                &serde_json::to_vec(stored).context("failed to encode DNS credentials")?,
+            )?;
+            let env = dns::env_file(stored.provider, &stored.credentials);
+            let env_changed = replace_if_changed(&paths.caddy_env_file, env.as_bytes(), 0o640)?;
+            share_with_caddy(&paths.caddy_env_file)?;
+            let unit = format!(
+                "# Managed by Tetra (access.set): DNS-01 credentials for the dashboard's\n\
+                 # certificate, referenced by the site as {{env.TETRA_DNS_*}}.\n\
+                 [Service]\n\
+                 EnvironmentFile=-{}\n",
+                paths.caddy_env_file.display()
+            );
+            let drop_in_changed = replace_if_changed(&drop_in, unit.as_bytes(), 0o644)?;
+            (env_changed, drop_in_changed)
+        } else {
+            secrets.remove(DNS_CREDENTIALS)?;
+            (
+                remove_if_exists(&paths.caddy_env_file)?,
+                remove_if_exists(&drop_in)?,
+            )
+        };
+        let site = config
+            .dashboard_site(
+                Some(&paths.public_dir),
+                dns.map(|stored| &stored.credentials),
+            )
+            .map_err(ApiError::bad_request)?;
+        let dashboard_site = crate::agent::modules::reverse_proxy::write_dashboard_site(
+            &paths.caddy_sites_dir,
+            &site,
+            false,
+            false,
+        )?;
+
+        let host = &self.inner.host;
+        let mut errors = Vec::new();
+        if drop_in_changed && let Err(error) = host.systemctl(&["daemon-reload"]) {
+            errors.push(format!("{error:#}"));
+        }
+        let restart = env_changed || drop_in_changed;
+        let result = if restart {
+            host.systemctl(&["--no-block", "try-restart", CADDY_UNIT])
+        } else {
+            host.systemctl(&["try-reload-or-restart", CADDY_UNIT])
+        };
+        if let Err(error) = result {
+            errors.push(format!("{error:#}"));
+        }
+        let error = (!errors.is_empty()).then(|| errors.join("; "));
+        if let Some(error) = &error {
+            eprintln!("access.set: Caddy did not take the new configuration: {error}");
+        }
+        Ok((
+            dashboard_site,
+            jsonf! { "restarted": restart, "reloaded": !restart, error },
+        ))
+    }
+
+    /// Set `ORIGIN` in the dashboard's environment file, keeping its other
+    /// lines, and restart the dashboard if it is running and the file
+    /// changed. `--no-block`: the dashboard may be the caller.
+    fn write_dashboard_env(&self, origin: &str) -> Result<Value, ApiError> {
+        let path = &self.inner.config.dashboard_env_file;
+        let existing = match fs::read_to_string(path) {
+            Ok(existing) => existing,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("failed to read `{}`", path.display()))
+                    .into());
+            }
+        };
+        let mut contents = String::new();
+        for line in existing
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("ORIGIN="))
+        {
+            contents.push_str(line);
+            contents.push('\n');
+        }
+        contents.push_str("ORIGIN=");
+        contents.push_str(origin);
+        contents.push('\n');
+        let changed = replace_if_changed(path, contents.as_bytes(), 0o644)?;
+        let restart_error = if changed {
+            self.inner
+                .host
+                .systemctl(&["--no-block", "try-restart", DASHBOARD_UNIT])
+                .err()
+                .map(|error| format!("{error:#}"))
+        } else {
+            None
+        };
+        Ok(jsonf! { path, "origin": origin, changed, restart_error })
     }
 
     // --- Launcher --------------------------------------------------------
@@ -1721,6 +2110,15 @@ impl AuthService {
     }
 
     async fn dispatch(&self, caller: &Caller, id: &str, p: DispatchParams) -> ApiResult {
+        if caller.principal == Principal::Setup
+            && authz::setup_needs_no_admin(&p.module, &p.action)
+            && self.admin_exists()?
+        {
+            return Err(ApiError::forbidden(format!(
+                "an administrator already exists, so the setup session may not run {}.{}",
+                p.module, p.action
+            )));
+        }
         caller.authorize(&p.module, &p.action)?;
         if let Some(field) = authz::admin_only_field(&p.module, &p.payload)
             && !matches!(caller.principal, Principal::RemoteController)
@@ -1811,6 +2209,58 @@ pub fn reset_second_factor(
             "sessions_invalidated": true,
         })
     })
+}
+
+/// Atomically replace `path` with `bytes` (mode `mode`) unless it already
+/// holds exactly that. Creates the parent directory (`0755`) if needed.
+/// Returns whether the file changed.
+fn replace_if_changed(path: &Path, bytes: &[u8], mode: u32) -> Result<bool> {
+    if fs::read(path).is_ok_and(|existing| existing == bytes) {
+        return Ok(false);
+    }
+    let parent = path.parent().context("path has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create `{}`", parent.display()))?;
+    super::store::replace(path, bytes, mode)?;
+    Ok(true)
+}
+
+/// Remove `path`; returns whether it existed.
+#[cfg(feature = "reverse-proxy")]
+fn remove_if_exists(path: &Path) -> Result<bool> {
+    let existed = path.exists();
+    super::store::remove(path)?;
+    Ok(existed)
+}
+
+/// Make a root-owned file readable by the `caddy` group (`root:caddy`), when
+/// running as root and the group exists. systemd reads `EnvironmentFile=` as
+/// root either way.
+#[cfg(feature = "reverse-proxy")]
+fn share_with_caddy(path: &Path) -> Result<()> {
+    if !nix::unistd::geteuid().is_root() {
+        return Ok(());
+    }
+    match nix::unistd::Group::from_name("caddy")? {
+        Some(group) => {
+            nix::unistd::chown(path, Some(nix::unistd::Uid::from_raw(0)), Some(group.gid))
+                .with_context(|| format!("failed to chown `{}`", path.display()))
+        }
+        None => {
+            // Without the group, keep it root-only.
+            fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .with_context(|| format!("failed to chmod `{}`", path.display()))
+        }
+    }
+}
+
+/// `AA:BB:...` SHA-256 fingerprint of a DER certificate.
+fn fingerprint(der: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(der)
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .join(":")
 }
 
 fn json_value<T: Serialize>(value: &T) -> Value {
@@ -1979,10 +2429,22 @@ struct TotpConfirmParams {
     code: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RedeemParams {
     code: String,
+    /// The browser's address as the OOBE saw it, for logs and the
+    /// per-address throttle.
+    #[serde(default)]
+    remote_addr: Option<String>,
+}
+
+impl std::fmt::Debug for RedeemParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedeemParams")
+            .field("remote_addr", &self.remote_addr)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]

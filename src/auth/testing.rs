@@ -29,6 +29,45 @@ impl Sealer for FakeSealer {
     }
 }
 
+/// [`HostControl`](super::host::HostControl) that records every command
+/// instead of running it. Commands listed with [`Self::fail`] fail.
+#[derive(Debug, Default)]
+pub struct RecordingHost {
+    calls: std::sync::Mutex<Vec<String>>,
+    failing: std::sync::Mutex<HashSet<String>>,
+}
+
+impl RecordingHost {
+    /// Commands so far, as space-joined command lines.
+    #[must_use]
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    /// Make the command line `command` fail from now on.
+    pub fn fail(&self, command: &str) {
+        self.failing.lock().unwrap().insert(command.into());
+    }
+
+    pub fn clear(&self) {
+        self.calls.lock().unwrap().clear();
+    }
+}
+
+impl super::host::HostControl for RecordingHost {
+    fn run(&self, program: &str, args: &[&str]) -> Result<()> {
+        let command = std::iter::once(program)
+            .chain(args.iter().copied())
+            .join(" ");
+        self.calls.lock().unwrap().push(command.clone());
+        ensure!(
+            !self.failing.lock().unwrap().contains(&command),
+            "`{command}` failed"
+        );
+        Ok(())
+    }
+}
+
 /// A clock that only moves when told to.
 #[derive(Debug)]
 pub struct ManualClock(AtomicI64);
@@ -215,6 +254,8 @@ pub struct TestHost {
     pub accounts: std::sync::Arc<StaticAccounts>,
     pub passwords: std::sync::Arc<MockPasswords>,
     pub clock: std::sync::Arc<ManualClock>,
+    /// Every systemctl and systemd-run call the service made.
+    pub host: std::sync::Arc<RecordingHost>,
 }
 
 /// Start time of a [`TestHost`] clock.
@@ -229,8 +270,12 @@ impl TestHost {
             state_dir: root.join("var/lib/tetra"),
             run_dir: root.join("run/tetra"),
             issue_dir: root.join("run/issue.d"),
-            caddy_sites_dir: root.join("etc/caddy/tetra-sites"),
-            reload_caddy: false,
+            caddy_sites_dir: root.join("etc/caddy/Caddyfile.d"),
+            caddy_env_file: root.join("etc/caddy/tetra-dns.env"),
+            caddy_root_ca: root.join("var/lib/caddy/pki/authorities/local/root.crt"),
+            systemd_dir: root.join("etc/systemd/system"),
+            dashboard_env_file: root.join("etc/ultramarine-dashboard/env"),
+            tetra_binary: "/usr/bin/tetra".into(),
             dashboard_upstream: super::access::DEFAULT_DASHBOARD_UPSTREAM.to_owned(),
             public_dir: root.join("var/lib/tetra-public"),
             session_policy: super::sessions::SessionPolicy::default(),
@@ -238,6 +283,7 @@ impl TestHost {
         let accounts = Arc::new(StaticAccounts::default());
         let passwords = Arc::new(MockPasswords::default());
         let clock = Arc::new(ManualClock::new(TEST_EPOCH));
+        let host = Arc::new(RecordingHost::default());
         let queue = crate::agent::queue::DispatchQueue::spawn(
             crate::agent::AgentBackend::spawn_default(),
             crate::agent::queue::DEFAULT_QUEUE_CAPACITY,
@@ -257,6 +303,7 @@ impl TestHost {
                         .map(|name| (*name).to_owned())
                         .collect(),
                 },
+                host: Arc::clone(&host) as _,
             },
             queue,
         )?;
@@ -266,6 +313,7 @@ impl TestHost {
             accounts,
             passwords,
             clock,
+            host,
         })
     }
 
@@ -288,6 +336,7 @@ impl TestHost {
                     shells: vec!["/bin/bash".into()],
                     excluded: vec!["ultramarine-apps".into()],
                 },
+                host: Arc::clone(&self.host) as _,
             },
             crate::agent::queue::DispatchQueue::spawn(
                 crate::agent::AgentBackend::spawn_default(),

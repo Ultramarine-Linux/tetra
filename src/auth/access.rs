@@ -8,7 +8,11 @@
 //!   `https://<hostname>[:port]`.
 //!
 //! **Domain mode** covers custom domains and Tailscale `*.ts.net` names; Caddy
-//! obtains certificates automatically. **IP mode** serves the dashboard on an
+//! obtains certificates automatically, with the HTTP-01 challenge by default
+//! or DNS-01 through one of terra-caddy's DNS provider modules
+//! ([`super::dns`]). For `*.ts.net` names Caddy asks tailscaled instead,
+//! which `remote_access.tailscale_up` permits and forwards the tailnet (and,
+//! with Funnel, the internet) to Caddy for. DNS credentials are never stored here. **IP mode** serves the dashboard on an
 //! IP address with Caddy's internal CA. Browsers do not allow WebAuthn on IP
 //! addresses, so passkeys are unavailable in IP mode.
 //!
@@ -22,7 +26,10 @@ use webauthn_rs::{Webauthn, WebauthnBuilder, prelude::Url};
 
 use crate::prelude::*;
 
-use super::store::{self, Extra, Header, Record, Tolerant};
+use super::{
+    dns::{self, DnsCredentials, DnsProvider},
+    store::{self, Extra, Header, Record, Tolerant},
+};
 
 /// Where the dashboard container listens unless `tetra agent-serve
 /// --dashboard-upstream` or `access.set` says otherwise. To be confirmed
@@ -30,7 +37,8 @@ use super::store::{self, Extra, Header, Record, Tolerant};
 pub const DEFAULT_DASHBOARD_UPSTREAM: &str = "127.0.0.1:3972";
 /// Relying party name shown by browsers and authenticators.
 pub const RP_NAME: &str = "Ultramarine Server";
-const HTTPS_PORT: u16 = 443;
+/// The default HTTPS port, which origins leave out.
+pub const HTTPS_PORT: u16 = 443;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +47,18 @@ pub enum AccessMode {
     Domain,
     /// An IP address, with Caddy's internal CA. No passkeys.
     Ip,
+}
+
+/// How Caddy proves control of the domain to the ACME CA.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AcmeChallenge {
+    /// Caddy answers on port 80 (and TLS-ALPN on 443).
+    #[default]
+    #[serde(rename = "http-01")]
+    Http01,
+    /// Caddy creates a TXT record through the DNS provider's API.
+    #[serde(rename = "dns-01")]
+    Dns01,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +73,12 @@ pub struct AccessConfig {
     pub port: Option<u16>,
     #[serde(default = "default_upstream")]
     pub dashboard_upstream: String,
+    /// Always `http-01` in IP mode, where Caddy uses its internal CA.
+    #[serde(default)]
+    pub challenge: AcmeChallenge,
+    /// The DNS provider for `dns-01`. Its credentials are sealed separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_provider: Option<DnsProvider>,
     #[serde(flatten)]
     extra: Extra,
 }
@@ -88,7 +114,7 @@ impl Record for ModeProbe {
     }
 }
 
-/// `access.set` parameters.
+/// `access.set` parameters. `Debug` leaves out the credentials' values.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccessRequest {
@@ -98,6 +124,15 @@ pub struct AccessRequest {
     pub port: Option<u16>,
     #[serde(default)]
     pub dashboard_upstream: Option<String>,
+    #[serde(default)]
+    pub challenge: AcmeChallenge,
+    /// Required with `dns-01`.
+    #[serde(default)]
+    pub dns_provider: Option<DnsProvider>,
+    /// With `dns-01`: the provider's credentials. May be left out to keep
+    /// the ones already stored for the same provider.
+    #[serde(default)]
+    pub dns_credentials: Option<DnsCredentials>,
 }
 
 impl AccessConfig {
@@ -120,6 +155,29 @@ impl AccessConfig {
                 .to_string(),
         };
         ensure!(request.port != Some(0), "port must not be 0");
+        match request.challenge {
+            AcmeChallenge::Http01 => ensure!(
+                request.dns_provider.is_none() && request.dns_credentials.is_none(),
+                "dns_provider and dns_credentials are only used with the dns-01 challenge"
+            ),
+            AcmeChallenge::Dns01 => {
+                ensure!(
+                    request.mode == AccessMode::Domain,
+                    "the dns-01 challenge needs domain mode; IP mode uses Caddy's internal CA"
+                );
+                ensure!(
+                    !is_tailnet_name(&hostname),
+                    "`{hostname}` is a Tailscale name; Caddy gets its certificate from \
+                     tailscaled, so use the http-01 challenge"
+                );
+                let provider = request
+                    .dns_provider
+                    .context("dns_provider is required with the dns-01 challenge")?;
+                if let Some(credentials) = &request.dns_credentials {
+                    dns::validate(provider, credentials)?;
+                }
+            }
+        }
         let upstream = request
             .dashboard_upstream
             .unwrap_or_else(|| default_upstream.to_owned())
@@ -135,6 +193,8 @@ impl AccessConfig {
             hostname,
             port: request.port.filter(|port| *port != HTTPS_PORT),
             dashboard_upstream: upstream,
+            challenge: request.challenge,
+            dns_provider: request.dns_provider,
             extra: Extra::new(),
         })
     }
@@ -188,6 +248,16 @@ impl AccessConfig {
             .context("invalid dashboard origin")
     }
 
+    /// The dashboard's origin as browsers send it: `https://<host>[:port]`,
+    /// IPv6 addresses bracketed, no trailing slash. This is the dashboard's
+    /// `ORIGIN` and the URL the OOBE sends people to.
+    ///
+    /// # Errors
+    /// Fails only for a hostname that is not a valid URL host.
+    pub fn origin_string(&self) -> Result<String> {
+        Ok(self.origin()?.origin().ascii_serialization())
+    }
+
     #[must_use]
     pub fn passkeys_available(&self) -> bool {
         self.mode == AccessMode::Domain
@@ -212,19 +282,33 @@ impl AccessConfig {
     }
 
     /// The dashboard's Caddy site for this configuration, serving the
-    /// launcher's public page from `public_root` when given.
+    /// launcher's public page from `public_root` when given. `dns` holds the
+    /// credentials for `dns-01`; only the keys and settings are used, secrets
+    /// become environment placeholders.
+    ///
+    /// # Errors
+    /// Fails when `dns-01` is configured without credentials.
     #[cfg(feature = "reverse-proxy")]
-    #[must_use]
     pub fn dashboard_site(
         &self,
         public_root: Option<&Path>,
-    ) -> crate::agent::modules::reverse_proxy::DashboardSite {
+        dns: Option<&DnsCredentials>,
+    ) -> Result<crate::agent::modules::reverse_proxy::DashboardSite> {
         use crate::agent::modules::reverse_proxy::{DashboardSite, DashboardTls};
         let port = self.port.map(|port| format!(":{port}")).unwrap_or_default();
-        match self.mode {
+        Ok(match self.mode {
             AccessMode::Domain => DashboardSite {
                 address: format!("{}{port}", self.hostname),
-                tls: DashboardTls::Automatic,
+                tls: match (self.challenge, self.dns_provider) {
+                    (AcmeChallenge::Dns01, Some(provider)) => DashboardTls::Dns {
+                        provider: provider.name(),
+                        fields: dns::caddy_fields(
+                            provider,
+                            dns.context("dns-01 needs the DNS provider's credentials")?,
+                        ),
+                    },
+                    _ => DashboardTls::Automatic,
+                },
                 upstream: self.dashboard_upstream.clone(),
                 public_root: public_root.map(Path::to_path_buf),
             },
@@ -234,8 +318,14 @@ impl AccessConfig {
                 upstream: self.dashboard_upstream.clone(),
                 public_root: public_root.map(Path::to_path_buf),
             },
-        }
+        })
     }
+}
+
+/// Whether `name` is a Tailscale `MagicDNS` name, whose certificate Caddy
+/// gets from tailscaled (Caddy treats every `*.ts.net` name this way).
+fn is_tailnet_name(name: &str) -> bool {
+    name.ends_with(".ts.net")
 }
 
 /// Normalize and validate a DNS name: lowercase, no trailing dot, LDH labels,
@@ -271,6 +361,9 @@ mod tests {
             hostname: hostname.into(),
             port,
             dashboard_upstream: None,
+            challenge: AcmeChallenge::Http01,
+            dns_provider: None,
+            dns_credentials: None,
         }
     }
 
@@ -297,6 +390,16 @@ mod tests {
         )
         .unwrap();
         assert!(config.passkeys_available());
+        #[cfg(feature = "reverse-proxy")]
+        assert_eq!(
+            config.dashboard_site(None, None).unwrap().tls,
+            crate::agent::modules::reverse_proxy::DashboardTls::Automatic
+        );
+        let mut dns = request(AccessMode::Domain, "server.tail1234.ts.net", None);
+        dns.challenge = AcmeChallenge::Dns01;
+        dns.dns_provider = Some(DnsProvider::Cloudflare);
+        let error = AccessConfig::from_request(dns, DEFAULT_DASHBOARD_UPSTREAM).unwrap_err();
+        assert!(error.to_string().contains("Tailscale name"), "{error}");
     }
 
     #[test]
@@ -358,7 +461,8 @@ mod tests {
             DEFAULT_DASHBOARD_UPSTREAM,
         )
         .unwrap()
-        .dashboard_site(None);
+        .dashboard_site(None, None)
+        .unwrap();
         assert_eq!(domain.address, "server.example.com");
         assert_eq!(domain.tls, DashboardTls::Automatic);
         let ip = AccessConfig::from_request(
@@ -366,9 +470,102 @@ mod tests {
             DEFAULT_DASHBOARD_UPSTREAM,
         )
         .unwrap()
-        .dashboard_site(None);
+        .dashboard_site(None, None)
+        .unwrap();
         assert_eq!(ip.address, "https://192.0.2.10:8443");
         assert_eq!(ip.tls, DashboardTls::Internal);
+    }
+
+    fn dns_request(value: Value) -> AccessRequest {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn dns_01_names_a_provider_and_stores_no_credentials() {
+        let mut request = dns_request(serde_json::json!({
+            "mode": "domain",
+            "hostname": "server.example.com",
+            "challenge": "dns-01",
+            "dns_provider": "cloudflare",
+            "dns_credentials": {"api_token": "s3cret-token"}
+        }));
+        assert!(!format!("{request:?}").contains("s3cret-token"));
+        #[cfg_attr(not(feature = "reverse-proxy"), allow(unused_variables))]
+        let credentials = request.dns_credentials.take();
+        let config = AccessConfig::from_request(request, DEFAULT_DASHBOARD_UPSTREAM).unwrap();
+        assert_eq!(config.challenge, AcmeChallenge::Dns01);
+        assert_eq!(config.dns_provider, Some(DnsProvider::Cloudflare));
+        let stored = serde_json::to_string(&config).unwrap();
+        assert!(stored.contains("\"challenge\":\"dns-01\""), "{stored}");
+        assert!(!stored.contains("s3cret-token"));
+
+        #[cfg(feature = "reverse-proxy")]
+        {
+            use crate::agent::modules::reverse_proxy::DashboardTls;
+            config.dashboard_site(None, None).unwrap_err();
+            let site = config.dashboard_site(None, credentials.as_ref()).unwrap();
+            assert_eq!(
+                site.tls,
+                DashboardTls::Dns {
+                    provider: "cloudflare",
+                    fields: vec![("api_token".into(), "{env.TETRA_DNS_API_TOKEN}".into())],
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn dns_01_is_validated() {
+        for body in [
+            // No provider.
+            serde_json::json!({"mode": "domain", "hostname": "a.example.com", "challenge": "dns-01"}),
+            // IP mode has no ACME.
+            serde_json::json!({"mode": "ip", "hostname": "192.0.2.1", "challenge": "dns-01", "dns_provider": "desec"}),
+            // Credentials for the wrong provider.
+            serde_json::json!({"mode": "domain", "hostname": "a.example.com", "challenge": "dns-01",
+                "dns_provider": "desec", "dns_credentials": {"api_token": "x"}}),
+            // DNS settings without dns-01.
+            serde_json::json!({"mode": "domain", "hostname": "a.example.com", "dns_provider": "desec"}),
+        ] {
+            AccessConfig::from_request(dns_request(body), DEFAULT_DASHBOARD_UPSTREAM).unwrap_err();
+        }
+        serde_json::from_value::<AccessRequest>(serde_json::json!({
+            "mode": "domain", "hostname": "a.example.com", "challenge": "tls-alpn-01"
+        }))
+        .unwrap_err();
+    }
+
+    #[test]
+    fn origin_strings_have_no_trailing_slash() {
+        let ip = AccessConfig::from_request(
+            request(AccessMode::Ip, "2001:db8::1", Some(8443)),
+            DEFAULT_DASHBOARD_UPSTREAM,
+        )
+        .unwrap();
+        assert_eq!(ip.origin_string().unwrap(), "https://[2001:db8::1]:8443");
+        let domain = AccessConfig::from_request(
+            request(AccessMode::Domain, "server.example.com", None),
+            DEFAULT_DASHBOARD_UPSTREAM,
+        )
+        .unwrap();
+        assert_eq!(
+            domain.origin_string().unwrap(),
+            "https://server.example.com"
+        );
+    }
+
+    #[test]
+    fn files_from_before_dns_01_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.json");
+        fs::write(
+            &path,
+            r#"{"schema": 1, "compat": 1, "mode": "domain", "hostname": "server.example.com"}"#,
+        )
+        .unwrap();
+        let config = AccessConfig::load(&path).unwrap().unwrap();
+        assert_eq!(config.challenge, AcmeChallenge::Http01);
+        assert_eq!(config.dns_provider, None);
     }
 
     #[test]

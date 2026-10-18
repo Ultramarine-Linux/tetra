@@ -31,6 +31,7 @@ use tetra::{
         accounts::{DEFAULT_EXCLUDED, LoginPolicy, SystemAccounts},
         audit::{self as action_log, AuditLog},
         clock::SystemClock,
+        host::SystemHost,
         pam::{self as tetra_pam, LibPam},
         seal::SystemdCreds,
     },
@@ -105,6 +106,10 @@ enum SetupCommand {
     /// Finish setup without the OOBE, on a host that already has an eligible
     /// administrator (upgrades, development machines).
     Complete(SetupCompleteCli),
+    /// Stop the OOBE after setup completed (run by the transient timer that
+    /// `setup.complete` starts).
+    #[command(hide = true)]
+    FinishHandoff(SetupCompleteCli),
 }
 
 #[derive(Debug, Parser)]
@@ -141,6 +146,10 @@ struct SetupCodeCli {
     /// and the getty banner (run at boot by tetra-setup-code.service).
     #[arg(long)]
     publish: bool,
+
+    /// Print `{"code": ..., "ca_fingerprint": ...}` instead of plain lines.
+    #[arg(long, conflicts_with = "publish")]
+    json: bool,
 
     /// Tetra state directory.
     #[arg(long, env = "TETRA_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
@@ -208,8 +217,9 @@ struct AgentServeCli {
     #[arg(long, default_value = tetra_pam::DEFAULT_SERVICE)]
     pam_service: String,
 
-    /// Caddy site directory where `access.set` writes the dashboard site.
-    #[arg(long, default_value = "/etc/caddy/tetra-sites")]
+    /// Caddy site directory where `access.set` writes the dashboard site
+    /// (terra-caddy's Caddyfile imports `Caddyfile.d/*.caddyfile`).
+    #[arg(long, default_value = auth::service::CADDY_SITES_DIR)]
     caddy_sites_dir: PathBuf,
 
     /// Where the dashboard container listens, used for the dashboard's Caddy
@@ -367,6 +377,7 @@ async fn main() -> Result<()> {
         Commands::Auth(AuthCommand::ResetSecondFactor(cli)) => reset_second_factor(&cli),
         Commands::Setup(SetupCommand::Code(cli)) => setup_code(cli),
         Commands::Setup(SetupCommand::Complete(cli)) => setup_complete(cli),
+        Commands::Setup(SetupCommand::FinishHandoff(cli)) => setup_finish_handoff(cli),
     }
 }
 
@@ -404,6 +415,7 @@ fn system_auth(
             sealer: Arc::new(SystemdCreds),
             clock: Arc::new(SystemClock),
             policy: login_policy()?,
+            host: Arc::new(SystemHost),
         },
         queue,
     )
@@ -433,18 +445,49 @@ fn console_auth(state_dir: PathBuf) -> Result<AuthService> {
 
 fn setup_complete(cli: SetupCompleteCli) -> Result<()> {
     require_root("tetra setup complete")?;
-    console_auth(cli.state_dir)?.complete_setup_from_console()?;
+    let handoff = console_auth(cli.state_dir)?.complete_setup_from_console()?;
     println!("setup completed; the setup code is disabled");
+    if handoff["dashboard_started"] != true {
+        eprintln!(
+            "the dashboard did not start: {}",
+            handoff["dashboard_error"].as_str().unwrap_or_default()
+        );
+    }
+    if let Some(error) = handoff["oobe_error"].as_str() {
+        eprintln!("the OOBE was not stopped: {error}");
+    }
+    Ok(())
+}
+
+fn setup_finish_handoff(cli: SetupCompleteCli) -> Result<()> {
+    require_root("tetra setup finish-handoff")?;
+    console_auth(cli.state_dir)?.finish_handoff()?;
+    eprintln!("the OOBE is stopped; the dashboard has taken over");
     Ok(())
 }
 
 fn setup_code(cli: SetupCodeCli) -> Result<()> {
     require_root("tetra setup code")?;
     // Printing must not create a code that the console does not show, so
-    // both forms publish; `--publish` (the boot unit) only skips printing it.
-    match console_auth(cli.state_dir)?.publish_setup_code()? {
+    // every form publishes; `--publish` (the boot unit) only skips printing.
+    let auth = console_auth(cli.state_dir)?;
+    let code = auth.publish_setup_code()?;
+    // Caddy creates its internal CA the first time it serves the OOBE's
+    // site, so right after the first boot there may be none yet.
+    let ca_fingerprint = auth.internal_ca_fingerprint();
+    match code {
         Some(_) if cli.publish => eprintln!("published the setup code to the console"),
-        Some(code) => println!("{code}"),
+        code if cli.json => println!(
+            "{}",
+            serde_json::json!({ "code": code, "ca_fingerprint": ca_fingerprint })
+        ),
+        Some(code) => {
+            println!("{code}");
+            match ca_fingerprint {
+                Some(fingerprint) => println!("CA SHA-256 {fingerprint}"),
+                None => eprintln!("Caddy has not created its internal CA yet"),
+            }
+        }
         None => eprintln!("setup is complete; there is no setup code"),
     }
     Ok(())

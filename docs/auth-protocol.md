@@ -195,7 +195,9 @@ no authenticator holds it.
 
 Ceremonies expire after 5 minutes and are single use. `remote_addr` is the browser's IP address: each
 address (IPv6 by `/64`) may have 16 pending ceremonies, and a 17th replaces
-its oldest, so one client cannot use up the shared limit of 4096. Without a
+its oldest, so one client cannot use up the shared limit of 4096. (Clients
+forwarded by Tailscale all count as `127.0.0.1`; see
+[Clients forwarded by Tailscale](#clients-forwarded-by-tailscale).) Without a
 valid IP address the ceremony only counts against the shared limit. The decoy
 looks like one platform passkey, so it hides users with exactly that; a user
 with several passkeys or security keys can still be told apart.
@@ -210,7 +212,11 @@ Returns the `authenticated` result with `method: "passkey"`.
 **`setup.status`** `{}` → `{setup_required, passkeys_available}`. With a setup
 or administrator token it also returns `admin_exists`.
 
-**`setup.redeem`** `{code}` (OOBE only)
+**`setup.redeem`** `{code, remote_addr?}` (OOBE only)
+
+`remote_addr` is the browser's address as Caddy reported it to the OOBE (the
+same field as on `auth.password`). Tetra logs it with every attempt and uses it
+for a per-address throttle.
 
 ```json
 { "status": "authenticated", "token": "tts_…", "session": { "kind": "setup", … },
@@ -218,8 +224,16 @@ or administrator token it also returns `admin_exists`.
 ```
 
 Errors: `wrong_client` (not the OOBE), `invalid_credentials`,
-`rate_limited` (3 free attempts, then a doubling wait capped at 5 minutes; the
-code is replaced after 20 wrong attempts), `setup_complete`.
+`rate_limited` with `retry_after`, `setup_complete`. Two limits apply:
+
+- **Per address** (only when `remote_addr` is given): 3 free wrong codes, then
+  a wait of 30 seconds that doubles with every further wrong code, capped at
+  one hour. IPv6 addresses are counted per /64. Attempts refused here never
+  reach the global counter, so one noisy browser cannot force the code to
+  rotate. Kept in memory.
+- **Global** (unchanged): 3 free wrong codes, then a doubling wait capped at 5
+  minutes; the code is replaced after 20 wrong attempts. Stored, so it
+  survives restarts. This is what stops guessing from many addresses.
 
 ### App access check (no token)
 
@@ -238,7 +252,7 @@ so the answer does not reveal whether an entry exists.
 
 | Op | Params | Result |
 | --- | --- | --- |
-| `session.info` | | `{session, user, permissions}`; `permissions` is `{"all": true}` for admins, `{page: level}` for users, `{"setup": [...]}` for the setup session |
+| `session.info` | | `{session, user, permissions}`; `permissions` is `{"all": true}` for admins, `{page: level}` for users, `{"setup": ["module.action", ...], "operations": [...]}` for the setup session |
 | `session.logout` | | `{revoked: 1}` |
 | `session.list` | `uid?` (admins only for other users) | `{sessions: [...]}` |
 | `session.revoke` | `id` | `{revoked}`; own sessions, or any user session for admins |
@@ -331,26 +345,90 @@ from other origins (its CSP allows only inline styles and `data:` images).
 | Op | Params | Result |
 | --- | --- | --- |
 | `access.get` | | `{access, passkeys_available}` |
-| `access.set` | `mode: "domain" \| "ip", hostname, port?, dashboard_upstream?` | `{access, passkeys_available, dashboard_site}` |
-| `setup.complete` | | `{complete: true}` |
+| `access.set` | `mode: "domain" \| "ip", hostname, port?, dashboard_upstream?, challenge?: "http-01" \| "dns-01", dns_provider?, dns_credentials?` | `{access, passkeys_available, dashboard_url, dashboard_site, caddy, dashboard_env}` |
+| `setup.complete` | | `{complete: true, dashboard_url, handoff_in_seconds, handoff}` |
 
 `access.set` and `setup.complete` need the setup session or an
 administrator.
 
 - `access.set` stores `/var/lib/tetra/access.json`, then regenerates the
-  dashboard's Caddy site (`/etc/caddy/tetra-sites/00-ultramarine-dashboard.caddy`)
-  and reloads Caddy. The site also routes `/public/` to the launcher's
-  public page.
+  dashboard's Caddy site
+  (`/etc/caddy/Caddyfile.d/00-ultramarine-dashboard.caddyfile`) and reloads
+  Caddy (see [Caddy](#caddy)). The site also routes `/public/` to the
+  launcher's public page.
 - Domain mode (custom domains and Tailscale `*.ts.net` names) uses automatic
   HTTPS and enables passkeys, with the hostname as the RP ID and
-  `https://hostname[:port]` as the origin.
+  `https://hostname[:port]` as the origin. Caddy gets certificates for
+  `*.ts.net` names from tailscaled, so those take `http-01` (the default),
+  never `dns-01`. To reach the dashboard over Tailscale, set the node's
+  `*.ts.net` name (from `remote_access.tailscale_up` or `status`) as the
+  hostname.
 - IP mode uses `tls internal` and disables passkeys.
 - `dashboard_upstream` defaults to `127.0.0.1:3972`.
 - Changing the hostname invalidates passkeys registered under the old one.
+- `dashboard_url` is `https://hostname[:port]`, IPv6 addresses bracketed.
+- Every `access.set` writes `ORIGIN=<dashboard_url>` to
+  `/etc/ultramarine-dashboard/env` (other lines are kept) and, if the file
+  changed, restarts `ultramarine-dashboard.service` if it is running
+  (`systemctl --no-block try-restart`, as the dashboard may be the caller).
+  `dashboard_env` reports `{path, origin, changed, restart_error}`.
 
-`setup.complete` requires at least one eligible administrator. It writes
+**Certificate challenge.** In domain mode `challenge` defaults to `http-01`.
+With `dns-01`, Caddy proves control of the domain through the DNS provider:
+
+- `dns_provider` is one of the caddy-dns modules built into terra-caddy:
+  `cloudflare`, `porkbun`, `desec`, `route53`, `hetzner`, `ovh`, `gandi`,
+  `linode`, `powerdns`, `rfc2136`, `acmedns`.
+- `dns_credentials` is an object keyed as in the module's Caddy JSON config:
+
+  | Provider | Keys (secret ones in bold) |
+  | --- | --- |
+  | `cloudflare`, `hetzner`, `linode` | **`api_token`** |
+  | `porkbun` | **`api_key`**, **`api_secret_key`** |
+  | `desec` | **`token`** |
+  | `route53` | `access_key_id`, **`secret_access_key`**, `region` (optional) |
+  | `ovh` | `endpoint`, `application_key`, **`application_secret`**, **`consumer_key`** |
+  | `gandi` | **`bearer_token`** |
+  | `powerdns` | `server_url`, **`api_token`** |
+  | `rfc2136` | `server`, `key_name`, `key_alg`, **`key`** |
+  | `acmedns` | `server_url`, `subdomain`, `username`, **`password`** |
+
+  Unknown or missing keys are `bad_request`. Secrets must be one line;
+  the other values may only contain letters, digits and `. - _ : / @ + =`.
+- `dns_credentials` may be left out to keep the credentials stored for the
+  same provider (for example when only the port changes).
+- `dns-01` is refused in IP mode. `dns_provider` and `dns_credentials` are
+  refused with `http-01`, and switching to `http-01` deletes the stored
+  credentials.
+
+Credentials never appear in `access.json`, a Caddyfile, a response or a log.
+Tetra seals them in `/var/lib/tetra/secrets/tetra-dns-credentials.cred` and
+writes the secret ones to `/etc/caddy/tetra-dns.env` (`root:caddy`, `0640`) as
+`TETRA_DNS_<KEY>`. A drop-in, `/etc/systemd/system/caddy.service.d/50-tetra.conf`,
+loads that file with `EnvironmentFile=`, and the site refers to the values as
+`{env.TETRA_DNS_<KEY>}` runtime placeholders, so even Caddy's adapted config
+holds only the placeholder. Non-secret settings are written into the site
+literally, because not every module expands placeholders in them. When the
+environment changes, Caddy is restarted with `--no-block` (a restart waits for
+requests in flight, and this one may be passing through Caddy); otherwise it is
+reloaded. `caddy` reports `{restarted, reloaded, error}`.
+
+**`setup.complete`** requires at least one eligible administrator. It writes
 `/var/lib/tetra/setup-complete`, which disables the setup code permanently,
-removes the published code, and ends every setup session.
+removes the published code, and ends every setup session. Then it hands over
+to the dashboard:
+
+1. `systemctl start ultramarine-dashboard.service` (the unit generated from
+   the dashboard's Quadlet).
+2. A transient timer, `tetra-setup-handoff`, runs
+   `tetra setup finish-handoff` `handoff_in_seconds` (5) seconds later. That
+   stops and disables `ultramarine-server-oobe.service` and
+   `tetra-setup-code.service`, removes the OOBE's Caddy site and reloads Caddy.
+
+The response comes back before the OOBE is stopped, so it can show a final
+screen with `dashboard_url` (`null` if `access.set` was never called).
+`handoff` reports `{dashboard_started, dashboard_error, oobe_stop_scheduled,
+oobe_error}`; a failure there does not undo setup completion.
 
 ### Module actions
 
@@ -367,11 +445,20 @@ Every dispatched action is recorded in the action log.
   every action) may run everything.
 - **Other users** have `launcher: view` by default (the Services page: the
   apps shared with them), plus their grants. `manage` implies `view`.
-- **The setup session** may run only OOBE operations: `settings.get_system`,
-  `settings.set_hostname`, `network.configure` and `network.confirm`, all of
-  `reverse_proxy.*`,
-  `users.list/status/groups/create/update/set_password`, and
-  `agent.capabilities` (list in `src/auth/authz.rs`, `SETUP_ALLOWED`).
+- **The setup session** may run only the module actions the OOBE needs, each
+  named individually (list in `src/auth/authz.rs`, `SETUP_ALLOWED`):
+  `agent.capabilities`; `settings.set_hostname/set_keymap/set_locale/set_timezone`;
+  `users.create/set_password/set_authorized_keys/add_admin`;
+  `power.reboot/poweroff`; `network.interfaces/status/scan_wifi/connect_wifi/configure/confirm`;
+  `updates.set_policy`; and
+  `remote_access.status/tailscale_up/tailscale_disable/cloudflared_set_token/cloudflared_disable`.
+  No `services.*`, no raw network configuration (`network.get_config/set_config`),
+  no `reverse_proxy.*` and no `users.update` (which can change group
+  memberships). `users.add_admin` is refused once an eligible administrator
+  exists. Of the socket operations it may only use `session.info`,
+  `session.logout`, `setup.status`, `setup.complete`, `access.get`,
+  `access.set` and `module.dispatch` (`SETUP_OPERATIONS`); anything else is
+  `forbidden`.
 - `capabilities` and `plan` of every module are open to any session.
 - Actions not in the table are administrator-only.
 
@@ -383,10 +470,10 @@ Every dispatched action is recorded in the action log.
 | `containers` | `podman.containers/inspect/images/volumes/networks/logs` | — | podman start/stop/restart/remove |
 | `storage` | `storage.list/status/zfs` | — | `storage.mount/unmount/configure` |
 | `sharing` | `samba.list_shares/get_config`, `nfs.list_exports/get_config` | `samba/nfs.set_config/reload` | samba/nfs enable, disable |
-| `network` | `network.interfaces/status/dns/routes`, `reverse_proxy.list/render` | `reverse_proxy.write/delete/reload` | `network.get_config/set_config/reload/configure/confirm` |
+| `network` | `network.interfaces/status/dns/routes`, `reverse_proxy.list/render` | `reverse_proxy.write/delete/reload` | `network.get_config/set_config/reload/configure/confirm`, `remote_access.*` |
 | `virtual_machines` | `virtual_machines.list/status/logs` | — | start, stop, restart, create, delete |
-| `settings` | `selinux.status/booleans/file_contexts` | — | `settings.set_hostname`, SELinux changes |
-| `users` | `users.list/status/groups` | — | create, update, delete, set_password |
+| `settings` | `selinux.status/booleans/file_contexts`, `updates.get_policy` | — | `settings.set_hostname/set_keymap/set_locale/set_timezone`, `updates.set_policy`, `power.reboot/poweroff`, SELinux changes |
+| `users` | `users.list/status/groups` | — | create, update, delete, set_password, set_authorized_keys, add_admin |
 | `files` | — | — | `files.read/write` |
 
 Payload fields that point an action at arbitrary host paths are
@@ -425,9 +512,111 @@ is recorded with `origin: "remote"`.
   writes it to the console, so the printed code is always the one shown).
   Publishing only creates the files; `/run/tetra` keeps the socket unit's
   `0755` mode so the OOBE can reach the socket.
+- `sudo tetra setup code` prints the code and, once Caddy has created its
+  internal CA, a second line `CA SHA-256 AA:BB:…` with the fingerprint of the
+  CA's root certificate, which the console screen shows so people can check
+  the certificate warning the OOBE gets. `--json` prints
+  `{"code": ..., "ca_fingerprint": ... | null}` instead. Caddy creates the CA
+  the first time it serves the OOBE's site, so right after the first boot the
+  fingerprint may still be `null`.
+- Publishing also writes the OOBE's Caddy site (see [Caddy](#caddy)), which
+  is why `tetra-setup-code.service` runs before `caddy.service`.
 - `sudo tetra setup complete` finishes setup from the console, with the same
-  check as `setup.complete` (an eligible administrator must exist). Use it on
-  upgraded hosts and development machines that have no OOBE run.
+  check as `setup.complete` (an eligible administrator must exist), then
+  starts the dashboard and stops the OOBE right away. Use it on upgraded hosts
+  and development machines that have no OOBE run.
+
+## Caddy
+
+Tetra writes its sites to `/etc/caddy/Caddyfile.d/*.caddyfile`. terra-caddy's
+default `/etc/caddy/Caddyfile` already ends with
+`import Caddyfile.d/*.caddyfile`, so no extra import line is needed; a server
+configuration package that ships its own Caddyfile must keep that line.
+Files Tetra did not write in that directory are never changed.
+
+| File | Written by |
+| --- | --- |
+| `00-ultramarine-dashboard.caddyfile` | `access.set` |
+| `00-ultramarine-setup.caddyfile` | `tetra setup code` while setup is incomplete; removed by the handoff |
+| `<domain>.caddyfile` | `reverse_proxy.write` |
+
+The OOBE's site serves port 6623 on every address, IPv4 and IPv6, with a
+certificate from Caddy's internal CA, and proxies to the OOBE on
+`127.0.0.1:6624`:
+
+```caddyfile
+https://:6623 {
+	tls internal {
+		on_demand
+	}
+	reverse_proxy 127.0.0.1:6624
+}
+```
+
+The site has no hostname (browsers may use any of the server's addresses), so
+certificates are issued on demand; Caddy allows that without an `ask`
+endpoint because only the internal CA issues them. It does not `bind`
+explicitly: Caddy's default wildcard listener covers IPv4 and IPv6 and still
+works on hosts with IPv6 disabled.
+
+Caddy's admin API listens on `localhost:2019` by default, where any local
+user can read and replace the running configuration (including asking it to
+expand `{env.*}` placeholders). The server configuration package should move
+it to a Unix socket in a directory only root and `caddy` can reach (the
+`admin` global option in `/etc/caddy/Caddyfile`).
+
+## Credentials for other services
+
+The Tailscale auth key, the Cloudflare Tunnel token and DNS-01 credentials are
+sealed with `systemd-creds` (TPM2 when available, no PCR binding) under their
+credential name in `/var/lib/tetra/secrets/<name>.cred`. Each file is an
+ordinary encrypted systemd credential:
+
+- `remote_access.tailscale_up {auth_key, serve?: true, funnel?: false}` writes
+  the key to a root-only file in `/run/tetra` for
+  `tailscale up --auth-key=file:<path>` and deletes it right after. It then
+  forwards Caddy's HTTPS port (the access port, 443 by default) as raw TCP:
+  on the tailnet with `tailscale serve --bg --tcp=<port>
+  tcp://127.0.0.1:<port>` (the default), or on the internet with `tailscale
+  funnel` instead, only when `funnel: true` is sent (Funnel allows ports 443,
+  8443 and 10000). Caddy terminates TLS, so the dashboard, apps, the public
+  page and forward-auth work as on the LAN once `access.set` uses the node's
+  `*.ts.net` name, which the response returns as `hostname`. Caddy gets that
+  name's certificate from tailscaled, which
+  `/etc/systemd/system/tailscaled.service.d/50-tetra.conf`
+  (`TS_PERMIT_CERT_UID=caddy`) allows; tailscaled is restarted once when that
+  drop-in is first installed. Connections forwarded by Tailscale reach Caddy
+  from `127.0.0.1`; see [Clients forwarded by Tailscale](#clients-forwarded-by-tailscale).
+- `remote_access.cloudflared_set_token {token}` installs
+  `/etc/systemd/system/cloudflared.service.d/50-tetra.conf`, which loads the
+  sealed token with `LoadCredentialEncrypted=` and points cloudflared's
+  `TUNNEL_TOKEN_FILE` at it, then enables and restarts `cloudflared.service`.
+- `remote_access.tailscale_disable` and `cloudflared_disable` stop and disable
+  the service and delete the sealed credential and Tetra's drop-in.
+- `remote_access.status` returns
+  `{tailscale: {enabled, serve, funnel, hostname?}, cloudflared: {enabled}}`.
+
+Credentials are never passed as command-line arguments, so they cannot leak
+through error messages, the action log or `ps`.
+
+### Clients forwarded by Tailscale
+
+`tailscale serve` and `tailscale funnel` forward raw TCP from tailscaled to
+Caddy on `127.0.0.1`, without the PROXY protocol (which would need a listener
+wrapper in terra-caddy's main Caddyfile). So every tailnet and Funnel client
+reaches Caddy, and through it the dashboard, as `127.0.0.1`. This is
+accepted, and it means:
+
+- Caddy's logs and the `remote_addr` the dashboard passes to Tetra show
+  `127.0.0.1`, as do `PAM_RHOST` on `auth.password` and the action log.
+- All of these clients share one per-address bucket. With Funnel that is
+  everyone on the internet: together they get the 16 pending passkey
+  ceremonies one address may have, so on a busy Funnel one visitor's new
+  ceremony can replace another's pending one (the shared limit of 4096 is
+  unchanged). Anything else that limits by address treats them as one client.
+- The setup-code throttle is not affected: the OOBE's port (6623) is never
+  forwarded by Tailscale. `tailscaled.service` and
+`cloudflared.service` ship disabled.
 
 ## Stored state
 
@@ -441,8 +630,10 @@ All under `/var/lib/tetra` (`0700`, files `0600`, root only):
 | `auth/sessions.json` | Session token hashes |
 | `auth/setup-code.json` | Encrypted setup code and wrong-attempt state |
 | `faillock/` | `pam_faillock` tally for dashboard password logins only |
-| `access.json` | Access mode, hostname, port, dashboard upstream |
+| `access.json` | Access mode, hostname, port, dashboard upstream, certificate challenge and DNS provider (no credentials) |
 | `launcher.json` | Launcher entries and the public page setting |
+| `secrets/<name>.cred` | Credentials for other services, each sealed with `systemd-creds` ([details](#credentials-for-other-services)) |
+| `updates.json` | Update policy (`automatic` or `notify`) |
 | `setup-complete` | Setup completion marker |
 | `audit/actions.jsonl` | Action log (rotated at 4 MiB) |
 

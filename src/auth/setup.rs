@@ -17,10 +17,19 @@
 //! Wrong codes are rate-limited: after [`FREE_ATTEMPTS`] failures each attempt
 //! waits twice as long as the last (capped at [`MAX_BACKOFF`] seconds), and
 //! after [`ROTATE_AFTER`] failures the code is replaced. The failure count is
-//! stored, so restarting Tetra does not reset it.
+//! stored, so restarting Tetra does not reset it. This global counter is what
+//! stops guessing from many addresses.
+//!
+//! In front of it, [`AddressThrottle`] slows down one noisy browser address
+//! (as reported by the OOBE in `remote_addr`) much sooner and harder, so a
+//! single client cannot burn through the global counter and force code
+//! rotations that the console then has to catch up with. Attempts it refuses
+//! never reach the global counter.
 //!
 //! `setup.complete` writes the `/var/lib/tetra/setup-complete` marker, which
 //! disables this path permanently.
+
+use std::{collections::HashMap, net::IpAddr, sync::Mutex};
 
 use subtle::ConstantTimeEq;
 
@@ -44,6 +53,15 @@ pub const FREE_ATTEMPTS: u32 = 3;
 pub const ROTATE_AFTER: u32 = 20;
 /// Longest wait between attempts, in seconds.
 pub const MAX_BACKOFF: i64 = 300;
+
+/// Wrong codes allowed per address before its own backoff starts.
+pub const ADDRESS_FREE_ATTEMPTS: u32 = 3;
+/// First per-address wait, in seconds; it doubles with every further failure.
+pub const ADDRESS_BASE_BACKOFF: i64 = 30;
+/// Longest per-address wait, in seconds.
+pub const ADDRESS_MAX_BACKOFF: i64 = 3600;
+/// Addresses remembered at most; the least recently seen are forgotten first.
+const ADDRESS_MAX_TRACKED: usize = 4096;
 
 /// Where setup state lives.
 #[derive(Debug, Clone)]
@@ -272,6 +290,100 @@ impl Setup {
     }
 }
 
+/// Per-address throttle for `setup.redeem`, in memory.
+#[derive(Debug, Default)]
+pub struct AddressThrottle {
+    entries: Mutex<HashMap<String, AddressEntry>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AddressEntry {
+    failures: u32,
+    retry_at: i64,
+    last_seen: i64,
+}
+
+impl AddressThrottle {
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<String, AddressEntry>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `Err(retry_after)` while `key` must wait.
+    ///
+    /// # Errors
+    /// Returns the seconds `key` still has to wait.
+    pub fn check(&self, key: &str, now: i64) -> Result<(), i64> {
+        match self.entries().get(key) {
+            Some(entry) if now < entry.retry_at => Err(entry.retry_at.saturating_sub(now)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Record a wrong code from `key`.
+    pub fn failed(&self, key: &str, now: i64) {
+        let entries = &mut *self.entries();
+        if !entries.contains_key(key) && entries.len() >= ADDRESS_MAX_TRACKED {
+            // Forget the address seen longest ago.
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_seen)
+                .map(|(key, _)| key.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+        let entry = entries.entry(key.to_owned()).or_insert(AddressEntry {
+            failures: 0,
+            retry_at: 0,
+            last_seen: now,
+        });
+        entry.failures = entry.failures.saturating_add(1);
+        entry.last_seen = now;
+        if let Some(excess) = entry.failures.checked_sub(ADDRESS_FREE_ATTEMPTS) {
+            entry.retry_at = now.saturating_add(address_backoff(excess));
+        }
+    }
+
+    /// Forget `key` after it redeemed the code.
+    pub fn succeeded(&self, key: &str) {
+        self.entries().remove(key);
+    }
+}
+
+/// The throttle key for a browser address: the address itself for IPv4,
+/// its /64 for IPv6 (one host usually holds a whole /64), and the text
+/// itself (bounded) when it is not an address.
+#[must_use]
+pub fn address_key(remote_addr: &str) -> String {
+    let trimmed = remote_addr
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    match trimmed.parse::<IpAddr>() {
+        Ok(IpAddr::V6(address)) if address.to_ipv4_mapped().is_none() => {
+            let segments = address.segments();
+            format!(
+                "{:x}:{:x}:{:x}:{:x}::/64",
+                segments[0], segments[1], segments[2], segments[3]
+            )
+        }
+        Ok(IpAddr::V6(address)) => address.to_canonical().to_string(),
+        Ok(address) => address.to_string(),
+        Err(_) => remote_addr.chars().take(64).collect(),
+    }
+}
+
+/// Seconds an address waits after `excess` failures beyond its free ones.
+fn address_backoff(excess: u32) -> i64 {
+    2_i64
+        .checked_pow(excess)
+        .and_then(|factor| factor.checked_mul(ADDRESS_BASE_BACKOFF))
+        .unwrap_or(ADDRESS_MAX_BACKOFF)
+        .min(ADDRESS_MAX_BACKOFF)
+}
+
 /// Seconds to wait after `excess` failures beyond the free attempts.
 fn backoff(excess: u32) -> i64 {
     2_i64
@@ -423,6 +535,60 @@ mod tests {
         assert!(banner.contains(&fresh));
         now += MAX_BACKOFF;
         f.setup.redeem(&f.key, &fresh, now).unwrap().unwrap();
+    }
+
+    #[test]
+    fn one_address_is_throttled_before_the_global_counter() {
+        let throttle = AddressThrottle::default();
+        let mut now = 0;
+        for _ in 0..ADDRESS_FREE_ATTEMPTS {
+            throttle.check("192.0.2.1", now).unwrap();
+            throttle.failed("192.0.2.1", now);
+        }
+        // Waits start well before the global counter's free attempts run
+        // out, and only for this address.
+        assert_eq!(throttle.check("192.0.2.1", now), Err(ADDRESS_BASE_BACKOFF));
+        throttle.check("192.0.2.2", now).unwrap();
+        now += ADDRESS_BASE_BACKOFF;
+        throttle.check("192.0.2.1", now).unwrap();
+        throttle.failed("192.0.2.1", now);
+        assert_eq!(
+            throttle.check("192.0.2.1", now),
+            Err(2 * ADDRESS_BASE_BACKOFF)
+        );
+        throttle.succeeded("192.0.2.1");
+        throttle.check("192.0.2.1", now).unwrap();
+    }
+
+    #[test]
+    fn address_backoff_doubles_and_is_capped() {
+        assert_eq!(address_backoff(0), ADDRESS_BASE_BACKOFF);
+        assert_eq!(address_backoff(2), 4 * ADDRESS_BASE_BACKOFF);
+        assert_eq!(address_backoff(20), ADDRESS_MAX_BACKOFF);
+        assert_eq!(address_backoff(u32::MAX), ADDRESS_MAX_BACKOFF);
+    }
+
+    #[test]
+    fn ipv6_addresses_share_their_64() {
+        assert_eq!(address_key("2001:db8:1:2:aaaa::1"), "2001:db8:1:2::/64");
+        assert_eq!(address_key("[2001:db8:1:2:bbbb::7]"), "2001:db8:1:2::/64");
+        assert_eq!(address_key("::ffff:192.0.2.7"), "192.0.2.7");
+        assert_eq!(address_key("192.0.2.7"), "192.0.2.7");
+        assert_eq!(address_key(&"x".repeat(100)).len(), 64);
+    }
+
+    #[test]
+    fn the_throttle_forgets_the_oldest_address_when_full() {
+        let throttle = AddressThrottle::default();
+        for i in 0..ADDRESS_MAX_TRACKED {
+            for _ in 0..=ADDRESS_FREE_ATTEMPTS {
+                throttle.failed(&format!("a{i}"), i64::try_from(i).unwrap());
+            }
+        }
+        throttle.check("a0", 0).unwrap_err();
+        throttle.failed("new", 0);
+        assert_eq!(throttle.entries().len(), ADDRESS_MAX_TRACKED);
+        throttle.check("a0", 0).unwrap();
     }
 
     #[test]

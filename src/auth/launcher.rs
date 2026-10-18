@@ -714,6 +714,9 @@ mod tests {
                 hostname: hostname.into(),
                 port,
                 dashboard_upstream: None,
+                challenge: crate::auth::access::AcmeChallenge::Http01,
+                dns_provider: None,
+                dns_credentials: None,
             },
             DEFAULT_DASHBOARD_UPSTREAM,
         )

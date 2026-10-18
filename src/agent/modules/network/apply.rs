@@ -25,7 +25,10 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngExt as _;
 
-use super::paths::{read_keyfile, remove_keyfile, write_keyfile};
+use super::{
+    certs,
+    paths::{read_keyfile, remove_keyfile, write_keyfile},
+};
 use crate::prelude::*;
 
 /// How long a change that dropped every routable address waits for
@@ -67,6 +70,7 @@ struct Pending {
     previous: Option<Vec<u8>>,
     /// The profile that was active on the interface before the change.
     previously_active: Option<String>,
+    certs: Option<PathBuf>,
 }
 
 /// One change to apply.
@@ -76,6 +80,9 @@ pub struct Change<'a> {
     pub path: &'a Path,
     pub uuid: &'a str,
     pub contents: &'a [u8],
+    /// The profile's certificate directory ([`super::certs`]), pruned to
+    /// what the profile on disk names once the change settles.
+    pub certs: Option<&'a Path>,
 }
 
 /// Applies changes and owns the (at most one) pending rollback.
@@ -113,6 +120,20 @@ impl SafeApply {
     /// cannot be written. Activation failures do not error: they are
     /// reported in the response and covered by the rollback.
     pub fn apply(&self, change: &Change<'_>) -> Result<Value> {
+        self.apply_with(change, false)
+    }
+
+    /// [`apply`](Self::apply), but a profile that fails to activate is
+    /// undone right away (the previous keyfile and profile come back) and
+    /// the failure is returned as an error.
+    ///
+    /// # Errors
+    /// As [`apply`](Self::apply), and when activation fails.
+    pub fn apply_or_revert(&self, change: &Change<'_>) -> Result<Value> {
+        self.apply_with(change, true)
+    }
+
+    fn apply_with(&self, change: &Change<'_>, revert_on_failure: bool) -> Result<Value> {
         let mut pending = lock(&self.pending);
         ensure!(
             pending.is_none(),
@@ -130,10 +151,29 @@ impl SafeApply {
             .load(change.path)
             .and_then(|()| self.host.activate(change.uuid));
 
+        if revert_on_failure && let Err(error) = activation {
+            roll_back(
+                self.host.as_ref(),
+                &Pending {
+                    token: String::new(),
+                    interface: change.interface.to_owned(),
+                    path: change.path.to_path_buf(),
+                    uuid: change.uuid.to_owned(),
+                    previous,
+                    previously_active,
+                    certs: None,
+                },
+            )
+            .context("activation failed and the change could not be undone")?;
+            prune_certs(change.path, change.certs);
+            return Err(error.context("activation failed; the change was undone"));
+        }
+
         let kept = self.wait_for_any(change.interface, &before);
         let activation_error = activation.err().map(|error| format!("{error:#}"));
 
         if kept.is_some() || before.is_empty() {
+            prune_certs(change.path, change.certs);
             return Ok(jsonf! {
                 "path": change.path,
                 "applied": true,
@@ -152,6 +192,7 @@ impl SafeApply {
             uuid: change.uuid.to_owned(),
             previous,
             previously_active,
+            certs: change.certs.map(Path::to_path_buf),
         });
         drop(pending);
         self.arm_rollback(token.clone());
@@ -180,6 +221,7 @@ impl SafeApply {
                 .take_if(|change| change.token == token)
                 .context("no network change is awaiting confirmation with that token")?
         };
+        prune_certs(&change.path, change.certs.as_deref());
         Ok(jsonf! { "confirmed": true, "path": change.path })
     }
 
@@ -213,7 +255,14 @@ impl SafeApply {
             // `configure` sees a consistent state.
             let mut guard = lock(&pending);
             if let Some(change) = guard.take_if(|change| change.token == token)
-                && let Err(error) = roll_back(host.as_ref(), &change)
+                && let Err(error) = {
+                    eprintln!(
+                        "network change to `{}` was not confirmed; rolling back",
+                        change.path.display()
+                    );
+                    roll_back(host.as_ref(), &change)
+                        .inspect(|()| prune_certs(&change.path, change.certs.as_deref()))
+                }
             {
                 eprintln!(
                     "network rollback of `{}` on {} failed: {error:#}",
@@ -227,10 +276,6 @@ impl SafeApply {
 }
 
 fn roll_back(host: &dyn NetworkHost, change: &Pending) -> Result<()> {
-    eprintln!(
-        "network change to `{}` was not confirmed; rolling back",
-        change.path.display()
-    );
     if let Some(previous) = &change.previous {
         write_keyfile(&change.path, previous)?;
         host.relabel(&change.path)?;
@@ -247,6 +292,14 @@ fn roll_back(host: &dyn NetworkHost, change: &Pending) -> Result<()> {
         Some(uuid) => host.activate(uuid),
         None if change.previous.is_some() => host.deactivate(&change.uuid),
         None => Ok(()),
+    }
+}
+
+/// Once a change has settled, drop the certificates its profile on disk no
+/// longer names.
+fn prune_certs(path: &Path, dir: Option<&Path>) {
+    if let Some(dir) = dir {
+        certs::prune(dir, read_keyfile(path).ok().flatten().as_deref());
     }
 }
 
@@ -271,6 +324,7 @@ mod tests {
         after_activate: Mutex<Option<Vec<IpAddr>>>,
         active: Mutex<Option<String>>,
         calls: Mutex<Vec<String>>,
+        fail_uuid: Mutex<Option<String>>,
     }
 
     impl FakeHost {
@@ -311,6 +365,9 @@ mod tests {
 
         fn activate(&self, uuid: &str) -> Result<()> {
             lock(&self.calls).push(format!("up {uuid}"));
+            if lock(&self.fail_uuid).as_deref() == Some(uuid) {
+                bail!("Secrets were required, but not provided");
+            }
             let after = lock(&self.after_activate).take();
             if let Some(after) = after {
                 *lock(&self.addresses) = after;
@@ -353,7 +410,7 @@ mod tests {
         host.after_activate(&["2001:db8::2", "192.0.2.10"]);
 
         let response = safe_apply(&host, Duration::from_secs(60))
-            .apply(&Change { interface: "eth0", path: &path, uuid: "new", contents: b"new" })
+            .apply(&Change { interface: "eth0", path: &path, uuid: "new", contents: b"new", certs: None })
             .unwrap();
 
         assert_eq!(response["confirmation_required"], false);
@@ -367,7 +424,7 @@ mod tests {
         let host = FakeHost::with(&[], None);
 
         let response = safe_apply(&host, Duration::from_secs(60))
-            .apply(&Change { interface: "eth0", path: &path, uuid: "new", contents: b"new" })
+            .apply(&Change { interface: "eth0", path: &path, uuid: "new", contents: b"new", certs: None })
             .unwrap();
 
         assert_eq!(response["confirmation_required"], false);
@@ -383,7 +440,7 @@ mod tests {
         let apply = safe_apply(&host, Duration::from_millis(100));
 
         let response = apply
-            .apply(&Change { interface: "eth0", path: &path, uuid: "same", contents: b"new" })
+            .apply(&Change { interface: "eth0", path: &path, uuid: "same", contents: b"new", certs: None })
             .unwrap();
         assert_eq!(response["confirmation_required"], true);
         assert!(response["confirmation_token"].as_str().is_some());
@@ -391,7 +448,7 @@ mod tests {
 
         // A second change is refused while this one is pending.
         apply
-            .apply(&Change { interface: "eth0", path: &path, uuid: "same", contents: b"x" })
+            .apply(&Change { interface: "eth0", path: &path, uuid: "same", contents: b"x", certs: None })
             .unwrap_err();
 
         wait_until(|| fs::read(&path).unwrap() == b"old");
@@ -408,7 +465,7 @@ mod tests {
         let apply = safe_apply(&host, Duration::from_millis(50));
 
         let response = apply
-            .apply(&Change { interface: "eth0", path: &path, uuid: "new", contents: b"new" })
+            .apply(&Change { interface: "eth0", path: &path, uuid: "new", contents: b"new", certs: None })
             .unwrap();
         assert_eq!(response["confirmation_required"], true);
 
@@ -427,7 +484,7 @@ mod tests {
         let apply = safe_apply(&host, Duration::from_millis(20));
 
         apply
-            .apply(&Change { interface: "eth0", path: &path, uuid: "u", contents: b"new" })
+            .apply(&Change { interface: "eth0", path: &path, uuid: "u", contents: b"new", certs: None })
             .unwrap();
 
         wait_until(|| host.calls().len() == 4);
@@ -445,7 +502,7 @@ mod tests {
         let apply = safe_apply(&host, Duration::from_millis(200));
 
         let response = apply
-            .apply(&Change { interface: "eth0", path: &path, uuid: "u", contents: b"new" })
+            .apply(&Change { interface: "eth0", path: &path, uuid: "u", contents: b"new", certs: None })
             .unwrap();
         let token = response["confirmation_token"].as_str().unwrap();
 
@@ -468,12 +525,46 @@ mod tests {
         let apply = safe_apply(&host, Duration::from_millis(20));
 
         let response = apply
-            .apply(&Change { interface: "eth0", path: &path, uuid: "u", contents: b"new" })
+            .apply(&Change { interface: "eth0", path: &path, uuid: "u", contents: b"new", certs: None })
             .unwrap();
         let token = response["confirmation_token"].as_str().unwrap().to_owned();
 
         wait_until(|| lock(&apply.pending).is_none());
         apply.confirm(&token).unwrap_err();
         assert_eq!(fs::read(&path).unwrap(), b"old");
+    }
+
+    #[test]
+    fn a_failed_activation_is_undone_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wifi-wlan0.nmconnection");
+        let host = FakeHost::with(&[], Some("ethernet"));
+        *lock(&host.fail_uuid) = Some("new".to_owned());
+        let apply = safe_apply(&host, Duration::from_secs(60));
+
+        let error = apply
+            .apply_or_revert(&Change { interface: "wlan0", path: &path, uuid: "new", contents: b"new", certs: None })
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("Secrets were required"), "{error:#}");
+        assert!(!path.exists());
+        assert_eq!(host.calls(), ["load", "up new", "delete new", "up ethernet"]);
+        assert!(lock(&apply.pending).is_none());
+    }
+
+    #[test]
+    fn a_failed_activation_restores_the_previous_keyfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wifi-wlan0.nmconnection");
+        fs::write(&path, b"old").unwrap();
+        let host = FakeHost::with(&["192.0.2.10"], Some("same"));
+        *lock(&host.fail_uuid) = Some("same".to_owned());
+
+        safe_apply(&host, Duration::from_secs(60))
+            .apply_or_revert(&Change { interface: "wlan0", path: &path, uuid: "same", contents: b"new", certs: None })
+            .unwrap_err();
+
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        assert_eq!(host.calls(), ["load", "up same", "load", "up same"]);
     }
 }

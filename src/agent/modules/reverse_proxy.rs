@@ -4,8 +4,14 @@
 //! Ultramarine Server dashboard can provision reverse proxies for hosted
 //! services (e.g. point `app.example.com` at a container's `127.0.0.1:8080`)
 //! without editing the main Caddyfile by hand. Each site is a small
-//! `*.caddy` file with a `reverse_proxy` block; the main Caddyfile is
-//! expected to `import` the managed directory.
+//! `*.caddyfile` file with a `reverse_proxy` block in
+//! `/etc/caddy/Caddyfile.d`, which terra-caddy's default Caddyfile already
+//! imports (`import Caddyfile.d/*.caddyfile`). Operator files in the same
+//! directory are left alone: Tetra only rewrites files it wrote.
+//!
+//! The same directory holds two sites Tetra writes itself rather than
+//! through module actions: the dashboard's site (`access.set`) and, until
+//! setup completes, the OOBE's site on port 6623.
 //!
 //! Registered behind the `reverse-proxy` cargo feature. Mutating actions
 //! (`write`, `delete`) accept `dry_run` and an optional `reload` flag that
@@ -17,7 +23,7 @@ use crate::agent::module_support::safe_join;
 
 /// Agent module that manages Caddy reverse proxy snippets.
 ///
-/// Stateless: all persisted state lives as `*.caddy` files under the
+/// Stateless: all persisted state lives as `*.caddyfile` files under the
 /// configured `config_dir`, with site metadata embedded in a header comment
 /// so the module can list and round-trip sites without a separate database.
 #[derive(Clone, Copy, Debug)]
@@ -43,12 +49,16 @@ const INFO: ModuleInfo = ModuleInfo {
     privileged_actions: &["write", "delete", "reload"],
 };
 
-/// Directory where managed site snippets live. Overridable per request via
-/// `config_dir` (used by tests and deployments that keep Caddy config
-/// elsewhere). The main Caddyfile is expected to `import` this directory.
-const DEFAULT_CONFIG_DIR: &str = "/etc/caddy/tetra-sites";
+/// Directory where managed site snippets live: terra-caddy's drop-in
+/// directory.
+///
+/// Overridable per request via `config_dir` (administrators only; used by
+/// tests and deployments that keep Caddy config elsewhere).
+pub const DEFAULT_CONFIG_DIR: &str = crate::auth::service::CADDY_SITES_DIR;
+/// Extension terra-caddy's Caddyfile imports from [`DEFAULT_CONFIG_DIR`].
+const SITE_EXTENSION: &str = "caddyfile";
 /// Sentinel first line written to every managed file. `list_sites` uses this
-/// to distinguish Tetra-managed snippets from any other `*.caddy` files the
+/// to distinguish Tetra-managed snippets from any other `*.caddyfile` files the
 /// operator may have placed in the same directory, so we never touch files
 /// we didn't write.
 const MANAGED_HEADER: &str = "# Managed by Tetra reverse_proxy";
@@ -271,19 +281,19 @@ fn validate_upstream(upstream: &str) -> Result<String> {
 /// Map a (validated) domain to a safe on-disk snippet filename.
 ///
 /// `*` (wildcard site labels) becomes `wildcard` and `.` becomes `_`, so
-/// `*.example.com` -> `wildcard_example_com.caddy`. The domain is already
+/// `*.example.com` -> `wildcard_example_com.caddyfile`. The domain is already
 /// validated to contain only `[a-z0-9-.]`, so no further escaping is needed.
 ///
-/// A domain whose filename would be the dashboard's own site (such as
+/// A domain whose filename would be one of Tetra's own sites (such as
 /// `00-ultramarine-dashboard`) is refused.
 fn site_filename(domain: &str) -> Result<String> {
     let filename = format!(
-        "{}.caddy",
+        "{}.{SITE_EXTENSION}",
         domain.replace('*', "wildcard").replace('.', "_")
     );
     ensure!(
-        filename != DASHBOARD_SITE_FILE,
-        "`{domain}` is reserved for the dashboard site"
+        filename != DASHBOARD_SITE_FILE && filename != SETUP_SITE_FILE,
+        "`{domain}` is reserved for Tetra's own sites"
     );
     Ok(filename)
 }
@@ -306,7 +316,7 @@ fn ensure_managed(path: &Path) -> Result<()> {
 
 /// List Tetra-managed sites in `config_dir`.
 ///
-/// Skips any `*.caddy` file that doesn't start with `MANAGED_HEADER`, so
+/// Skips any `*.caddyfile` file that doesn't start with `MANAGED_HEADER`, so
 /// operator-authored files in the same directory are neither reported nor
 /// touched. Metadata is recovered from the `# tetra:` comment line; files
 /// without a parseable header are silently ignored. Results are sorted by
@@ -322,7 +332,7 @@ fn list_sites(config_dir: &Path) -> Result<Vec<Value>> {
     {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("caddy") {
+        if path.extension().and_then(|ext| ext.to_str()) != Some(SITE_EXTENSION) {
             continue;
         }
 
@@ -361,16 +371,53 @@ fn reload_caddy(action: &str, dry_run: bool, user: Option<&str>) -> Result<Value
 /// It does not start with the `MANAGED_HEADER` line, so `list` (which reports
 /// app sites) skips it, and `write` and `delete` refuse its name. The `00-` prefix keeps
 /// it first in the import order.
-pub const DASHBOARD_SITE_FILE: &str = "00-ultramarine-dashboard.caddy";
+pub const DASHBOARD_SITE_FILE: &str = "00-ultramarine-dashboard.caddyfile";
 const DASHBOARD_HEADER: &str = "# Managed by Tetra access.set: Ultramarine Server dashboard";
 
 /// How the dashboard site gets its certificate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DashboardTls {
-    /// Caddy's automatic HTTPS (Let's Encrypt, or Tailscale for `ts.net`).
+    /// Caddy's automatic HTTPS (Let's Encrypt, or Tailscale for `ts.net`),
+    /// with the HTTP-01 challenge.
     Automatic,
     /// Caddy's local CA (`tls internal`), for IP mode.
     Internal,
+    /// Automatic HTTPS with the DNS-01 challenge through a caddy-dns module.
+    Dns {
+        /// The module, such as `cloudflare`.
+        provider: &'static str,
+        /// `(key, value)` lines of the provider block. Values are runtime
+        /// placeholders (`{env.TETRA_DNS_API_TOKEN}`) for secrets and quoted
+        /// literals for settings; never a credential.
+        fields: Vec<(String, String)>,
+    },
+}
+
+/// One `key value` line of a DNS provider block. Keys are lowercase words;
+/// values are a `{env.TETRA_DNS_*}` placeholder or a quoted literal that
+/// cannot close the quote or a block.
+fn render_dns_field(key: &str, value: &str) -> Result<String> {
+    ensure!(
+        !key.is_empty() && key.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+        "invalid DNS provider key `{key}`"
+    );
+    let placeholder = value
+        .strip_prefix("{env.TETRA_DNS_")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .is_some_and(|name| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+        });
+    let literal = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .is_some_and(|inner| {
+            !inner.is_empty()
+                && !inner.chars().any(|c| {
+                    matches!(c, '"' | '\\' | '{' | '}') || c.is_control() || c.is_whitespace()
+                })
+        });
+    ensure!(placeholder || literal, "invalid value for DNS provider key `{key}`");
+    Ok(format!("\t\t\t{key} {value}\n"))
 }
 
 /// The dashboard's site block.
@@ -403,9 +450,21 @@ impl DashboardSite {
             self.address
         );
         let upstream = validate_upstream(&self.upstream)?;
-        let tls = match self.tls {
-            DashboardTls::Automatic => "",
-            DashboardTls::Internal => "\ttls internal\n",
+        let tls = match &self.tls {
+            DashboardTls::Automatic => String::new(),
+            DashboardTls::Internal => "\ttls internal\n".to_owned(),
+            DashboardTls::Dns { provider, fields } => {
+                ensure!(
+                    !provider.is_empty() && provider.chars().all(|c| c.is_ascii_alphanumeric()),
+                    "invalid DNS provider `{provider}`"
+                );
+                let mut block = format!("\ttls {{\n\t\tdns {provider} {{\n");
+                for (key, value) in fields {
+                    block.push_str(&render_dns_field(key, value)?);
+                }
+                block.push_str("\t\t}\n\t}\n");
+                block
+            }
         };
         let public = match &self.public_root {
             Some(root) => {
@@ -459,6 +518,65 @@ pub fn write_dashboard_site(
         (None, None)
     };
     Ok(jsonf! { path, contents, "written": !dry_run, dry_run, reload, reload_error })
+}
+
+/// Filename of the OOBE's site, written while setup is incomplete.
+pub const SETUP_SITE_FILE: &str = "00-ultramarine-setup.caddyfile";
+const SETUP_HEADER: &str = "# Managed by Tetra setup: Ultramarine Server setup (OOBE)";
+/// Port browsers use for the OOBE.
+pub const SETUP_PORT: u16 = 6623;
+/// Where the OOBE listens (loopback only).
+pub const SETUP_UPSTREAM: &str = "127.0.0.1:6624";
+
+/// The OOBE's site: HTTPS on [`SETUP_PORT`] for any address or name the
+/// browser uses, with a certificate from Caddy's internal CA, proxied to
+/// [`SETUP_UPSTREAM`].
+///
+/// The site has no host, so Caddy cannot know names up front: certificates
+/// are issued on demand, which Caddy allows without an `ask` endpoint because
+/// only the internal issuer is used. Caddy listens on the port on every
+/// address, IPv4 and IPv6 (a dual-stack wildcard socket), and still starts
+/// on hosts with IPv6 disabled, so the site does not `bind` explicitly.
+#[must_use]
+pub fn render_setup_site() -> String {
+    format!(
+        "{SETUP_HEADER}\n\
+         https://:{SETUP_PORT} {{\n\
+         \ttls internal {{\n\
+         \t\ton_demand\n\
+         \t}}\n\
+         \treverse_proxy {SETUP_UPSTREAM}\n\
+         }}\n"
+    )
+}
+
+/// Write the OOBE's site into `config_dir`. Returns whether it changed.
+///
+/// # Errors
+/// Fails when the file cannot be written.
+pub fn write_setup_site(config_dir: &Path) -> Result<bool> {
+    let path = safe_join(config_dir, SETUP_SITE_FILE)?;
+    let contents = render_setup_site();
+    if fs::read_to_string(&path).is_ok_and(|existing| existing == contents) {
+        return Ok(false);
+    }
+    fs::create_dir_all(config_dir)
+        .with_context(|| format!("failed to create `{}`", config_dir.display()))?;
+    fs::write(&path, contents).with_context(|| format!("failed to write `{}`", path.display()))?;
+    Ok(true)
+}
+
+/// Remove the OOBE's site. Returns whether it existed.
+///
+/// # Errors
+/// Fails when the file exists but cannot be removed.
+pub fn remove_setup_site(config_dir: &Path) -> Result<bool> {
+    let path = safe_join(config_dir, SETUP_SITE_FILE)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to remove `{}`", path.display())),
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +671,80 @@ mod tests {
     }
 
     #[test]
+    fn renders_dns_01_dashboard_sites_with_placeholders_only() {
+        let site = DashboardSite {
+            address: "server.example.com".into(),
+            tls: DashboardTls::Dns {
+                provider: "powerdns",
+                fields: vec![
+                    ("server_url".into(), "\"https://ns.example.com\"".into()),
+                    ("api_token".into(), "{env.TETRA_DNS_API_TOKEN}".into()),
+                ],
+            },
+            upstream: "127.0.0.1:3972".into(),
+            public_root: None,
+        };
+        assert_eq!(
+            site.render().unwrap(),
+            format!(
+                "{DASHBOARD_HEADER}\nserver.example.com {{\n\ttls {{\n\t\tdns powerdns {{\n\
+                 \t\t\tserver_url \"https://ns.example.com\"\n\
+                 \t\t\tapi_token {{env.TETRA_DNS_API_TOKEN}}\n\
+                 \t\t}}\n\t}}\n\treverse_proxy 127.0.0.1:3972\n}}\n"
+            )
+        );
+        for (key, value) in [
+            ("api_token", "plain-secret"),
+            ("api_token", "{env.HOME}"),
+            ("api_token", "\"a\" }\n"),
+            ("api_token", "\"with space\""),
+            ("Key", "\"x\""),
+        ] {
+            let site = DashboardSite {
+                tls: DashboardTls::Dns {
+                    provider: "cloudflare",
+                    fields: vec![(key.into(), value.into())],
+                },
+                ..site.clone()
+            };
+            site.render().unwrap_err();
+        }
+    }
+
+    #[test]
+    fn setup_site_serves_the_oobe_with_the_internal_ca() {
+        assert_eq!(
+            render_setup_site(),
+            format!(
+                "{SETUP_HEADER}\nhttps://:6623 {{\n\ttls internal {{\n\t\ton_demand\n\t}}\n\
+                 \treverse_proxy 127.0.0.1:6624\n}}\n"
+            )
+        );
+        let dir = tempfile::tempdir().unwrap();
+        assert!(write_setup_site(dir.path()).unwrap());
+        assert!(!write_setup_site(dir.path()).unwrap());
+        assert!(dir.path().join(SETUP_SITE_FILE).exists());
+        // Not an app site.
+        assert_eq!(list_sites(dir.path()).unwrap().len(), 0);
+        assert!(remove_setup_site(dir.path()).unwrap());
+        assert!(!remove_setup_site(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn sites_use_terra_caddys_drop_in_directory() {
+        assert_eq!(DEFAULT_CONFIG_DIR, "/etc/caddy/Caddyfile.d");
+        assert_eq!(site_filename("app.example.com").unwrap(), "app_example_com.caddyfile");
+        let dir = tempfile::tempdir().unwrap();
+        // Files with other extensions are not imported, so not listed.
+        fs::write(
+            dir.path().join("old_example_com.caddy"),
+            format!("{MANAGED_HEADER}\n# tetra: {{\"domain\":\"old.example.com\",\"upstream\":\"127.0.0.1:1\",\"tls\":true}}\n"),
+        )
+        .unwrap();
+        assert_eq!(list_sites(dir.path()).unwrap().len(), 0);
+    }
+
+    #[test]
     fn dashboard_site_is_not_listed_as_an_app_site() {
         let dir = tempfile::tempdir().unwrap();
         let site = DashboardSite {
@@ -584,11 +776,13 @@ mod tests {
             reload: false,
         };
 
-        // The dashboard site's name is reserved, even before it exists.
-        write("00-ultramarine-dashboard").handle(None).unwrap_err();
-        delete("00-ultramarine-dashboard").handle(None).unwrap_err();
+        // Tetra's own sites' names are reserved, even before they exist.
+        for reserved in ["00-ultramarine-dashboard", "00-ultramarine-setup"] {
+            write(reserved).handle(None).unwrap_err();
+            delete(reserved).handle(None).unwrap_err();
+        }
 
-        let operator = dir.path().join("mine_example_com.caddy");
+        let operator = dir.path().join("mine_example_com.caddyfile");
         fs::write(&operator, "mine.example.com {\n}\n").unwrap();
         write("mine.example.com").handle(None).unwrap_err();
         delete("mine.example.com").handle(None).unwrap_err();
@@ -601,13 +795,13 @@ mod tests {
         write("app.example.com").handle(None).unwrap();
         write("app.example.com").handle(None).unwrap();
         delete("app.example.com").handle(None).unwrap();
-        assert!(!dir.path().join("app_example_com.caddy").exists());
+        assert!(!dir.path().join("app_example_com.caddyfile").exists());
     }
 
     #[test]
     fn dry_run_write_does_not_create_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("demo_example_com.caddy");
+        let path = dir.path().join("demo_example_com.caddyfile");
         let response = Write {
             config_dir: dir.path().to_path_buf(),
             domain: "demo.example.com".into(),

@@ -448,6 +448,10 @@ Always available.
 Actions:
 
 - `get_system`
+- `set_hostname` (privileged)
+- `set_keymap` (privileged)
+- `set_locale` (privileged)
+- `set_timezone` (privileged)
 
 Request:
 
@@ -464,6 +468,20 @@ Payload response:
   "family": "unix"
 }
 ```
+
+The setters return the command result and accept `dry_run`:
+
+- `set_hostname` `{ "hostname": "server" }` runs `hostnamectl set-hostname`.
+- `set_keymap` `{ "layout": "de", "variant": "nodeadkeys" }` runs
+  `localectl set-x11-keymap`, which also sets the console keymap. `layout`
+  (comma-separated for several) and the optional `variant` are 1–64 letters,
+  digits, `_`, `-` or `,`.
+- `set_locale` `{ "locale": "de_DE.UTF-8" }` sets `LANG` with
+  `localectl set-locale`. Locales start with a letter and contain letters,
+  digits, `_`, `.`, `-` or `@`.
+- `set_timezone` `{ "timezone": "Europe/Berlin" }` runs
+  `timedatectl set-timezone` with an IANA name: a letter first, then letters,
+  digits, `_`, `-`, `+` or `/`, no `..` and no trailing `/`.
 
 ### files
 
@@ -1243,6 +1261,8 @@ Actions:
 - `get_config` (privileged)
 - `set_config` (privileged)
 - `reload` (privileged)
+- `scan_wifi` (privileged)
+- `connect_wifi` (privileged)
 
 `interfaces` returns interface names, MAC addresses, and operstate from
 `/sys/class/net`, plus each interface's IPv4 and IPv6 `addresses`:
@@ -1309,6 +1329,27 @@ and its default SELinux label, then loads and activates it.
   match its section's family.
 - At least one family must give the host a routable address, so both families
   `disabled` (or IPv4 `disabled` with IPv6 `link-local`) is rejected.
+- `wired_8021x` (optional) adds wired 802.1X as the keyfile's `[802-1x]`
+  section: `{eap, identity, anonymous_identity?, password?, ca_cert?,
+  client_cert?, private_key?, private_key_password?, domain_suffix_match?,
+  phase2?}`. `eap` is `tls`, `peap`, `ttls`, `pwd` or `md5`; `tls` needs
+  `client_cert` and `private_key` and takes no `password`, the others need
+  `password`. `phase2` (`mschapv2`, the default, `mschap`, `pap`, `chap`,
+  `gtc`, `md5`) and `anonymous_identity` are for `peap` and `ttls`.
+- `ca_cert`, `client_cert` and `private_key` are each an absolute path or
+  PEM contents (up to 64 KiB, starting with `-----BEGIN `). Tetra stores PEM
+  contents under `/etc/pki/tetra/802-1x/<profile>/` (directories `0700`,
+  files `0600`, root only, default SELinux label), named by a hash of the
+  contents, and writes those paths into the keyfile. Once a change settles
+  (applied, confirmed or rolled back), files the profile on disk no longer
+  names are deleted, and the directory with the last one; a profile that is
+  rolled back or never came up takes its files with it.
+- `domain_suffix_match` (`tls`, `peap` and `ttls` only) is a domain name;
+  the authentication server's certificate must name it or a subdomain
+  (`802-1x.domain-suffix-match`).
+- The keyfile in responses has passwords replaced by `<redacted>`. Passwords,
+  `private_key_password` and key contents never appear on a command line,
+  in a response, in an error or in the action log.
 - Unknown fields are rejected.
 
 With `dry_run`, the response holds the `path`, `uuid` and rendered `keyfile`
@@ -1329,6 +1370,58 @@ inside the window keeps the new configuration.
 ```json
 { "token": "..." }
 ```
+
+`scan_wifi` lists the networks a wireless interface can see, from
+`nmcli device wifi list`:
+
+```json
+{ "interface": "wlan0", "rescan": true }
+```
+
+`rescan: true` always scans first and `false` never does; by default
+NetworkManager scans when its last scan is more than 30 seconds old. The
+response is `{"networks": [...]}`, strongest first, one entry per SSID:
+
+```json
+{ "ssid": "Home", "security": "wpa-personal", "signal": 82, "frequency": 5180, "in_use": true }
+```
+
+`security` is `open`, `wpa-personal` (WPA2 or WPA3), `wpa-enterprise`
+(802.1X) or `unknown` (WEP, OWE and others `connect_wifi` cannot join).
+Hidden networks are not listed.
+
+`connect_wifi` writes `/etc/NetworkManager/system-connections/wifi-<interface>.nmconnection`
+(mode `0600`, default SELinux label) and activates it. Each interface has
+one Wi-Fi profile, so connecting to another network replaces it and keeps
+its UUID.
+
+```json
+{
+  "interface": "wlan0",
+  "ssid": "Home",
+  "hidden": false,
+  "security": { "type": "wpa-personal", "password": "..." },
+  "dry_run": false
+}
+```
+
+- `security.type` is `open`, `wpa-personal` with `password`, or
+  `wpa-enterprise` with the same fields as `wired_8021x` above.
+- `wpa-personal` passwords are 8–63 printable ASCII characters or 64 hex
+  digits. For networks the scan shows as WPA3-only, Tetra uses SAE, which
+  takes up to 128 characters.
+- A network the last scan did not see is written with `hidden=true`, as is
+  any network sent with `hidden: true`.
+- IPv4 and IPv6 use `auto`.
+- Unknown fields are rejected.
+
+The password goes only into the keyfile: it is never on a command line, and
+the `keyfile` in responses shows `<redacted>`. `connect_wifi` uses the same
+safe apply as `configure` (including `confirmation_required` when the
+interface lost every address it had). If the profile does not come up (a
+wrong password, say), Tetra restores the previous profile, or removes the
+new one, and returns an error. With `dry_run`, nothing is scanned or
+written.
 
 `get_config` and `set_config` give raw access to keyfiles, restricted to
 regular `.nmconnection` files directly inside
@@ -1411,6 +1504,10 @@ Actions:
 - `update`
 - `delete`
 - `set_password`
+- `set_authorized_keys`
+- `add_admin`
+
+Every action except `list` and `status` is privileged.
 
 `list` parses `/etc/passwd`; `groups` parses `/etc/group`.
 
@@ -1453,6 +1550,37 @@ Actions:
   "dry_run": true
 }
 ```
+
+`set_authorized_keys` replaces `~/.ssh/authorized_keys` for an existing
+account:
+
+```json
+{
+  "name": "alice",
+  "keys": ["ssh-ed25519 AAAAC3Nza... alice@laptop"],
+  "dry_run": true
+}
+```
+
+- Up to 100 keys, each one line of at most 16 KiB without control
+  characters, with an OpenSSH key type (`ssh-…`, `ecdsa-sha2-…`, `sk-ssh-…`,
+  `sk-ecdsa-sha2-…`). An empty list empties the file.
+- `.ssh` is `0700` and the file `0600`, both owned by the user. Tetra writes
+  through directory handles without following symlinks, so a symlinked
+  `.ssh` or `authorized_keys` cannot redirect the write. On SELinux hosts it
+  then runs `restorecon -R` on `.ssh`.
+- The response has `name`, `path`, the number of `keys`, `written` and the
+  `selinux` command results.
+
+`add_admin` adds an existing account to the `ultramarine-admin` group
+(`usermod --append --groups`), which makes it a dashboard administrator:
+
+```json
+{ "name": "alice", "dry_run": true }
+```
+
+The group must exist on the host. A setup session may only call `add_admin`
+while no eligible administrator exists (see `docs/auth-protocol.md`).
 
 ### virtual_machines
 
@@ -1498,6 +1626,116 @@ Mutation payloads:
 ```json
 { "xml_path": "/var/lib/libvirt/images/vm1.xml", "dry_run": true }
 ```
+
+### power
+
+Feature: `power`
+
+Actions:
+
+- `reboot` (privileged)
+- `poweroff` (privileged)
+
+Both take `{ "dry_run": false }` and answer before the host goes down: Tetra
+starts a transient timer (`systemd-run --on-active=3 --unit=tetra-power-<action>
+systemctl <action>`) and returns `{ "action", "in_seconds": 3, "dry_run",
+"command" }`.
+
+### updates
+
+Feature: `updates`
+
+Actions:
+
+- `get_policy`
+- `set_policy` (privileged)
+
+The policy is `automatic` (install updates on a timer) or `notify` (do not).
+Tetra picks the timer for the install variant: on bootc hosts
+(`/run/ostree-booted` exists) `bootc-fetch-apply-updates.timer`, otherwise
+`dnf5-automatic.timer` from `dnf5-plugin-automatic` (whether that installs
+or only downloads is `apply_updates` in `/etc/dnf/automatic.conf`).
+
+`set_policy` payload:
+
+```json
+{ "policy": "automatic", "dry_run": true }
+```
+
+It runs `systemctl enable --now` (`automatic`) or `disable --now`
+(`notify`) on the timer, and only then stores the policy in
+`/var/lib/tetra/updates.json` (versioned like the auth files). The response
+has `policy`, `variant` (`bootc` or `mutable`), `timer`, `stored`, `dry_run`
+and the `command` result.
+
+`get_policy` takes `{}` and returns `{ "policy", "variant", "timer" }`;
+`policy` is `null` until one is set.
+
+### remote_access
+
+Feature: `remote-access`
+
+Actions (all privileged):
+
+- `status`
+- `tailscale_up`
+- `tailscale_disable`
+- `cloudflared_set_token`
+- `cloudflared_disable`
+
+`tailscaled.service` and `cloudflared.service` ship disabled; these actions
+turn them on and off. Credentials are sealed with `systemd-creds` under
+`/var/lib/tetra/secrets/` and never appear on a command line, in a unit file,
+in a response or in the action log. Payload credentials are refused unless
+they are 1–4096 printable ASCII characters without spaces. Responses list
+the `commands` run (or, with `dry_run`, planned).
+
+`tailscale_up` payload:
+
+```json
+{ "auth_key": "tskey-auth-...", "serve": true, "funnel": false, "dry_run": false }
+```
+
+- The key is sealed, then written to a root-only file in `/run/tetra` for
+  `tailscale up --auth-key=file:<path>` and deleted right after.
+- Tetra installs `tailscaled.service.d/50-tetra.conf`
+  (`TS_PERMIT_CERT_UID=caddy`) so Caddy can get the node's `*.ts.net`
+  certificate, and restarts tailscaled the first time it does so.
+- After `tailscale serve reset`, `serve` (the default) forwards Caddy's HTTPS
+  port as raw TCP on the tailnet (`tailscale serve --bg --tcp=<port>
+  tcp://127.0.0.1:<port>`); `funnel: true` does the same on the internet with
+  `tailscale funnel`, only on ports 443, 8443 and 10000. The port is the
+  access port (443 by default). With neither, nothing is forwarded.
+- The response has `enabled`, `serve`, `funnel`, `target`, `dry_run` and the
+  node's `hostname` (its `*.ts.net` name), which `access.set` should use so
+  the dashboard works over Tailscale.
+
+`tailscale_disable` takes `{ "dry_run": false }`: it resets serve, runs
+`systemctl disable --now tailscaled.service`, removes the drop-in and
+forgets the auth key.
+
+`cloudflared_set_token` payload:
+
+```json
+{ "token": "eyJ...", "dry_run": false }
+```
+
+It seals the token and installs `cloudflared.service.d/50-tetra.conf`, which
+loads it with `LoadCredentialEncrypted=`, points `TUNNEL_TOKEN_FILE` at it and
+runs `cloudflared --no-autoupdate tunnel run`, then reloads systemd and
+enables and restarts `cloudflared.service`. `cloudflared_disable` stops and
+disables it and removes the drop-in and the sealed token.
+
+`status` takes `{}` and returns:
+
+```json
+{
+  "tailscale": { "enabled": true, "serve": true, "funnel": false, "hostname": "server.tail1234.ts.net" },
+  "cloudflared": { "enabled": false }
+}
+```
+
+`hostname` is only present while tailscaled is running.
 
 ## Controller Guidance
 

@@ -11,17 +11,25 @@
 //!   `/etc/NetworkManager/system-connections/`.
 //!
 //! `configure` is the structured path: it takes an interface plus `ipv4` and
-//! `ipv6` sections, validates them ([`keyfile`]), writes the keyfile `0600`
+//! `ipv6` sections and optional wired 802.1X settings, validates them
+//! ([`keyfile`]), writes the keyfile `0600`
 //! with its default SELinux label, loads and activates it, and rolls it back
 //! unless confirmed if the interface lost every routable address it had
 //! ([`apply`]). `get_config`/`set_config` remain for raw keyfile access, but
 //! only for regular `.nmconnection` files directly inside that directory
 //! ([`paths`]). All of these are privileged.
+//!
+//! `scan_wifi` lists the networks a wireless interface can see, and
+//! `connect_wifi` writes a Wi-Fi keyfile for it and activates it through the
+//! same safe apply, undoing the profile if it does not come up ([`wifi`]).
+//! Passwords only ever go into the `0600` keyfile. Both are privileged.
 
 mod addresses;
 mod apply;
+mod certs;
 mod keyfile;
 mod paths;
+mod wifi;
 
 use std::{
     net::IpAddr,
@@ -33,7 +41,8 @@ use crate::prelude::*;
 use crate::agent::module_support::{CommandResult, SelinuxOptions};
 use crate::types::{
     DryRunRequest, NetworkConfigRequest, NetworkConfigureRequest, NetworkConfirmRequest,
-    NetworkInterfaceRequest, NetworkWriteConfigRequest,
+    NetworkConnectWifiRequest, NetworkInterfaceRequest, NetworkScanWifiRequest,
+    NetworkWriteConfigRequest, WifiSecurity,
 };
 use addresses::{InterfaceAddress, parse_ip_addr_json};
 use apply::{Change, NetworkHost, SafeApply};
@@ -62,8 +71,18 @@ const INFO: ModuleInfo = ModuleInfo {
         "get_config",
         "set_config",
         "reload",
+        "scan_wifi",
+        "connect_wifi",
     ],
-    privileged_actions: &["configure", "confirm", "get_config", "set_config", "reload"],
+    privileged_actions: &[
+        "configure",
+        "confirm",
+        "get_config",
+        "set_config",
+        "reload",
+        "scan_wifi",
+        "connect_wifi",
+    ],
 };
 
 /// The host's single safe-apply state, shared by `configure` and `confirm`.
@@ -104,7 +123,12 @@ actions!(Action [payload user] => {
     Dns => Ok(jsonf! { "resolv_conf": read_optional("/etc/resolv.conf") }),
     Routes => crate::cmd!({ &INFO, "routes", user } "ip" ["-json", "route", "show"] JSON),
     Configure: NetworkConfigureRequest => {
-        configure(&payload, Path::new(SYSTEM_CONNECTIONS_DIR), &SAFE_APPLY)
+        configure(
+            &payload,
+            Path::new(SYSTEM_CONNECTIONS_DIR),
+            Path::new(certs::CERTS_DIR),
+            &SAFE_APPLY,
+        )
     },
     Confirm: NetworkConfirmRequest => SAFE_APPLY.confirm(&payload.token),
     GetConfig: NetworkConfigRequest => {
@@ -116,42 +140,176 @@ actions!(Action [payload user] => {
     Reload: DryRunRequest => {
         crate::cmd!((payload.dry_run) { &INFO, "reload", user } "systemctl" ["reload-or-restart", "NetworkManager.service"] json)
     },
+    ScanWifi: NetworkScanWifiRequest => {
+        Ok(jsonf! { "networks": scan_wifi(&payload.interface, payload.rescan)? })
+    },
+    ConnectWifi: NetworkConnectWifiRequest => {
+        if !payload.dry_run {
+            keyfile::validate_interface(&payload.interface)?;
+            ensure_wireless(&payload.interface)?;
+        }
+        connect_wifi(
+            &payload,
+            Path::new(SYSTEM_CONNECTIONS_DIR),
+            Path::new(certs::CERTS_DIR),
+            &SAFE_APPLY,
+            &|interface| scan_wifi(interface, Some(false)),
+        )
+    },
 });
+
+fn scan_wifi(interface: &str, rescan: Option<bool>) -> Result<Vec<wifi::Network>> {
+    keyfile::validate_interface(interface)?;
+    ensure_wireless(interface)?;
+    let rescan = match rescan {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "auto",
+    };
+    let result = crate::cmd!("nmcli" [
+        "--terse", "--escape", "yes", "--fields", wifi::SCAN_FIELDS,
+        "device", "wifi", "list", "--rescan", rescan, "ifname", interface,
+    ])?;
+    Ok(wifi::parse_scan(&result.stdout))
+}
+
+/// Validate, render, and (outside dry-run) apply a Wi-Fi profile as
+/// `wifi-<interface>.nmconnection` in `dir`. `scan` lists the networks the
+/// interface can see, to tell WPA3-only and hidden networks apart; it is
+/// not run in dry-run.
+fn connect_wifi(
+    payload: &NetworkConnectWifiRequest,
+    dir: &Path,
+    certs_dir: &Path,
+    safe_apply: &SafeApply,
+    scan: &dyn Fn(&str) -> Result<Vec<wifi::Network>>,
+) -> Result<Value> {
+    keyfile::validate_interface(&payload.interface)?;
+    let seen = if payload.dry_run {
+        None
+    } else {
+        scan(&payload.interface)
+            .ok()
+            .and_then(|networks| networks.into_iter().find(|network| network.ssid == payload.ssid))
+    };
+    let key_management = if seen.as_ref().is_some_and(|network| network.sae_only) {
+        wifi::KeyManagement::Sae
+    } else {
+        wifi::KeyManagement::WpaPsk
+    };
+    // A network the scan did not see is probed for, in case it is hidden.
+    let hidden = payload.hidden || (!payload.dry_run && seen.is_none());
+    wifi::validate(payload, key_management)?;
+
+    let name = wifi::connection_name(&payload.interface);
+    let path = keyfile_path_for(dir, &name)?;
+    let uuid = read_keyfile(&path)?
+        .as_deref()
+        .and_then(keyfile::existing_uuid)
+        .unwrap_or_else(keyfile::new_uuid);
+    let certs = certs_dir.join(&name);
+    let mut request = payload.clone();
+    let pem_files = match &mut request.security {
+        WifiSecurity::WpaEnterprise(settings) => certs::externalize(settings, &certs),
+        _ => Vec::new(),
+    };
+    let contents = wifi::render(&request, key_management, hidden, &uuid);
+    let shown = wifi::render_redacted(&request, key_management, hidden, &uuid);
+
+    if payload.dry_run {
+        return Ok(jsonf! {
+            "path": path,
+            uuid,
+            "keyfile": shown,
+            "applied": false,
+            payload.dry_run,
+        });
+    }
+
+    store_certs(&pem_files)?;
+    let mut response = safe_apply
+        .apply_or_revert(&Change {
+            interface: &payload.interface,
+            path: &path,
+            uuid: &uuid,
+            contents: contents.as_bytes(),
+            certs: Some(&certs),
+        })
+        .with_context(|| format!("could not connect to `{}`", payload.ssid))?;
+    response["ssid"] = payload.ssid.clone().into();
+    response["security"] = match &payload.security {
+        WifiSecurity::Open {} => "open",
+        WifiSecurity::WpaPersonal { .. } => "wpa-personal",
+        WifiSecurity::WpaEnterprise(_) => "wpa-enterprise",
+    }
+    .into();
+    response["uuid"] = uuid.into();
+    response["keyfile"] = shown.into();
+    response["dry_run"] = false.into();
+    Ok(response)
+}
 
 /// Validate, render, and (outside dry-run) safely apply a structured
 /// configuration as the keyfile `<name>.nmconnection` in `dir`.
-fn configure(payload: &NetworkConfigureRequest, dir: &Path, safe_apply: &SafeApply) -> Result<Value> {
+fn configure(
+    payload: &NetworkConfigureRequest,
+    dir: &Path,
+    certs_dir: &Path,
+    safe_apply: &SafeApply,
+) -> Result<Value> {
     keyfile::validate(payload)?;
-    let path = keyfile_path_for(dir, keyfile::connection_name(payload))?;
+    let name = keyfile::connection_name(payload);
+    let path = keyfile_path_for(dir, name)?;
     // Rewriting a profile keeps its UUID, so NetworkManager treats it as the
     // same connection rather than a new one.
     let uuid = read_keyfile(&path)?
         .as_deref()
         .and_then(keyfile::existing_uuid)
         .unwrap_or_else(keyfile::new_uuid);
-    let contents = keyfile::render(payload, &uuid);
+    // PEM certificates and keys are stored as files the keyfile points at.
+    let certs = certs_dir.join(name);
+    let mut request = payload.clone();
+    let pem_files = request
+        .wired_8021x
+        .as_mut()
+        .map(|settings| certs::externalize(settings, &certs))
+        .unwrap_or_default();
+    let contents = keyfile::render(&request, &uuid);
+    // Responses never carry 802.1X passwords.
+    let shown = keyfile::render_redacted(&request, &uuid);
 
     if payload.dry_run {
         return Ok(jsonf! {
             "path": path,
             uuid,
-            "keyfile": contents,
+            "keyfile": shown,
             "applied": false,
             payload.dry_run,
         });
     }
 
     ensure_ethernet(&payload.interface)?;
+    store_certs(&pem_files)?;
     let mut response = safe_apply.apply(&Change {
         interface: &payload.interface,
         path: &path,
         uuid: &uuid,
         contents: contents.as_bytes(),
+        certs: Some(&certs),
     })?;
     response["uuid"] = uuid.into();
-    response["keyfile"] = contents.into();
+    response["keyfile"] = shown.into();
     response["dry_run"] = false.into();
     Ok(response)
+}
+
+/// Write PEM certificates and keys and give them their default SELinux
+/// label.
+fn store_certs(files: &[certs::PemFile]) -> Result<()> {
+    for path in certs::write(files)? {
+        restorecon(&path, false)?;
+    }
+    Ok(())
 }
 
 fn get_config(payload: &NetworkConfigRequest, dir: &Path) -> Result<Value> {
@@ -213,6 +371,21 @@ fn ensure_ethernet(interface: &str) -> Result<()> {
     ensure!(
         link_type.trim() == "1" && !has_devtype && !sysfs.join("wireless").exists(),
         "interface `{interface}` is not an Ethernet device"
+    );
+    Ok(())
+}
+
+/// `scan_wifi` and `connect_wifi` need a wireless device.
+fn ensure_wireless(interface: &str) -> Result<()> {
+    let sysfs = Path::new("/sys/class/net").join(interface);
+    ensure!(sysfs.exists(), "interface `{interface}` does not exist");
+    let is_wlan = fs::read_to_string(sysfs.join("uevent"))
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line == "DEVTYPE=wlan");
+    ensure!(
+        is_wlan || sysfs.join("wireless").exists(),
+        "interface `{interface}` is not a Wi-Fi device"
     );
     Ok(())
 }
@@ -305,6 +478,8 @@ fn read_interfaces(addresses: &[InterfaceAddress]) -> Result<Vec<Value>> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use serde_json::json;
 
     use super::*;
@@ -317,7 +492,15 @@ mod tests {
 
     #[test]
     fn configuration_actions_are_privileged() {
-        for action in ["configure", "confirm", "get_config", "set_config", "reload"] {
+        for action in [
+            "configure",
+            "confirm",
+            "get_config",
+            "set_config",
+            "reload",
+            "scan_wifi",
+            "connect_wifi",
+        ] {
             assert!(INFO.is_privileged(action), "{action}");
             assert!(INFO.actions.contains(&action), "{action}");
         }
@@ -435,13 +618,273 @@ mod tests {
         }))
         .unwrap();
 
-        let response = configure(&payload, dir.path(), &SAFE_APPLY).unwrap();
+        let response = configure(&payload, dir.path(), &dir.path().join("certs"), &SAFE_APPLY).unwrap();
 
         assert_eq!(response["path"], dir.path().join("eth0.nmconnection").to_str().unwrap());
         assert_eq!(response["applied"], false);
         let keyfile = response["keyfile"].as_str().unwrap();
         assert!(keyfile.contains("[ipv6]\nmethod=manual\naddress1=2001:db8::2/64\ngateway=fe80::1\n"));
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn configure_responses_do_not_echo_8021x_passwords() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload: NetworkConfigureRequest = serde_json::from_value(json!({
+            "interface": "eth0",
+            "wired_8021x": { "eap": "peap", "identity": "alice", "password": "hunter2-8021x" },
+            "dry_run": true
+        }))
+        .unwrap();
+
+        let response = configure(&payload, dir.path(), &dir.path().join("certs"), &SAFE_APPLY).unwrap();
+
+        let keyfile = response["keyfile"].as_str().unwrap();
+        assert!(keyfile.contains("[802-1x]\neap=peap;\nidentity=alice\npassword=<redacted>\n"));
+        assert!(!response.to_string().contains("hunter2-8021x"));
+    }
+
+    /// A NetworkManager stand-in for `connect_wifi`: no addresses, and
+    /// activation fails when `fail` is set.
+    #[derive(Default)]
+    struct WifiHost {
+        calls: std::sync::Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    impl WifiHost {
+        fn record(&self, call: String) {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(call);
+        }
+    }
+
+    impl NetworkHost for WifiHost {
+        fn routable_addresses(&self, _interface: &str) -> Result<Vec<IpAddr>> {
+            Ok(Vec::new())
+        }
+        fn active_connection(&self, _interface: &str) -> Option<String> {
+            None
+        }
+        fn relabel(&self, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn load(&self, _path: &Path) -> Result<()> {
+            self.record("load".to_owned());
+            Ok(())
+        }
+        fn activate(&self, uuid: &str) -> Result<()> {
+            self.record(format!("up {uuid}"));
+            ensure!(!self.fail, "Error: Connection activation failed: Secrets were required");
+            Ok(())
+        }
+        fn deactivate(&self, uuid: &str) -> Result<()> {
+            self.record(format!("down {uuid}"));
+            Ok(())
+        }
+        fn delete(&self, uuid: &str) -> Result<()> {
+            self.record(format!("delete {uuid}"));
+            Ok(())
+        }
+    }
+
+    fn wifi_request(ssid: &str, password: &str) -> NetworkConnectWifiRequest {
+        serde_json::from_value(json!({
+            "interface": "wlan0",
+            "ssid": ssid,
+            "security": {"type": "wpa-personal", "password": password},
+        }))
+        .unwrap()
+    }
+
+    fn seen(ssid: &str, sae_only: bool) -> Vec<wifi::Network> {
+        wifi::parse_scan(&format!(
+            " :{}:80:2437 MHz:WPA3:(none):pair_ccmp {}",
+            ssid.bytes().map(|byte| format!("{byte:02X}")).join(""),
+            if sae_only { "sae" } else { "psk sae" }
+        ))
+    }
+
+    #[test]
+    fn connect_wifi_writes_the_passphrase_only_to_the_keyfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Arc::new(WifiHost::default());
+        let apply = SafeApply::new(Arc::clone(&host) as Arc<dyn NetworkHost>);
+        let request = wifi_request("Home", "wifi-S3CRET-pass");
+
+        let response =
+            connect_wifi(&request, dir.path(), &dir.path().join("certs"), &apply, &|_| Ok(seen("Home", true))).unwrap();
+
+        let path = dir.path().join("wifi-wlan0.nmconnection");
+        let keyfile = fs::read_to_string(&path).unwrap();
+        assert!(keyfile.contains("key-mgmt=sae\npsk=wifi-S3CRET-pass\n"), "{keyfile}");
+        assert!(!keyfile.contains("hidden"));
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!response.to_string().contains("S3CRET"), "{response}");
+        assert_eq!(response["ssid"], "Home");
+        assert_eq!(response["security"], "wpa-personal");
+        let uuid = response["uuid"].as_str().unwrap();
+        assert_eq!(*host.calls.lock().unwrap(), ["load".to_owned(), format!("up {uuid}")]);
+
+        // Reconnecting keeps the profile; a network missing from the scan
+        // is probed for as hidden, with WPA-PSK.
+        let again = connect_wifi(&wifi_request("Attic", "another-pass"), dir.path(), &dir.path().join("certs"), &apply, &|_| {
+            Ok(seen("Home", false))
+        })
+        .unwrap();
+        assert_eq!(again["uuid"], uuid);
+        let keyfile = fs::read_to_string(&path).unwrap();
+        assert!(keyfile.contains("hidden=true\n"));
+        assert!(keyfile.contains("key-mgmt=wpa-psk\npsk=another-pass\n"));
+    }
+
+    #[test]
+    fn a_wifi_profile_that_does_not_come_up_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Arc::new(WifiHost { fail: true, ..WifiHost::default() });
+        let apply = SafeApply::new(Arc::clone(&host) as Arc<dyn NetworkHost>);
+
+        let error = connect_wifi(
+            &wifi_request("Home", "wrong-S3CRET-pass"),
+            dir.path(),
+            &dir.path().join("certs"),
+            &apply,
+            &|_| Ok(seen("Home", false)),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("could not connect to `Home`"), "{message}");
+        assert!(!message.contains("S3CRET"), "{message}");
+        assert!(!dir.path().join("wifi-wlan0.nmconnection").exists());
+        assert!(host.calls.lock().unwrap().last().unwrap().starts_with("delete "));
+    }
+
+    const PEM_KEY: &str =
+        "-----BEGIN PRIVATE KEY-----\nMIIBVQ-S3CRET-key\n-----END PRIVATE KEY-----\n";
+    const PEM_CA: &str = "-----BEGIN CERTIFICATE-----\nMIIBca\n-----END CERTIFICATE-----\n";
+
+    fn enterprise_request() -> NetworkConnectWifiRequest {
+        serde_json::from_value(json!({
+            "interface": "wlan0",
+            "ssid": "Corp",
+            "security": {
+                "type": "wpa-enterprise",
+                "eap": "tls",
+                "identity": "host/server",
+                "ca_cert": PEM_CA,
+                "client_cert": PEM_CA,
+                "private_key": PEM_KEY,
+                "private_key_password": "key-S3CRET-pass",
+                "domain_suffix_match": "radius.example.com",
+            },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn enterprise_wifi_stores_pem_files_and_points_the_keyfile_at_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let certs = dir.path().join("certs");
+        let host = Arc::new(WifiHost::default());
+        let apply = SafeApply::new(Arc::clone(&host) as Arc<dyn NetworkHost>);
+
+        let response =
+            connect_wifi(&enterprise_request(), dir.path(), &certs, &apply, &|_| Ok(Vec::new()))
+                .unwrap();
+
+        let keyfile = fs::read_to_string(dir.path().join("wifi-wlan0.nmconnection")).unwrap();
+        let profile_certs = certs.join("wifi-wlan0");
+        let key = fs::read_dir(&profile_certs)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap().to_string_lossy().starts_with("private-key-"))
+            .unwrap();
+        assert_eq!(fs::read_to_string(&key).unwrap(), PEM_KEY);
+        assert_eq!(fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::metadata(&profile_certs).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(keyfile.contains(&format!("private-key={}\n", key.display())), "{keyfile}");
+        assert!(keyfile.contains("domain-suffix-match=radius.example.com\n"));
+        assert!(keyfile.contains("private-key-password=key-S3CRET-pass\n"));
+        assert!(!keyfile.contains("BEGIN"));
+        // Neither the key nor its password reaches the response.
+        assert!(!response.to_string().contains("S3CRET"), "{response}");
+        assert!(!format!("{:?}", enterprise_request()).contains("S3CRET"));
+
+        // Switching to a network without certificates removes them once the
+        // change settles.
+        connect_wifi(&wifi_request("Home", "another-pass"), dir.path(), &certs, &apply, &|_| {
+            Ok(Vec::new())
+        })
+        .unwrap();
+        assert!(!profile_certs.exists());
+    }
+
+    #[test]
+    fn certificates_of_a_profile_that_does_not_come_up_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let certs = dir.path().join("certs");
+        let host = Arc::new(WifiHost { fail: true, ..WifiHost::default() });
+        let apply = SafeApply::new(Arc::clone(&host) as Arc<dyn NetworkHost>);
+
+        let error =
+            connect_wifi(&enterprise_request(), dir.path(), &certs, &apply, &|_| Ok(Vec::new()))
+                .unwrap_err();
+
+        assert!(!format!("{error:#}").contains("S3CRET"));
+        assert!(!certs.join("wifi-wlan0").exists());
+    }
+
+    #[test]
+    fn dry_run_configure_shows_where_wired_pem_files_would_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let certs = dir.path().join("certs");
+        let payload: NetworkConfigureRequest = serde_json::from_value(json!({
+            "interface": "eth0",
+            "wired_8021x": {
+                "eap": "peap",
+                "identity": "alice",
+                "password": "hunter2-8021x",
+                "ca_cert": PEM_CA,
+                "domain_suffix_match": "Example.COM",
+            },
+            "dry_run": true
+        }))
+        .unwrap();
+
+        let response = configure(&payload, dir.path(), &certs, &SAFE_APPLY).unwrap();
+
+        let keyfile = response["keyfile"].as_str().unwrap();
+        assert!(
+            keyfile.contains(&format!("ca-cert={}", certs.join("eth0/ca-cert-").display())),
+            "{keyfile}"
+        );
+        assert!(keyfile.contains("domain-suffix-match=example.com\n"));
+        assert!(!certs.exists());
+    }
+
+    #[test]
+    fn dry_run_connect_wifi_does_not_scan_or_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let request: NetworkConnectWifiRequest = serde_json::from_value(json!({
+            "interface": "wlan0",
+            "ssid": "Home",
+            "security": {"type": "wpa-personal", "password": "wifi-S3CRET-pass"},
+            "dry_run": true,
+        }))
+        .unwrap();
+
+        let response = connect_wifi(&request, dir.path(), &dir.path().join("certs"), &SAFE_APPLY, &|_| {
+            panic!("dry run scanned")
+        })
+        .unwrap();
+
+        assert_eq!(response["applied"], false);
+        assert!(response["keyfile"].as_str().unwrap().contains("psk=<redacted>"));
+        assert!(!response.to_string().contains("S3CRET"));
+        assert!(!dir.path().join("wifi-wlan0.nmconnection").exists());
     }
 
     #[test]
@@ -459,7 +902,7 @@ mod tests {
         }))
         .unwrap();
 
-        let response = configure(&payload, dir.path(), &SAFE_APPLY).unwrap();
+        let response = configure(&payload, dir.path(), &dir.path().join("certs"), &SAFE_APPLY).unwrap();
 
         assert_eq!(response["uuid"], "0b0c3a52-4f43-4b6b-9a54-2d1b0f5e8c11");
     }
@@ -474,7 +917,7 @@ mod tests {
         }))
         .unwrap();
 
-        configure(&payload, dir.path(), &SAFE_APPLY).unwrap_err();
+        configure(&payload, dir.path(), &dir.path().join("certs"), &SAFE_APPLY).unwrap_err();
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 

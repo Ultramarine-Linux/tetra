@@ -6,6 +6,11 @@
 //! gateway, and DNS server, and that the result still leaves the host with at
 //! least one routable address. Rendering is a pure function of the validated
 //! request, so it is unit tested without touching the host.
+//!
+//! An optional `wired_8021x` section becomes the keyfile's `[802-1x]`
+//! section. Its passwords are stored in the keyfile (which is `0600`, like
+//! NetworkManager's own), and [`render_redacted`] gives the copy that is
+//! returned to callers.
 
 use std::{
     collections::HashSet,
@@ -18,7 +23,10 @@ use rand::RngExt as _;
 
 use super::addresses::AddressScope;
 use crate::prelude::*;
-use crate::types::{IpAddressConfig, IpConfig, Ipv4Method, Ipv6Method, NetworkConfigureRequest};
+use crate::types::{
+    EapMethod, IpAddressConfig, IpConfig, Ipv4Method, Ipv6Method, NetworkConfigureRequest,
+    Phase2Method, Wired8021x, is_pem,
+};
 
 /// Upper bound on addresses per family, to keep payloads reasonable.
 const MAX_ADDRESSES: usize = 32;
@@ -27,6 +35,11 @@ const MAX_DNS_SERVERS: usize = 8;
 /// Linux `IFNAMSIZ` minus the trailing NUL.
 const MAX_INTERFACE_LEN: usize = 15;
 const MAX_NAME_LEN: usize = 64;
+/// Upper bound on 802.1X identities and passwords.
+const MAX_8021X_VALUE_LEN: usize = 256;
+/// Upper bound on one PEM certificate (chain) or key.
+const MAX_PEM_BYTES: usize = 64 * 1024;
+pub(super) const REDACTED: &str = "<redacted>";
 
 /// An address family as it appears in a `network.configure` payload.
 trait Family: Copy + Display + Eq + Hash {
@@ -148,6 +161,9 @@ pub fn validate(request: &NetworkConfigureRequest) -> Result<()> {
     }
     let ipv4_routable = validate_family(&request.ipv4)?;
     let ipv6_routable = validate_family(&request.ipv6)?;
+    if let Some(wired) = &request.wired_8021x {
+        validate_8021x("wired_8021x", wired)?;
+    }
     ensure!(
         ipv4_routable || ipv6_routable,
         "at least one of ipv4 or ipv6 must give the host a routable address \
@@ -158,7 +174,7 @@ pub fn validate(request: &NetworkConfigureRequest) -> Result<()> {
     Ok(())
 }
 
-fn validate_interface(interface: &str) -> Result<()> {
+pub(super) fn validate_interface(interface: &str) -> Result<()> {
     ensure!(
         (1..=MAX_INTERFACE_LEN).contains(&interface.len())
             && interface
@@ -180,6 +196,113 @@ fn validate_name(name: &str) -> Result<()> {
             && !name.contains(".."),
         "name `{name}` must be 1-{MAX_NAME_LEN} letters, digits, `-`, `_` or `.`"
     );
+    Ok(())
+}
+
+/// A string value written to the keyfile: one line, no control characters.
+/// Errors name the field, never the value (it may be a password).
+fn validate_8021x_value(section: &str, field: &str, value: &str) -> Result<()> {
+    ensure!(
+        (1..=MAX_8021X_VALUE_LEN).contains(&value.len()) && !value.chars().any(char::is_control),
+        "{section}.{field} must be 1 to {MAX_8021X_VALUE_LEN} characters on one line"
+    );
+    Ok(())
+}
+
+/// A certificate or key: PEM contents, or an absolute path. Errors never
+/// show the value (it may be a private key).
+fn validate_8021x_file(section: &str, field: &str, value: &str) -> Result<()> {
+    if is_pem(value) {
+        ensure!(
+            value.len() <= MAX_PEM_BYTES
+                && value.contains("-----END ")
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_graphic() || matches!(c, ' ' | '\n' | '\r' | '\t')),
+            "{section}.{field} must be PEM text of at most {MAX_PEM_BYTES} bytes"
+        );
+        return Ok(());
+    }
+    let path = Path::new(value);
+    ensure!(
+        path.is_absolute()
+            && !value.chars().any(char::is_control)
+            && !path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir)),
+        "{section}.{field} must be an absolute path or PEM contents"
+    );
+    Ok(())
+}
+
+/// `domain_suffix_match`: a DNS name, matched case-insensitively.
+fn validate_domain(section: &str, domain: &str) -> Result<()> {
+    let valid = (1..=253).contains(&domain.len())
+        && domain.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+    ensure!(valid, "{section}.domain_suffix_match `{domain}` is not a domain name");
+    Ok(())
+}
+
+/// Validate 802.1X settings; `section` names them in errors.
+pub(super) fn validate_8021x(section: &str, wired: &Wired8021x) -> Result<()> {
+    validate_8021x_value(section, "identity", &wired.identity)?;
+    if let Some(anonymous) = &wired.anonymous_identity {
+        validate_8021x_value(section, "anonymous_identity", anonymous)?;
+    }
+    if let Some(password) = &wired.password {
+        validate_8021x_value(section, "password", password)?;
+    }
+    if let Some(password) = &wired.private_key_password {
+        validate_8021x_value(section, "private_key_password", password)?;
+    }
+    for (field, value) in [
+        ("ca_cert", &wired.ca_cert),
+        ("client_cert", &wired.client_cert),
+        ("private_key", &wired.private_key),
+    ] {
+        if let Some(value) = value {
+            validate_8021x_file(section, field, value)?;
+        }
+    }
+    if let Some(domain) = &wired.domain_suffix_match {
+        validate_domain(section, domain)?;
+        // Only these methods check the server's certificate.
+        ensure!(
+            matches!(wired.eap, EapMethod::Tls | EapMethod::Peap | EapMethod::Ttls),
+            "{section}.domain_suffix_match is only used with tls, peap and ttls"
+        );
+    }
+    let tunneled = matches!(wired.eap, EapMethod::Peap | EapMethod::Ttls);
+    ensure!(
+        tunneled || (wired.phase2.is_none() && wired.anonymous_identity.is_none()),
+        "{section}.phase2 and anonymous_identity are only used with peap and ttls"
+    );
+    if wired.eap == EapMethod::Tls {
+        ensure!(
+            wired.client_cert.is_some() && wired.private_key.is_some(),
+            "{section}.client_cert and private_key are required for tls"
+        );
+        ensure!(
+            wired.password.is_none(),
+            "{section}.password is not used with tls; use private_key_password"
+        );
+    } else {
+        ensure!(
+            wired.password.is_some(),
+            "{section}.password is required unless eap is tls"
+        );
+        ensure!(
+            wired.client_cert.is_none()
+                && wired.private_key.is_none()
+                && wired.private_key_password.is_none(),
+            "{section}.client_cert and private_key are only used with tls"
+        );
+    }
     Ok(())
 }
 
@@ -276,6 +399,16 @@ fn ensure_unique<A: Family>(values: impl Iterator<Item = A>, label: &str, what: 
 /// Render a validated request into keyfile contents.
 #[must_use]
 pub fn render(request: &NetworkConfigureRequest, uuid: &str) -> String {
+    render_keyfile(request, uuid, false)
+}
+
+/// [`render`] with 802.1X passwords replaced, for responses.
+#[must_use]
+pub fn render_redacted(request: &NetworkConfigureRequest, uuid: &str) -> String {
+    render_keyfile(request, uuid, true)
+}
+
+fn render_keyfile(request: &NetworkConfigureRequest, uuid: &str, redact: bool) -> String {
     let mut out = String::new();
     // Writing to a `String` cannot fail.
     let _ok: std::fmt::Result = (|| {
@@ -289,11 +422,94 @@ pub fn render(request: &NetworkConfigureRequest, uuid: &str) -> String {
         writeln!(out)?;
         writeln!(out, "[ethernet]")?;
         writeln!(out)?;
+        if let Some(wired) = &request.wired_8021x {
+            render_8021x(&mut out, wired, redact)?;
+            writeln!(out)?;
+        }
         render_family(&mut out, &request.ipv4)?;
         writeln!(out)?;
         render_family(&mut out, &request.ipv6)
     })();
     out
+}
+
+const fn eap_keyword(method: EapMethod) -> &'static str {
+    match method {
+        EapMethod::Tls => "tls",
+        EapMethod::Peap => "peap",
+        EapMethod::Ttls => "ttls",
+        EapMethod::Pwd => "pwd",
+        EapMethod::Md5 => "md5",
+    }
+}
+
+const fn phase2_keyword(method: Phase2Method) -> &'static str {
+    match method {
+        Phase2Method::Mschapv2 => "mschapv2",
+        Phase2Method::Mschap => "mschap",
+        Phase2Method::Pap => "pap",
+        Phase2Method::Chap => "chap",
+        Phase2Method::Gtc => "gtc",
+        Phase2Method::Md5 => "md5",
+    }
+}
+
+/// Escape a string for a keyfile (`GKeyFile`) value: backslashes, and
+/// leading whitespace, which `GKeyFile` would otherwise strip. Control
+/// characters were rejected by validation.
+pub(super) fn keyfile_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut leading = true;
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            ' ' if leading => out.push_str("\\s"),
+            c => out.push(c),
+        }
+        leading = leading && c == ' ';
+    }
+    out
+}
+
+pub(super) fn render_8021x(out: &mut String, wired: &Wired8021x, redact: bool) -> std::fmt::Result {
+    let secret = |value: &str| {
+        if redact {
+            REDACTED.to_owned()
+        } else {
+            keyfile_value(value)
+        }
+    };
+    writeln!(out, "[802-1x]")?;
+    writeln!(out, "eap={};", eap_keyword(wired.eap))?;
+    writeln!(out, "identity={}", keyfile_value(&wired.identity))?;
+    if let Some(anonymous) = &wired.anonymous_identity {
+        writeln!(out, "anonymous-identity={}", keyfile_value(anonymous))?;
+    }
+    // PEM contents have been stored as files by now (see `certs`); only
+    // paths are written.
+    for (key, value) in [
+        ("ca-cert", &wired.ca_cert),
+        ("client-cert", &wired.client_cert),
+        ("private-key", &wired.private_key),
+    ] {
+        if let Some(path) = value.as_deref().filter(|value| !is_pem(value)) {
+            writeln!(out, "{key}={}", keyfile_value(path))?;
+        }
+    }
+    if let Some(domain) = &wired.domain_suffix_match {
+        writeln!(out, "domain-suffix-match={}", domain.to_ascii_lowercase())?;
+    }
+    if let Some(password) = &wired.private_key_password {
+        writeln!(out, "private-key-password={}", secret(password))?;
+    }
+    if let Some(password) = &wired.password {
+        writeln!(out, "password={}", secret(password))?;
+    }
+    if matches!(wired.eap, EapMethod::Peap | EapMethod::Ttls) {
+        let phase2 = wired.phase2.unwrap_or(Phase2Method::Mschapv2);
+        writeln!(out, "phase2-auth={}", phase2_keyword(phase2))?;
+    }
+    Ok(())
 }
 
 fn render_family<M: Method, A: Family>(
@@ -717,6 +933,100 @@ mod tests {
         }
         for name in ["", "..", ".hidden", "a/b", "a..b", "with space", "x\ny"] {
             rejection(json!({ "interface": "eth0", "name": name }));
+        }
+    }
+
+    // Wired 802.1X.
+
+    #[test]
+    fn wired_8021x_peap_renders_an_8021x_section() {
+        let request = request(json!({
+            "interface": "eth0",
+            "wired_8021x": {
+                "eap": "peap",
+                "identity": "alice@example.com",
+                "anonymous_identity": "anonymous@example.com",
+                "password": " pa\\ss word",
+                "ca_cert": "/etc/pki/tls/certs/radius-ca.pem"
+            }
+        }));
+        validate(&request).unwrap();
+        assert!(!format!("{request:?}").contains("pa\\ss"));
+        let keyfile = render(&request, UUID);
+        assert_eq!(
+            keyfile,
+            header("eth0")
+                + "[802-1x]\neap=peap;\nidentity=alice@example.com\n\
+                   anonymous-identity=anonymous@example.com\n\
+                   ca-cert=/etc/pki/tls/certs/radius-ca.pem\n\
+                   password=\\spa\\\\ss word\nphase2-auth=mschapv2\n\n\
+                   [ipv4]\nmethod=auto\n\n[ipv6]\nmethod=auto\n"
+        );
+        let redacted = render_redacted(&request, UUID);
+        assert!(redacted.contains("password=<redacted>\n"));
+        assert!(!redacted.contains("ss word"));
+    }
+
+    #[test]
+    fn wired_8021x_tls_uses_certificates() {
+        let keyfile = rendered(json!({
+            "interface": "eth0",
+            "wired_8021x": {
+                "eap": "tls",
+                "identity": "host.example.com",
+                "ca_cert": "/etc/pki/8021x/ca.pem",
+                "client_cert": "/etc/pki/8021x/client.pem",
+                "private_key": "/etc/pki/8021x/client.key",
+                "private_key_password": "keypass"
+            }
+        }));
+        assert!(keyfile.contains(
+            "[802-1x]\neap=tls;\nidentity=host.example.com\nca-cert=/etc/pki/8021x/ca.pem\n\
+             client-cert=/etc/pki/8021x/client.pem\nprivate-key=/etc/pki/8021x/client.key\n\
+             private-key-password=keypass\n\n[ipv4]"
+        ));
+        assert!(!keyfile.contains("phase2"));
+    }
+
+    #[test]
+    fn wired_8021x_ttls_takes_a_phase2_method() {
+        let keyfile = rendered(json!({
+            "interface": "eth0",
+            "wired_8021x": { "eap": "ttls", "identity": "bob", "password": "x", "phase2": "pap" }
+        }));
+        assert!(keyfile.contains("phase2-auth=pap\n"));
+    }
+
+    #[test]
+    fn wired_8021x_rejects_incomplete_or_unsafe_settings() {
+        for wired in [
+            // Password methods need a password.
+            json!({ "eap": "peap", "identity": "bob" }),
+            // TLS needs a certificate and key.
+            json!({ "eap": "tls", "identity": "bob", "client_cert": "/c.pem" }),
+            json!({ "eap": "tls", "identity": "bob", "client_cert": "/c.pem", "private_key": "/k", "password": "x" }),
+            // Inner methods only for tunneled EAP.
+            json!({ "eap": "md5", "identity": "bob", "password": "x", "phase2": "pap" }),
+            // Certificates only for TLS.
+            json!({ "eap": "pwd", "identity": "bob", "password": "x", "client_cert": "/c.pem" }),
+            // Keyfile injection.
+            json!({ "eap": "peap", "identity": "bob\n[connection]\nautoconnect=false", "password": "x" }),
+            json!({ "eap": "peap", "identity": "bob", "password": "x\ny=z" }),
+            json!({ "eap": "peap", "identity": "bob", "password": "x", "ca_cert": "relative.pem" }),
+            json!({ "eap": "peap", "identity": "bob", "password": "x", "ca_cert": "-----BEGIN CERTIFICATE-----\nno end" }),
+            json!({ "eap": "peap", "identity": "bob", "password": "x", "ca_cert": format!("-----BEGIN X-----\n{}\n-----END X-----", "A".repeat(70_000)) }),
+            json!({ "eap": "peap", "identity": "bob", "password": "x", "domain_suffix_match": "not a domain" }),
+            json!({ "eap": "peap", "identity": "bob", "password": "x", "domain_suffix_match": "-bad.example" }),
+            json!({ "eap": "md5", "identity": "bob", "password": "x", "domain_suffix_match": "example.com" }),
+            json!({ "eap": "peap", "identity": "bob", "password": "x", "ca_cert": "/etc/../shadow" }),
+            json!({ "eap": "peap", "identity": "", "password": "x" }),
+            json!({ "eap": "leap", "identity": "bob", "password": "x" }),
+            json!({ "eap": "peap", "identity": "bob", "password": "x", "domain": "y" }),
+        ] {
+            let error = rejection(json!({ "interface": "eth0", "wired_8021x": wired }));
+            assert!(!error.contains("y=z"), "{error}");
+            // Nor any certificate or key contents.
+            assert!(!error.contains("no end") && !error.contains("AAAA"), "{error}");
         }
     }
 

@@ -19,7 +19,10 @@
 //! - Actions missing from the table are admin-only, so a new action is never
 //!   accidentally open. A test checks that every action of every compiled
 //!   module is listed.
-//! - The setup session may only run the actions in [`SETUP_ALLOWED`].
+//! - The setup session may only use the operations in [`SETUP_OPERATIONS`]
+//!   and run the module actions in [`SETUP_ALLOWED`], each named
+//!   individually; actions in [`SETUP_ONLY_WITHOUT_ADMIN`] only while no
+//!   eligible administrator exists.
 //! - Remote controllers (the outbound mTLS control plane) may run everything;
 //!   their actions are recorded in the audit log.
 
@@ -113,6 +116,13 @@ const fn page(page: Page, level: Level) -> Requirement {
 const TABLE: &[(&str, &str, Requirement)] = &[
     ("settings", "get_system", Authenticated),
     ("settings", "set_hostname", AdminOnly),
+    ("settings", "set_keymap", AdminOnly),
+    ("settings", "set_locale", AdminOnly),
+    ("settings", "set_timezone", AdminOnly),
+    ("power", "reboot", AdminOnly),
+    ("power", "poweroff", AdminOnly),
+    ("updates", "get_policy", page(Settings, View)),
+    ("updates", "set_policy", AdminOnly),
     // The launcher is a session operation (`launcher.*`), not a module, but
     // it is authorized through this table too. Which entries a user sees is
     // decided per entry (`src/auth/launcher.rs`).
@@ -193,11 +203,20 @@ const TABLE: &[(&str, &str, Requirement)] = &[
     ("network", "reload", AdminOnly),
     ("network", "configure", AdminOnly),
     ("network", "confirm", AdminOnly),
+    ("network", "scan_wifi", AdminOnly),
+    ("network", "connect_wifi", AdminOnly),
     ("reverse_proxy", "list", page(Network, View)),
     ("reverse_proxy", "render", page(Network, View)),
     ("reverse_proxy", "write", page(Network, Manage)),
     ("reverse_proxy", "delete", page(Network, Manage)),
     ("reverse_proxy", "reload", page(Network, Manage)),
+    // Remote access exposes the dashboard beyond the local network and
+    // handles credentials; even its status comes from root-only tools.
+    ("remote_access", "status", AdminOnly),
+    ("remote_access", "tailscale_up", AdminOnly),
+    ("remote_access", "tailscale_disable", AdminOnly),
+    ("remote_access", "cloudflared_set_token", AdminOnly),
+    ("remote_access", "cloudflared_disable", AdminOnly),
     ("selinux", "status", page(Settings, View)),
     ("selinux", "booleans", page(Settings, View)),
     ("selinux", "file_contexts", page(Settings, View)),
@@ -213,6 +232,8 @@ const TABLE: &[(&str, &str, Requirement)] = &[
     ("users", "update", AdminOnly),
     ("users", "delete", AdminOnly),
     ("users", "set_password", AdminOnly),
+    ("users", "set_authorized_keys", AdminOnly),
+    ("users", "add_admin", AdminOnly),
     // Reads any path as root (`/etc/shadow`, the store key): root-equivalent.
     ("files", "read", AdminOnly),
     ("files", "write", AdminOnly),
@@ -226,22 +247,58 @@ const TABLE: &[(&str, &str, Requirement)] = &[
     ("virtual_machines", "delete", AdminOnly),
 ];
 
-/// What the setup session may run: OOBE operations only. `*` matches every
-/// action of a module. Extend this list as the OOBE grows (an updates module
-/// will need an entry).
+/// The module actions the setup session may run: what the OOBE needs, each
+/// named individually (never a whole module).
+///
+/// No `services.*`, no raw network
+/// configuration (`network.get_config`/`set_config`), no user deletion and no
+/// `users.update` (which can change group memberships, and with them who is
+/// an administrator). Extend this list deliberately as the OOBE grows.
 pub const SETUP_ALLOWED: &[(&str, &str)] = &[
     ("agent", "capabilities"),
-    ("settings", "get_system"),
     ("settings", "set_hostname"),
+    ("settings", "set_keymap"),
+    ("settings", "set_locale"),
+    ("settings", "set_timezone"),
+    ("users", "create"),
+    ("users", "set_password"),
+    ("users", "set_authorized_keys"),
+    ("users", "add_admin"),
+    ("power", "reboot"),
+    ("power", "poweroff"),
+    ("network", "interfaces"),
+    ("network", "status"),
+    ("network", "scan_wifi"),
+    ("network", "connect_wifi"),
     ("network", "configure"),
     ("network", "confirm"),
-    ("reverse_proxy", "*"),
-    ("users", "list"),
-    ("users", "status"),
-    ("users", "groups"),
-    ("users", "create"),
-    ("users", "update"),
-    ("users", "set_password"),
+    ("updates", "set_policy"),
+    ("remote_access", "status"),
+    ("remote_access", "tailscale_up"),
+    ("remote_access", "tailscale_disable"),
+    ("remote_access", "cloudflared_set_token"),
+    ("remote_access", "cloudflared_disable"),
+];
+
+/// Setup actions that are refused once an eligible administrator exists, so
+/// the setup code cannot be used to make more administrators (for example on
+/// a host installed with one by Readymade).
+pub const SETUP_ONLY_WITHOUT_ADMIN: &[(&str, &str)] = &[("users", "add_admin")];
+
+/// The socket operations (other than login and `setup.redeem`) the setup
+/// session may use.
+///
+/// `access.set` and `setup.complete` are operations rather
+/// than module actions because Tetra itself owns the dashboard's Caddy site,
+/// its credentials and the handoff to the dashboard.
+pub const SETUP_OPERATIONS: &[&str] = &[
+    "session.info",
+    "session.logout",
+    "setup.status",
+    "setup.complete",
+    "access.get",
+    "access.set",
+    "module.dispatch",
 ];
 
 /// Payload fields that only administrators (and remote controllers) may set,
@@ -281,7 +338,22 @@ pub fn requirement(module: &str, action: &str) -> Requirement {
 pub fn setup_allows(module: &str, action: &str) -> bool {
     SETUP_ALLOWED
         .iter()
-        .any(|(m, a)| *m == module && (*a == "*" || *a == action))
+        .any(|(m, a)| *m == module && *a == action)
+}
+
+/// Whether the setup session may only run `module.action` while no eligible
+/// administrator exists.
+#[must_use]
+pub fn setup_needs_no_admin(module: &str, action: &str) -> bool {
+    SETUP_ONLY_WITHOUT_ADMIN
+        .iter()
+        .any(|(m, a)| *m == module && *a == action)
+}
+
+/// Whether the setup session may use the socket operation `op`.
+#[must_use]
+pub fn setup_allows_operation(op: &str) -> bool {
+    SETUP_OPERATIONS.contains(&op)
 }
 
 /// Whether `level` on `page` can be granted: some action needs exactly it.
@@ -612,12 +684,117 @@ mod tests {
         assert!(setup.allows("network", "configure"));
         assert!(setup.allows("network", "confirm"));
         assert!(!setup.allows("network", "get_config"));
+        assert!(!setup.allows("network", "set_config"));
         assert!(!setup.allows("network", "reload"));
     }
 
     #[test]
+    fn setup_allowlist_names_individual_actions() {
+        for (module, action) in SETUP_ALLOWED {
+            assert_ne!(*action, "*", "{module}.* must not be allowed as a whole");
+        }
+        let setup = Principal::Setup;
+        for (module, action) in [
+            ("settings", "set_keymap"),
+            ("settings", "set_locale"),
+            ("settings", "set_timezone"),
+            ("users", "set_authorized_keys"),
+            ("users", "add_admin"),
+            ("power", "reboot"),
+            ("power", "poweroff"),
+            ("network", "interfaces"),
+            ("network", "status"),
+            ("network", "scan_wifi"),
+            ("network", "connect_wifi"),
+            ("updates", "set_policy"),
+            ("remote_access", "tailscale_up"),
+            ("remote_access", "cloudflared_set_token"),
+            ("remote_access", "status"),
+        ] {
+            assert!(setup.allows(module, action), "{module}.{action}");
+        }
+        for (module, action) in [
+            ("services", "start"),
+            ("services", "list"),
+            ("reverse_proxy", "write"),
+            ("reverse_proxy", "list"),
+            ("users", "update"),
+            ("users", "delete"),
+            ("updates", "get_policy"),
+            ("files", "read"),
+            ("settings", "get_system"),
+        ] {
+            assert!(!setup.allows(module, action), "{module}.{action}");
+        }
+        assert!(setup_needs_no_admin("users", "add_admin"));
+        assert!(!setup_needs_no_admin("users", "create"));
+    }
+
+    #[test]
+    fn setup_allowlist_names_real_actions() {
+        let modules = Dispatcher::full().capabilities();
+        for (module, action) in SETUP_ALLOWED {
+            if *module == "agent" {
+                continue;
+            }
+            // Modules compiled out by features cannot be checked.
+            if let Some(info) = modules.iter().find(|info| info.name == *module) {
+                assert!(
+                    info.actions.contains(action),
+                    "{module}.{action} is allowed for setup but does not exist"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn setup_operations_are_listed() {
+        for op in [
+            "access.set",
+            "setup.complete",
+            "module.dispatch",
+            "session.info",
+        ] {
+            assert!(setup_allows_operation(op), "{op}");
+        }
+        for op in [
+            "admin.grants_set",
+            "admin.actions",
+            "account.totp_begin",
+            "session.list",
+            "authz.catalog",
+        ] {
+            assert!(!setup_allows_operation(op), "{op}");
+        }
+    }
+
+    #[test]
+    fn new_host_actions_are_admin_only() {
+        for (module, action) in [
+            ("settings", "set_keymap"),
+            ("users", "add_admin"),
+            ("users", "set_authorized_keys"),
+            ("power", "reboot"),
+            ("updates", "set_policy"),
+            ("remote_access", "tailscale_up"),
+            ("remote_access", "status"),
+        ] {
+            assert_eq!(requirement(module, action), AdminOnly, "{module}.{action}");
+        }
+        assert_eq!(requirement("updates", "get_policy"), page(Settings, View));
+    }
+
+    #[test]
     fn network_configuration_is_admin_only() {
-        for action in ["get_config", "set_config", "reload", "configure", "confirm"] {
+        for action in [
+            "get_config",
+            "set_config",
+            "reload",
+            "configure",
+            "confirm",
+            "scan_wifi",
+            "connect_wifi",
+        ] {
             assert_eq!(
                 requirement("network", action),
                 AdminOnly,

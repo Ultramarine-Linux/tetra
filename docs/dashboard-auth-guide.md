@@ -251,23 +251,68 @@ separately.
 
 ## 10. OOBE flow
 
+The OOBE runs unprivileged as `ultramarine-oobe` on `127.0.0.1:6624`. Tetra
+puts it behind Caddy on port 6623 of every address (IPv4 and IPv6) with a
+certificate from Caddy's internal CA, so browsers show a certificate warning;
+the console shows the CA's SHA-256 fingerprint (`tetra setup code`) next to
+the setup code so people can compare it. Every host change goes through Tetra
+with the setup session.
+
 1. Connect as `ultramarine-oobe`. `hello.setup_required` tells you whether
    setup is still open.
 2. Ask the user for the setup code shown on the server's console and call
-   `setup.redeem {code}`. Handle `rate_limited` by showing `retry_after`.
-3. With the setup token:
-   - if `admin_exists` is `false`, create the first administrator. Call
-     `users.create`, then `users.set_password` with a hashed password, then
-     `users.update {groups: ["ultramarine-admin"]}`, all through
-     `module.dispatch`;
-   - set the hostname (`settings.set_hostname`) and network
-     (`network.configure`, then `network.confirm` once the new settings work);
-   - set the access mode with `access.set {mode, hostname}`. Tetra writes the
-     dashboard's Caddy site and reloads Caddy.
-4. Call `setup.complete`. This fails with `setup_incomplete` until an eligible
-   administrator exists. Afterwards the setup code no longer works, setup
-   sessions end, and the console stops showing the code.
+   `setup.redeem {code, remote_addr}`, with the browser's address as Caddy
+   reported it (the last `X-Forwarded-For` entry). Handle `rate_limited` by
+   showing `retry_after`: one address is slowed down after 3 wrong codes, and
+   all addresses after 3 wrong codes in total.
+3. With the setup token, through `module.dispatch`:
+   - keyboard, language and time zone: `settings.set_keymap {layout, variant?}`,
+     `settings.set_locale {locale}`, `settings.set_timezone {timezone}`;
+   - if `admin_exists` is `false`, create the first administrator:
+     `users.create {name}`, `users.set_password {name, password_hash}`, then
+     `users.add_admin {name}` (adds `ultramarine-admin`; refused once an
+     administrator exists). Optionally `users.set_authorized_keys {name, keys}`
+     to install SSH keys;
+   - hostname (`settings.set_hostname`) and network: `network.interfaces` and
+     `network.status` to show the current state; for Wi-Fi,
+     `network.scan_wifi {interface}` and `network.connect_wifi {interface,
+     ssid, security: {type: "open" | "wpa-personal" | "wpa-enterprise", ...}}`
+     (it fails, leaving the old network in place, if the network does not come
+     up); for Ethernet, `network.configure`
+     (optionally with `wired_8021x: {eap, identity, password?, ca_cert?,
+     client_cert?, private_key?, private_key_password?, domain_suffix_match?,
+     phase2?}`, certificates and keys as PEM contents or paths; Wi-Fi
+     Enterprise takes the same fields) and
+     `network.confirm` once the new settings work. The `keyfile` in the
+     response has 802.1X passwords redacted;
+   - updates: `updates.set_policy {policy: "automatic" | "notify"}`. Tetra
+     knows whether the host is bootc or package-based and picks the timer;
+   - remote access, if wanted: `remote_access.tailscale_up {auth_key, serve,
+     funnel}` (serve defaults to `true`, funnel to `false`; it returns the
+     node's `*.ts.net` `hostname`, which goes to `access.set` so the dashboard
+     works over the tailnet) and
+     `remote_access.cloudflared_set_token {token}`. Tetra keeps the
+     credentials; drop them from the OOBE's memory and state once sent.
+     `remote_access.status` shows what is on;
+   - `power.reboot` and `power.poweroff` answer first and act 3 seconds later.
+4. Set the access mode with `access.set {mode, hostname, port?}`; in domain
+   mode add `challenge: "http-01"`, or `challenge: "dns-01"` with
+   `dns_provider` and `dns_credentials` (keys as in the caddy-dns module's
+   config, listed in [auth-protocol.md](auth-protocol.md#access-and-setup-completion)).
+   Tetra writes the dashboard's Caddy site, hands DNS credentials to Caddy
+   without writing them into any Caddyfile, writes the dashboard's `ORIGIN`
+   and returns `dashboard_url`.
+5. Call `setup.complete`. This fails with `setup_incomplete` until an eligible
+   administrator exists. On success the setup code no longer works, setup
+   sessions end, the console stops showing the code, and Tetra starts the
+   dashboard. The result is `{complete, dashboard_url, handoff_in_seconds,
+   handoff}`: show a final screen pointing at `dashboard_url`, because Tetra
+   stops and disables the OOBE (and removes its Caddy site) after
+   `handoff_in_seconds`.
 
-The setup session is limited to these operations; anything else returns
-`forbidden`. To support another OOBE step (an updates module, for example),
-add its actions to `SETUP_ALLOWED` in `src/auth/authz.rs`.
+The setup session is limited to these actions and to the operations
+`session.info`, `session.logout`, `setup.status`, `setup.complete`,
+`access.get`, `access.set` and `module.dispatch`; anything else returns
+`forbidden`, including `services.*`, `network.set_config` and `users.update`.
+To support another OOBE step, add its actions one by one to `SETUP_ALLOWED` in
+`src/auth/authz.rs`.
