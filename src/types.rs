@@ -54,18 +54,16 @@ impl NetworkInterfaceRequest {
     }
 }
 
+/// Payload for `network.get_config`. The path must name a `.nmconnection`
+/// file directly inside `/etc/NetworkManager/system-connections/`.
 #[derive(Debug, Deserialize)]
 pub struct NetworkConfigRequest {
     pub path: PathBuf,
 }
 
-impl NetworkConfigRequest {
-    pub fn read(&self) -> Result<String> {
-        fs::read_to_string(&self.path)
-            .with_context(|| format!("failed to read `{}`", self.path.display()))
-    }
-}
-
+/// Payload for `network.set_config`. The path is restricted like
+/// [`NetworkConfigRequest`]; the file is always written `0600` and relabeled
+/// with its default SELinux context.
 #[derive(Debug, Deserialize)]
 pub struct NetworkWriteConfigRequest {
     pub path: PathBuf,
@@ -76,14 +74,101 @@ pub struct NetworkWriteConfigRequest {
     pub selinux: Option<SelinuxOptions>,
 }
 
-impl NetworkWriteConfigRequest {
-    pub fn write(&self) -> Result<()> {
-        if !self.dry_run {
-            fs::write(&self.path, &self.contents)
-                .with_context(|| format!("failed to write `{}`", self.path.display()))?;
+/// Payload for `network.configure`: a structured profile for one Ethernet
+/// interface that Tetra validates and renders into a NetworkManager keyfile.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkConfigureRequest {
+    /// Kernel interface name, e.g. `enp1s0`.
+    pub interface: String,
+    /// Connection profile name and keyfile stem; defaults to `interface`.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub ipv4: Ipv4Config,
+    #[serde(default)]
+    pub ipv6: Ipv6Config,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `ipv4.method` for [`NetworkConfigureRequest`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Ipv4Method {
+    /// DHCP.
+    #[default]
+    Auto,
+    Manual,
+    Disabled,
+}
+
+/// `ipv6.method` for [`NetworkConfigureRequest`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Ipv6Method {
+    /// `SLAAC`, with `DHCPv6` when router advertisements ask for it.
+    #[default]
+    Auto,
+    /// `DHCPv6` only, without `SLAAC`.
+    Dhcp,
+    Manual,
+    /// Only the link-local address; not routable.
+    LinkLocal,
+    Disabled,
+}
+
+/// One address of a manual configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IpAddressConfig<A> {
+    pub address: A,
+    pub prefix_length: u8,
+}
+
+/// One address family's section of [`NetworkConfigureRequest`].
+///
+/// Using the family's address type means a value of the wrong family (an
+/// IPv6 DNS server under `ipv4`, say) fails to deserialize.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    bound(deserialize = "M: Deserialize<'de> + Default, A: Deserialize<'de>")
+)]
+pub struct IpConfig<M, A> {
+    #[serde(default)]
+    pub method: M,
+    /// Required for, and only allowed with, `manual`.
+    #[serde(default = "Vec::new")]
+    pub addresses: Vec<IpAddressConfig<A>>,
+    /// Only allowed with `manual`.
+    #[serde(default = "Option::default")]
+    pub gateway: Option<A>,
+    /// Static DNS servers; not allowed when the family is disabled or
+    /// link-local.
+    #[serde(default = "Vec::new")]
+    pub dns: Vec<A>,
+}
+
+impl<M: Default, A> Default for IpConfig<M, A> {
+    fn default() -> Self {
+        Self {
+            method: M::default(),
+            addresses: Vec::new(),
+            gateway: None,
+            dns: Vec::new(),
         }
-        Ok(())
     }
+}
+
+pub type Ipv4Config = IpConfig<Ipv4Method, std::net::Ipv4Addr>;
+pub type Ipv6Config = IpConfig<Ipv6Method, std::net::Ipv6Addr>;
+
+/// Payload for `network.confirm`: keeps a change made by `network.configure`
+/// that would otherwise be rolled back.
+#[derive(Debug, Deserialize)]
+pub struct NetworkConfirmRequest {
+    pub token: String,
 }
 
 #[derive(Debug, Deserialize)]

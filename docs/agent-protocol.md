@@ -404,7 +404,9 @@ Actions that support this shared object include:
 - `storage.configure`
 - `samba.set_config`
 - `nfs.set_config`
-- `network.set_config`
+
+`network.set_config` always relabels the keyfile with its default context and
+rejects `path`, `path_pattern` and `context_type`.
 
 SELinux operation responses are returned as a `selinux` array of command result
 objects.
@@ -1232,12 +1234,31 @@ Actions:
 - `status`
 - `dns`
 - `routes`
-- `get_config`
-- `set_config`
-- `reload`
+- `configure` (privileged)
+- `confirm` (privileged)
+- `get_config` (privileged)
+- `set_config` (privileged)
+- `reload` (privileged)
 
 `interfaces` returns interface names, MAC addresses, and operstate from
-`/sys/class/net`.
+`/sys/class/net`, plus each interface's IPv4 and IPv6 `addresses`:
+
+```json
+{
+  "name": "eth0",
+  "operstate": "up",
+  "mac": "52:54:00:12:34:56",
+  "addresses": [
+    { "interface": "eth0", "family": "ipv6", "address": "2001:db8::2", "prefix_length": 64, "scope": "global" },
+    { "interface": "eth0", "family": "ipv6", "address": "fe80::5054:ff:fe12:3456", "prefix_length": 64, "scope": "link-local" }
+  ]
+}
+```
+
+`scope` is derived from the address prefix, not the kernel's scope field:
+`global`, `private` (RFC 1918 and RFC 6598 IPv4), `ula` (`fc00::/7`),
+`link-local`, `loopback`, `multicast` or `unspecified`. `global`, `private`
+and `ula` count as routable.
 
 `dns` returns the current `/etc/resolv.conf` contents in `resolv_conf` (or
 `null` when unavailable). `routes` returns parsed JSON output from
@@ -1249,7 +1270,68 @@ Actions:
 { "interface": "enp1s0" }
 ```
 
-Response includes raw `ip -json addr show` output parsed into `data`.
+Response includes raw `ip -json addr show` output parsed into `data`, and the
+same classified `addresses` list as `interfaces`.
+
+`configure` writes a NetworkManager keyfile for one Ethernet interface from
+structured settings. Tetra validates the payload, writes
+`/etc/NetworkManager/system-connections/<name>.nmconnection` with mode `0600`
+and its default SELinux label, then loads and activates it.
+
+```json
+{
+  "interface": "eth0",
+  "name": "eth0",
+  "ipv4": { "method": "disabled" },
+  "ipv6": {
+    "method": "manual",
+    "addresses": [{ "address": "2001:db8:10::2", "prefix_length": 64 }],
+    "gateway": "fe80::1",
+    "dns": ["2606:4700:4700::1111"]
+  },
+  "dry_run": false
+}
+```
+
+- `name` is the profile name and keyfile stem; it defaults to `interface`.
+  Rewriting an existing profile keeps its UUID.
+- `ipv4.method`: `auto` (DHCP, the default), `manual` or `disabled`.
+- `ipv6.method`: `auto` (SLAAC, plus DHCPv6 as NetworkManager decides; the
+  default), `dhcp`, `manual`, `link-local` or `disabled`.
+- `addresses` (required with `manual`, rejected otherwise) take a
+  `prefix_length` of 1–32 for IPv4 and 1–128 for IPv6. `gateway` is optional
+  and only allowed with `manual`; an IPv6 gateway may be link-local. `dns` is
+  allowed unless the family is `disabled` or `link-local`. Every address must
+  match its section's family.
+- At least one family must give the host a routable address, so both families
+  `disabled` (or IPv4 `disabled` with IPv6 `link-local`) is rejected.
+- Unknown fields are rejected.
+
+With `dry_run`, the response holds the `path`, `uuid` and rendered `keyfile`
+and nothing is written. Otherwise the response also reports `applied`,
+`activation_error` (or `null`), `addresses_before` and `addresses_after`.
+
+Safe apply: before activating, Tetra records the interface's routable
+addresses. If none of them is present again shortly after activation, the
+response has `"confirmation_required": true`, a `confirmation_token`, and
+`rollback_in_seconds` (60). Unless the caller sends `confirm` within that time,
+Tetra restores the previous keyfile (or deletes the new one) and reactivates
+the previously active profile. Only one change can await confirmation at a
+time. The pending rollback is held in memory, so a Tetra restart or reboot
+inside the window keeps the new configuration.
+
+`confirm` payload:
+
+```json
+{ "token": "..." }
+```
+
+`get_config` and `set_config` give raw access to keyfiles, restricted to
+regular `.nmconnection` files directly inside
+`/etc/NetworkManager/system-connections/`. Paths that are relative, contain
+`..`, point elsewhere, or name a symlink or other non-regular file are
+rejected. `set_config` replaces the file atomically with mode `0600` and
+relabels it with `restorecon`.
 
 `get_config` payload:
 
@@ -1263,10 +1345,7 @@ Response includes raw `ip -json addr show` output parsed into `data`.
 {
   "path": "/etc/NetworkManager/system-connections/example.nmconnection",
   "contents": "[connection]\nid=example\n",
-  "dry_run": true,
-  "selinux": {
-    "context_type": "NetworkManager_etc_t"
-  }
+  "dry_run": true
 }
 ```
 

@@ -63,7 +63,7 @@ tetra/
 │           ├── services.rs
 │           ├── selinux.rs
 │           ├── storage.rs
-│           ├── network.rs
+│           ├── network.rs      # network/{keyfile,paths,addresses,apply}.rs
 │           ├── samba.rs
 │           ├── nfs.rs
 │           ├── podman.rs
