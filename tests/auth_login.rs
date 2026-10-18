@@ -215,6 +215,97 @@ async fn totp_is_required_once_enrolled_and_codes_are_single_use() {
 }
 
 #[tokio::test]
+async fn expired_passwords_of_ineligible_accounts_look_wrong() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(dir.path());
+    host.accounts.add("root", 0, &[]);
+    host.passwords.set("root", "hunter2");
+    host.passwords.expire("root");
+    fails(
+        &host.service,
+        Dashboard,
+        None,
+        "auth.password",
+        json!({"username": "root", "password": "hunter2"}),
+        ErrorCode::InvalidCredentials,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wrong_second_factor_codes_are_limited_per_account_across_logins() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(dir.path());
+    let token = login(&host.service, "alice").await;
+    let (secret, recovery_codes) = enroll_totp(&host.service, &token, host.clock_now()).await;
+    host.clock.advance(30);
+
+    // Ten wrong codes over two logins are free; after that each attempt
+    // waits, even with the right code.
+    for _ in 0..2 {
+        let step = password_step(&host.service, "alice").await;
+        for _ in 0..5 {
+            fails(
+                &host.service,
+                Dashboard,
+                None,
+                "auth.second_factor",
+                json!({"pending": step["pending"], "code": "000000"}),
+                ErrorCode::InvalidCredentials,
+            )
+            .await;
+        }
+    }
+    let step = password_step(&host.service, "alice").await;
+    let code = totp::code_at(&secret, host.clock_now()).unwrap();
+    fails(
+        &host.service,
+        Dashboard,
+        None,
+        "auth.second_factor",
+        json!({"pending": step["pending"], "code": code}),
+        ErrorCode::RateLimited,
+    )
+    .await;
+    // A restart does not reset the count.
+    let restarted = host.restart().unwrap();
+    let step = password_step(&restarted, "alice").await;
+    fails(
+        &restarted,
+        Dashboard,
+        None,
+        "auth.second_factor",
+        json!({"pending": step["pending"], "code": code}),
+        ErrorCode::RateLimited,
+    )
+    .await;
+    // Recovery codes are too strong to guess, so they keep working: someone
+    // with the password cannot lock the user out.
+    let other = password_step(&restarted, "alice").await;
+    let result = ok(
+        &restarted,
+        Dashboard,
+        None,
+        "auth.second_factor",
+        json!({"pending": other["pending"], "recovery_code": recovery_codes[0]}),
+    )
+    .await;
+    assert_eq!(result["status"], "authenticated");
+    // The rate-limited attempt kept its pending login, and the right code
+    // works there now.
+    host.clock.advance(1);
+    let result = ok(
+        &restarted,
+        Dashboard,
+        None,
+        "auth.second_factor",
+        json!({"pending": step["pending"], "code": code}),
+    )
+    .await;
+    assert_eq!(result["status"], "authenticated");
+}
+
+#[tokio::test]
 async fn second_factor_attempts_are_limited_and_pending_logins_expire() {
     let dir = tempfile::tempdir().unwrap();
     let host = host(dir.path());

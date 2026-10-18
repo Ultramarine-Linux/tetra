@@ -81,9 +81,15 @@ browser ──username/password──▶ dashboard ──auth.password──▶ 
    console or over SSH.
 5. If the pending login expires (5 minutes) or the user gets the code wrong 5
    times, the answer is `invalid_credentials`. Restart at the password step.
+   After 10 wrong TOTP codes in a row for the account (across logins), Tetra
+   answers `rate_limited` with `retry_after` and keeps the pending login;
+   show the wait, let the user try again on the same form, and offer the
+   recovery-code option, which keeps working.
 
 Do not add your own rate limiting that reveals account state; `pam_faillock`
-in Tetra's PAM stack handles lockout.
+in Tetra's PAM stack handles lockout. It keeps a dashboard-only tally, so a
+lockout here does not affect console or SSH logins, and it does not block
+passkey logins. A locked-out user with a passkey can still sign in with it.
 
 ## 5. Passkeys
 
@@ -98,18 +104,50 @@ ids) are base64url strings in Tetra's JSON. Decode them before calling
 `@github/webauthn-json` or SimpleWebAuthn's browser `startRegistration` /
 `startAuthentication` does this.
 
-**Login**
+**Login with autofill (primary)**
 
-1. `auth.passkey_begin {username}` → `{ceremony, options}`. Without a
-   username you get a discoverable challenge (pass `conditional: true` for
-   autofill UI).
-2. Browser: `navigator.credentials.get(options)`.
-3. `auth.passkey_finish {ceremony, credential, remote_addr}` → the
-   `authenticated` result. A passkey alone is a full login; no TOTP prompt.
+Passkeys are registered as discoverable credentials, so the login page does
+not need a username first:
+
+1. When the login page loads, call
+   `auth.passkey_begin {conditional: true, remote_addr}` →
+   `{ceremony, options}`. Set `remote_addr` as for `auth.password`; pending
+   ceremonies are limited per address. Send only the address Caddy saw (the
+   last `X-Forwarded-For` entry Caddy appended), never a value the browser
+   can choose, or one client can spread its ceremonies over made-up
+   addresses.
+2. Browser: give the username field `autocomplete="username webauthn"` and
+   call `navigator.credentials.get(options)` (with `mediation:
+   "conditional"`, which `options` carries) without awaiting it before the
+   form is usable. The browser offers the user's passkeys in the username
+   autofill.
+3. When it resolves, `auth.passkey_finish {ceremony, credential, remote_addr}`
+   → the `authenticated` result. A passkey alone is a full login; no TOTP
+   prompt.
+4. A "Sign in with a passkey" button can do the same without
+   `conditional` (a modal browser prompt). If the user submits the password
+   form instead, abort the pending `navigator.credentials.get` call. Begin a
+   new ceremony when the old one expires (5 minutes) or is used.
+
+**Login with a username (fallback)**
+
+Some security keys cannot store discoverable credentials; they only work
+when Tetra lists them. Offer this after a username is entered, for example
+as "Use a security key":
+
+1. `auth.passkey_begin {username, remote_addr}` → `{ceremony, options}`.
+2. Browser: `navigator.credentials.get(options)` (modal, no autofill).
+3. `auth.passkey_finish` as above.
+
+For a username without passkeys Tetra returns a decoy and the browser finds
+no matching key; show the same "no passkey found" message and offer the
+password form.
 
 **Registration** (logged-in user, for example under account settings)
 
-1. `account.passkey_register_begin {name}` → `{ceremony, options}`.
+1. `account.passkey_register_begin {name}` → `{ceremony, options}`. The
+   options ask for a discoverable credential (`residentKey: "preferred"`);
+   pass them through unchanged.
 2. Browser: `navigator.credentials.create(options)`.
 3. `account.passkey_register_finish {ceremony, credential}`.
 

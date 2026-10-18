@@ -109,15 +109,24 @@ pub fn write<T: Record>(path: &Path, record: &mut T) -> Result<()> {
     write_bytes(path, &bytes, FILE_MODE)
 }
 
-/// Atomically replace `path` with `bytes`, created with `mode`.
+/// Atomically replace `path` with `bytes`, created with `mode`, in a private
+/// (`0700`) parent directory.
 ///
 /// # Errors
 /// Fails when the file cannot be written or renamed into place.
 pub fn write_bytes(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    let parent = path
-        .parent()
-        .with_context(|| format!("`{}` has no parent directory", path.display()))?;
-    private_dir(parent)?;
+    private_dir(parent_of(path)?)?;
+    replace(path, bytes, mode)
+}
+
+/// Atomically replace `path` with `bytes`, created with `mode`. The parent
+/// directory must exist; its mode is left alone, so this is for files in
+/// shared directories such as `/run/tetra`.
+///
+/// # Errors
+/// Fails when the file cannot be written or renamed into place.
+pub fn replace(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    let parent = parent_of(path)?;
     let name = path
         .file_name()
         .and_then(OsStr::to_str)
@@ -147,6 +156,11 @@ pub fn write_bytes(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         fs::remove_file(&temporary).ok();
     }
     result
+}
+
+fn parent_of(path: &Path) -> Result<&Path> {
+    path.parent()
+        .with_context(|| format!("`{}` has no parent directory", path.display()))
 }
 
 /// Remove `path`, treating a missing file as success.

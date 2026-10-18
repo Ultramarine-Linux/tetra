@@ -234,3 +234,66 @@ async fn failed_actions_report_action_failed() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn files_cannot_be_granted_and_config_dir_is_admin_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(dir.path());
+    let alice = login(&host.service, "alice").await;
+    let admin = login(&host.service, "admin").await;
+    // The files module reads any path as root.
+    fails(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "admin.grants_set",
+        json!({"uid": 1000, "grants": {"files": "view"}}),
+        ErrorCode::BadRequest,
+    )
+    .await;
+
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "admin.grants_set",
+        json!({"uid": 1000, "grants": {"network": "manage"}}),
+    )
+    .await;
+    let write = |config_dir: Option<&str>| {
+        let mut payload = json!({
+            "domain": "app.example.com",
+            "upstream": "127.0.0.1:8080",
+            "dry_run": true,
+        });
+        if let Some(config_dir) = config_dir {
+            payload["config_dir"] = json!(config_dir);
+        }
+        json!({"module": "reverse_proxy", "action": "write", "payload": payload})
+    };
+    fails(
+        &host.service,
+        Dashboard,
+        Some(&alice),
+        "module.dispatch",
+        write(Some("/etc/systemd/system")),
+        ErrorCode::Forbidden,
+    )
+    .await;
+    for token in [&alice, &admin] {
+        let config_dir = (token == &admin).then_some("/tmp/caddy");
+        let response = call(
+            &host.service,
+            Dashboard,
+            Some(token),
+            "module.dispatch",
+            write(config_dir),
+        )
+        .await;
+        assert!(
+            response
+                .error
+                .is_none_or(|error| error.code != ErrorCode::Forbidden)
+        );
+    }
+}

@@ -177,7 +177,11 @@ impl Setup {
     /// # Errors
     /// Fails when either file cannot be written.
     pub fn publish(&self, code: &str) -> Result<()> {
-        store::write_bytes(
+        // `/run/tetra` also holds the socket the OOBE connects to, so it must
+        // stay traversable: only the code file itself is private.
+        fs::create_dir_all(&self.paths.run_dir)
+            .with_context(|| format!("failed to create `{}`", self.paths.run_dir.display()))?;
+        store::replace(
             &self.paths.run_dir.join(RUN_CODE_FILE),
             format!("{code}\n").as_bytes(),
             0o600,
@@ -356,7 +360,14 @@ mod tests {
     fn publishes_to_the_console_and_unpublishes_on_completion() {
         let f = fixture();
         let code = f.setup.ensure_code(&f.key, 0).unwrap().unwrap();
+        // `/run/tetra` holds the socket too: publishing must not restrict it.
+        fs::create_dir_all(&f.paths.run_dir).unwrap();
+        fs::set_permissions(&f.paths.run_dir, fs::Permissions::from_mode(0o755)).unwrap();
         f.setup.publish(&code).unwrap();
+        assert_eq!(
+            fs::metadata(&f.paths.run_dir).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
         let banner = fs::read_to_string(f.paths.issue_dir.join(ISSUE_FILE)).unwrap();
         assert!(banner.contains(&code));
         let run = f.paths.run_dir.join(RUN_CODE_FILE);

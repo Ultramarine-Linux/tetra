@@ -45,6 +45,11 @@ use super::{
 const LOGIN_TTL: i64 = 300;
 /// Wrong second-factor codes allowed per password login.
 const SECOND_FACTOR_ATTEMPTS: u32 = 5;
+/// Consecutive wrong second-factor codes per account, across logins, before
+/// each further attempt has to wait.
+const SECOND_FACTOR_FREE_FAILURES: u32 = 10;
+/// Longest wait between second-factor attempts per account, in seconds.
+const SECOND_FACTOR_MAX_BACKOFF: i64 = 900;
 /// Seconds to confirm a TOTP enrollment.
 const ENROLLMENT_TTL: i64 = 600;
 /// Concurrent PAM transactions.
@@ -221,6 +226,11 @@ const fn client_name(client: ClientKind) -> &'static str {
     }
 }
 
+/// Owner of pending state that belongs to a user, for [`passkey::Pending`].
+fn user_owner(uid: u32) -> String {
+    format!("uid:{uid}")
+}
+
 fn totp_purpose(uid: u32) -> String {
     format!("totp-secret:{uid}")
 }
@@ -249,6 +259,8 @@ impl AuthService {
         let auth_dir = config.auth_dir();
         super::store::private_dir(&config.state_dir)?;
         super::store::private_dir(&auth_dir)?;
+        // pam_faillock records dashboard failures here (see the PAM file).
+        super::store::private_dir(&config.state_dir.join(super::pam::FAILLOCK_DIR))?;
         let now = backends.clock.now();
         let sessions =
             SessionStore::load(auth_dir.join("sessions.json"), config.session_policy, now)?;
@@ -320,7 +332,7 @@ impl AuthService {
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            if let Err(error) = self.inner.sessions.flush() {
+            if let Err(error) = self.inner.sessions.flush(self.now()) {
                 eprintln!("failed to save sessions: {error:#}");
             }
         }
@@ -331,7 +343,7 @@ impl AuthService {
     /// # Errors
     /// Fails when the session file cannot be written.
     pub fn flush_sessions(&self) -> Result<()> {
-        self.inner.sessions.flush()
+        self.inner.sessions.flush(self.now())
     }
 
     /// Run one request from `client`.
@@ -538,27 +550,29 @@ impl AuthService {
             .await
             .map_err(|error| anyhow::anyhow!(error))?
         };
-        match outcome {
-            PamOutcome::Success => {}
+        match &outcome {
             PamOutcome::Denied => {
                 eprintln!("password login failed for `{}`", p.username);
                 return Err(ApiError::invalid_credentials());
             }
-            PamOutcome::PasswordExpired => {
-                return Err(ApiError::new(
-                    ErrorCode::PasswordExpired,
-                    "the password has expired; change it on the console or over SSH",
-                ));
-            }
+            PamOutcome::PasswordExpired | PamOutcome::Success => {}
             PamOutcome::Error(error) => {
                 return Err(anyhow::anyhow!("PAM failed: {error}").into());
             }
         }
         // Eligibility is checked after PAM so that failures take the same
-        // time whether or not the account exists.
+        // time whether or not the account exists, and before reporting an
+        // expired password so that root and other accounts that may never log
+        // in do not learn that a guess was right.
         let Some(account) = self.eligible_by_name(&p.username)? else {
             return Err(ApiError::invalid_credentials());
         };
+        if outcome == PamOutcome::PasswordExpired {
+            return Err(ApiError::new(
+                ErrorCode::PasswordExpired,
+                "the password has expired; change it on the console or over SSH",
+            ));
+        }
         let enrolled = self
             .record(account.uid, &account.name)?
             .is_some_and(|record| record.totp.is_some());
@@ -571,6 +585,7 @@ impl AuthService {
             .inner
             .logins
             .insert(
+                Some(&user_owner(account.uid)),
                 PendingLogin {
                     client,
                     uid: account.uid,
@@ -591,6 +606,14 @@ impl AuthService {
     }
 
     /// Check a TOTP code or recovery code against `record`, consuming it.
+    ///
+    /// Wrong TOTP codes are counted on the record, across logins, so knowing
+    /// the password does not give unlimited guesses at the 6-digit code: after
+    /// [`SECOND_FACTOR_FREE_FAILURES`] each attempt waits twice as long as the
+    /// last, up to [`SECOND_FACTOR_MAX_BACKOFF`], and fails with
+    /// [`SecondFactorLocked`] meanwhile. Recovery codes (50 bits each) are too
+    /// strong to guess and stay usable during the wait, so someone holding
+    /// the password cannot lock the real user out of their account with it.
     fn verify_second_factor(
         &self,
         record: &mut UserRecord,
@@ -598,6 +621,39 @@ impl AuthService {
         recovery_code: Option<&str>,
     ) -> Result<Option<AuthMethod>> {
         let now = self.now();
+        if code.is_some() && now < record.second_factor_retry_at {
+            bail!(SecondFactorLocked {
+                retry_after: record.second_factor_retry_at.saturating_sub(now),
+            });
+        }
+        let method = self.check_second_factor(record, code, recovery_code, now)?;
+        if method.is_some() {
+            record.second_factor_failures = 0;
+            record.second_factor_retry_at = 0;
+        } else if code.is_some() {
+            record.second_factor_failures = record.second_factor_failures.saturating_add(1);
+            if let Some(excess) = record
+                .second_factor_failures
+                .checked_sub(SECOND_FACTOR_FREE_FAILURES)
+            {
+                let backoff = 2_i64
+                    .checked_pow(excess)
+                    .map_or(SECOND_FACTOR_MAX_BACKOFF, |wait| {
+                        wait.min(SECOND_FACTOR_MAX_BACKOFF)
+                    });
+                record.second_factor_retry_at = now.saturating_add(backoff);
+            }
+        }
+        Ok(method)
+    }
+
+    fn check_second_factor(
+        &self,
+        record: &mut UserRecord,
+        code: Option<&str>,
+        recovery_code: Option<&str>,
+        now: i64,
+    ) -> Result<Option<AuthMethod>> {
         match (code, recovery_code) {
             (Some(code), None) => {
                 let Some(totp_record) = record.totp.as_mut() else {
@@ -646,14 +702,38 @@ impl AuthService {
                 login.attempts = login.attempts.saturating_add(1);
                 if login.attempts < SECOND_FACTOR_ATTEMPTS {
                     let expires_at = login.expires_at;
-                    self.inner.logins.restore(p.pending, login, expires_at);
+                    self.inner.logins.restore(
+                        p.pending,
+                        Some(&user_owner(login.uid)),
+                        login,
+                        expires_at,
+                        now,
+                    );
                 }
                 Err(ApiError::invalid_credentials())
             }
             Err(error) if error.is::<BadSecondFactor>() => {
                 let expires_at = login.expires_at;
-                self.inner.logins.restore(p.pending, login, expires_at);
+                self.inner.logins.restore(
+                    p.pending,
+                    Some(&user_owner(login.uid)),
+                    login,
+                    expires_at,
+                    now,
+                );
                 Err(ApiError::bad_request(BadSecondFactor))
+            }
+            Err(error) if error.is::<SecondFactorLocked>() => {
+                let retry_after = SecondFactorLocked::retry_after(&error);
+                let expires_at = login.expires_at;
+                self.inner.logins.restore(
+                    p.pending,
+                    Some(&user_owner(login.uid)),
+                    login,
+                    expires_at,
+                    now,
+                );
+                Err(ApiError::rate_limited(retry_after))
             }
             Err(error) => Err(error.into()),
         }
@@ -692,17 +772,30 @@ impl AuthService {
             let (mut options, state) = webauthn
                 .start_discoverable_authentication()
                 .map_err(|error| anyhow::anyhow!("webauthn: {error}"))?;
-            if !p.conditional {
+            if p.username.is_some() || !p.conditional {
                 options.mediation = None;
             }
             (options, AuthenticationState::Discoverable(state))
         };
+        let mut options = json_value(&options);
+        if let (Some(name), AuthenticationState::Discoverable(_)) = (p.username.as_deref(), &state)
+        {
+            // Answer like a user with one passkey, so the response does not
+            // reveal whether `name` exists or has passkeys. No authenticator
+            // holds the decoy, so the ceremony cannot complete.
+            let seed = self
+                .key()?
+                .keyed_hash(passkey::DECOY_PURPOSE, name.as_bytes());
+            options["publicKey"]["allowCredentials"] =
+                Value::Array(vec![passkey::decoy_credential(&seed)]);
+        }
         let now = self.now();
         let expires_at = now.saturating_add(CEREMONY_TTL);
         let ceremony = self
             .inner
             .authentications
             .insert(
+                passkey::source_owner(p.remote_addr.as_deref()).as_deref(),
                 Authentication {
                     client,
                     state,
@@ -1080,6 +1173,7 @@ impl AuthService {
             .inner
             .enrollments
             .insert(
+                Some(&user_owner(uid)),
                 PendingTotp {
                     client: caller.client,
                     uid,
@@ -1112,9 +1206,13 @@ impl AuthService {
             pending.attempts = pending.attempts.saturating_add(1);
             if pending.attempts < SECOND_FACTOR_ATTEMPTS {
                 let expires_at = pending.expires_at;
-                self.inner
-                    .enrollments
-                    .restore(p.enrollment, pending, expires_at);
+                self.inner.enrollments.restore(
+                    p.enrollment,
+                    Some(&user_owner(uid)),
+                    pending,
+                    expires_at,
+                    now,
+                );
             }
             return Err(ApiError::invalid_credentials());
         };
@@ -1174,6 +1272,9 @@ impl AuthService {
             Err(error) if error.is::<BadSecondFactor>() => {
                 Err(ApiError::bad_request(BadSecondFactor))
             }
+            Err(error) if error.is::<SecondFactorLocked>() => Err(ApiError::rate_limited(
+                SecondFactorLocked::retry_after(&error),
+            )),
             Err(error) => Err(error.into()),
         }
     }
@@ -1213,6 +1314,12 @@ impl AuthService {
         let (options, state) = webauthn
             .start_passkey_registration(handle, username, username, Some(exclude))
             .map_err(|error| anyhow::anyhow!("webauthn: {error}"))?;
+        // webauthn-rs asks for a non-discoverable credential. Prefer a
+        // discoverable one so usernameless login (and autofill) works, while
+        // keys that cannot store one still register; webauthn-rs does not
+        // check this setting when it verifies the result.
+        let mut options = json_value(&options);
+        options["publicKey"]["authenticatorSelection"]["residentKey"] = json_value(&"preferred");
         let name = passkey_name(p.name)?;
         let now = self.now();
         let expires_at = now.saturating_add(CEREMONY_TTL);
@@ -1220,6 +1327,7 @@ impl AuthService {
             .inner
             .registrations
             .insert(
+                Some(&user_owner(uid)),
                 Registration {
                     client: caller.client,
                     uid,
@@ -1445,6 +1553,15 @@ impl AuthService {
             };
             return Err(ApiError::forbidden(reason));
         }
+        if let Some(field) = authz::admin_only_field(&p.module, &p.payload)
+            && !matches!(caller.principal, Principal::RemoteController)
+            && !caller.is_admin()
+        {
+            return Err(ApiError::forbidden(format!(
+                "only administrators may set `{field}` on {}.{}",
+                p.module, p.action
+            )));
+        }
         let user = match &caller.principal {
             Principal::User { username, .. } => Some(username.clone()),
             _ => None,
@@ -1509,6 +1626,8 @@ pub fn reset_second_factor(
     users.update(account.uid, &account.name, |record| {
         let had_totp = record.totp.take().is_some();
         let recovery_codes = std::mem::take(&mut record.recovery_codes).len();
+        record.second_factor_failures = 0;
+        record.second_factor_retry_at = 0;
         let removed_passkeys = if passkeys {
             std::mem::take(&mut record.passkeys).len()
         } else {
@@ -1551,6 +1670,28 @@ impl std::fmt::Display for BadSecondFactor {
     }
 }
 impl std::error::Error for BadSecondFactor {}
+
+#[derive(Debug)]
+struct SecondFactorLocked {
+    retry_after: i64,
+}
+impl std::fmt::Display for SecondFactorLocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "too many wrong codes; retry in {} seconds",
+            self.retry_after
+        )
+    }
+}
+impl std::error::Error for SecondFactorLocked {}
+impl SecondFactorLocked {
+    fn retry_after(error: &anyhow::Error) -> i64 {
+        error
+            .downcast_ref::<Self>()
+            .map_or(SECOND_FACTOR_MAX_BACKOFF, |locked| locked.retry_after)
+    }
+}
 
 #[derive(Debug)]
 struct NotEnrolled;
@@ -1612,6 +1753,9 @@ struct CodeParams {
 struct PasskeyBeginParams {
     #[serde(default)]
     username: Option<String>,
+    /// The browser's address. Pending ceremonies are limited per address.
+    #[serde(default)]
+    remote_addr: Option<String>,
     /// Keep conditional mediation (autofill UI) on a usernameless challenge.
     #[serde(default)]
     conditional: bool,

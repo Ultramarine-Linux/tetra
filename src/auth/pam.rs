@@ -2,10 +2,12 @@
 //!
 //! Dashboard logins use the dedicated `ultramarine-dashboard` PAM service
 //! (`pam/ultramarine-dashboard`, installed to `/etc/pam.d`), which stacks
-//! `pam_faillock` around `pam_unix` so repeated failures lock the account
-//! the same way console logins do. Tetra runs `pam_authenticate` followed by
-//! `pam_acct_mgmt`; passkey logins run only the account stack so expiry and
-//! `/etc/nologin` still apply.
+//! `pam_faillock` around `pam_unix` so repeated wrong passwords lock the
+//! account for the dashboard. The tally lives in its own directory
+//! ([`FAILLOCK_DIR`]), so dashboard failures never lock console or SSH logins.
+//! Tetra runs `pam_authenticate` followed by `pam_acct_mgmt`; passkey logins
+//! run only the account stack, which has no `pam_faillock`, so expiry and
+//! `/etc/nologin` still apply but a password lockout does not.
 //!
 //! PAM calls block (and `pam_unix` deliberately delays failures), so callers
 //! run them on the blocking thread pool.
@@ -16,13 +18,16 @@ use crate::prelude::*;
 
 /// Default PAM service name, matching `/etc/pam.d/ultramarine-dashboard`.
 pub const DEFAULT_SERVICE: &str = "ultramarine-dashboard";
+/// Name of the dashboard's `pam_faillock` tally directory under the state
+/// directory (`dir=` in the PAM service file).
+pub const FAILLOCK_DIR: &str = "faillock";
 
 /// Result of a PAM transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PamOutcome {
     Success,
-    /// Wrong password, unknown user, faillock lockout or an account-stack
-    /// denial. Deliberately not distinguished.
+    /// Wrong password, unknown user, faillock lockout (password logins only)
+    /// or an account-stack denial. Deliberately not distinguished.
     Denied,
     /// The password was correct but has expired; it must be changed on the
     /// console or over SSH.
@@ -101,9 +106,19 @@ impl PasswordBackend for LibPam {
 
 #[cfg(test)]
 mod tests {
+    use super::FAILLOCK_DIR;
+
     #[test]
     fn pam_service_file_uses_faillock_around_pam_unix() {
         let file = include_str!("../../pam/ultramarine-dashboard");
+        // Its own tally, never the one console and SSH logins share.
+        let tally = format!("dir=/var/lib/tetra/{FAILLOCK_DIR}");
+        for line in file.lines().filter(|line| line.contains("pam_faillock.so")) {
+            assert!(
+                line.starts_with("auth") && line.contains(&tally),
+                "`{line}` must be in the auth stack and use {tally}"
+            );
+        }
         let auth: Vec<_> = file
             .lines()
             .filter(|line| line.starts_with("auth"))

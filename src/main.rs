@@ -100,7 +100,7 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum SetupCommand {
-    /// Print the setup code, or publish it to the console.
+    /// Publish the setup code to the console and print it.
     Code(SetupCodeCli),
     /// Finish setup without the OOBE, on a host that already has an eligible
     /// administrator (upgrades, development machines).
@@ -137,8 +137,8 @@ struct ResetSecondFactorCli {
 
 #[derive(Debug, Parser)]
 struct SetupCodeCli {
-    /// Write the code to /run/tetra/setup-code and the getty banner instead of
-    /// printing it (run at boot by tetra-setup-code.service).
+    /// Do not print the code. It is always written to /run/tetra/setup-code
+    /// and the getty banner (run at boot by tetra-setup-code.service).
     #[arg(long)]
     publish: bool,
 
@@ -435,18 +435,12 @@ fn setup_complete(cli: SetupCompleteCli) -> Result<()> {
 
 fn setup_code(cli: SetupCodeCli) -> Result<()> {
     require_root("tetra setup code")?;
-    let service = console_auth(cli.state_dir)?;
-    if cli.publish {
-        match service.publish_setup_code()? {
-            Some(_) => eprintln!("published the setup code to the console"),
-            None => eprintln!("setup is complete; nothing to publish"),
-        }
-    } else {
-        // Printing must not create a code that the console does not show.
-        match service.publish_setup_code()? {
-            Some(code) => println!("{code}"),
-            None => eprintln!("setup is complete; there is no setup code"),
-        }
+    // Printing must not create a code that the console does not show, so
+    // both forms publish; `--publish` (the boot unit) only skips printing it.
+    match console_auth(cli.state_dir)?.publish_setup_code()? {
+        Some(_) if cli.publish => eprintln!("published the setup code to the console"),
+        Some(code) => println!("{code}"),
+        None => eprintln!("setup is complete; there is no setup code"),
     }
     Ok(())
 }
@@ -531,12 +525,16 @@ async fn agent_serve(cli: AgentServeCli) -> Result<()> {
     let enrollment_dir = cli.enrollment_dir;
     let select = move |config: &RuntimeConfig| remote::connection_from(config, &enrollment_dir);
     let (sender, settings) = watch::channel(select(&RuntimeConfig::load_or_disabled(&cli.config)));
+    // systemd stops the service with SIGTERM; both signals flush sessions.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to install the SIGTERM handler")?;
     let result = tokio::select! {
         result = local_socket::serve(listener, server) => result,
         () = remote::supervise(settings, queue, audit) => Ok(()),
         result = remote::reload_on_hangup(cli.config, sender, select) => result,
         () = auth.flush_sessions_every(SESSION_FLUSH_INTERVAL) => Ok(()),
         result = tokio::signal::ctrl_c() => result.map_err(Into::into),
+        _ = terminate.recv() => Ok(()),
     };
     auth.flush_sessions()?;
     result

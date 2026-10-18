@@ -25,6 +25,8 @@ use chacha20poly1305::{
     aead::{Aead, Payload},
 };
 
+use sha2::{Digest, Sha256};
+
 use crate::prelude::*;
 
 use super::store;
@@ -115,6 +117,8 @@ pub struct Sealed {
 /// The unsealed store key.
 pub struct StoreKey {
     cipher: XChaCha20Poly1305,
+    /// Derived from the store key; never used for encryption.
+    hash_key: [u8; 32],
 }
 
 impl std::fmt::Debug for StoreKey {
@@ -144,9 +148,28 @@ impl StoreKey {
             store::write_bytes(path, &blob, 0o600)?;
             key
         };
+        let hash_key = Sha256::new()
+            .chain_update(b"tetra store key: keyed hash\0")
+            .chain_update(&key)
+            .finalize()
+            .into();
         Ok(Self {
             cipher: XChaCha20Poly1305::new(Key::from_slice(&key)),
+            hash_key,
         })
+    }
+
+    /// A stable pseudorandom value for `input`, bound to `purpose`, that only
+    /// a holder of the store key can compute.
+    #[must_use]
+    pub fn keyed_hash(&self, purpose: &str, input: &[u8]) -> Vec<u8> {
+        Sha256::new()
+            .chain_update(self.hash_key)
+            .chain_update(purpose.as_bytes())
+            .chain_update([0])
+            .chain_update(input)
+            .finalize()
+            .to_vec()
     }
 
     /// Encrypt `plaintext` for `purpose`, which must be passed again to

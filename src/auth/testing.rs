@@ -57,6 +57,7 @@ pub struct MockPasswords {
     passwords: std::sync::Mutex<BTreeMap<String, String>>,
     expired: std::sync::Mutex<HashSet<String>>,
     denied_accounts: std::sync::Mutex<HashSet<String>>,
+    locked_out: std::sync::Mutex<HashSet<String>>,
     calls: std::sync::Mutex<Vec<String>>,
 }
 
@@ -78,6 +79,13 @@ impl MockPasswords {
         self.denied_accounts.lock().unwrap().insert(username.into());
     }
 
+    /// Lock `username` out like `pam_faillock` does: the auth stack denies
+    /// even the right password; the account stack (which has no
+    /// `pam_faillock`) is unaffected.
+    pub fn lock_out(&self, username: &str) {
+        self.locked_out.lock().unwrap().insert(username.into());
+    }
+
     /// Calls so far, as `auth:<user>` or `account:<user>`.
     #[must_use]
     pub fn calls(&self) -> Vec<String> {
@@ -94,6 +102,9 @@ impl super::pam::PasswordBackend for MockPasswords {
     ) -> super::pam::PamOutcome {
         use super::pam::PamOutcome;
         self.calls.lock().unwrap().push(format!("auth:{username}"));
+        if self.locked_out.lock().unwrap().contains(username) {
+            return PamOutcome::Denied;
+        }
         let correct = self.passwords.lock().unwrap().get(username).cloned();
         if correct.as_deref() != Some(password) || password.is_empty() {
             return PamOutcome::Denied;

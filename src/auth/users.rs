@@ -33,8 +33,18 @@ pub struct UserRecord {
     pub recovery_codes: Vec<RecoveryCode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub passkeys: Vec<PasskeyRecord>,
+    /// Consecutive wrong second-factor codes, across logins.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub second_factor_failures: u32,
+    /// No second-factor code is checked before this time.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub second_factor_retry_at: i64,
     #[serde(flatten)]
     extra: Extra,
+}
+
+fn is_zero<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 
 impl Record for UserRecord {
@@ -58,6 +68,8 @@ impl UserRecord {
             totp: None,
             recovery_codes: Vec::new(),
             passkeys: Vec::new(),
+            second_factor_failures: 0,
+            second_factor_retry_at: 0,
             extra: Extra::new(),
         }
     }

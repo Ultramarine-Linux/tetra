@@ -9,7 +9,8 @@
 //!   administrator granted them, stored per UID in
 //!   `/var/lib/tetra/auth/grants.json`.
 //! - Actions that are root-equivalent are [`Requirement::AdminOnly`] and can
-//!   never be granted: managing users, writing files, changing settings and
+//!   never be granted: managing users, reading or writing files (the files
+//!   module runs as root on any path), changing settings and
 //!   SELinux, mounting or configuring storage, and anything that manages
 //!   rootful systemd units, containers or VMs. Apps are installed as system-scope units today, so app management is
 //!   admin-only too; it becomes grantable once apps run rootless under
@@ -75,7 +76,7 @@ pub enum Requirement {
 
 use Level::{Manage, View};
 use Page::{
-    Apps, Containers, Files, Network, Services, Settings, Sharing, Storage, Users, VirtualMachines,
+    Apps, Containers, Network, Services, Settings, Sharing, Storage, Users, VirtualMachines,
 };
 use Requirement::{AdminOnly, Authenticated};
 
@@ -110,9 +111,12 @@ const TABLE: &[(&str, &str, Requirement)] = &[
     ("quadlets", "write", AdminOnly),
     ("quadlets", "delete", AdminOnly),
     ("quadlets", "install", AdminOnly),
-    ("recipes", "render", page(Apps, View)),
+    // `render` and `context` read recipes and templates from any path as
+    // root (and `render` can write rendered files anywhere); the inline forms
+    // take their input in the payload.
+    ("recipes", "render", AdminOnly),
     ("recipes", "render_inline", page(Apps, View)),
-    ("recipes", "context", page(Apps, View)),
+    ("recipes", "context", AdminOnly),
     ("recipes", "context_inline", page(Apps, View)),
     ("podman", "containers", page(Containers, View)),
     ("podman", "inspect", page(Containers, View)),
@@ -175,7 +179,8 @@ const TABLE: &[(&str, &str, Requirement)] = &[
     ("users", "update", AdminOnly),
     ("users", "delete", AdminOnly),
     ("users", "set_password", AdminOnly),
-    ("files", "read", page(Files, View)),
+    // Reads any path as root (`/etc/shadow`, the store key): root-equivalent.
+    ("files", "read", AdminOnly),
     ("files", "write", AdminOnly),
     ("virtual_machines", "list", page(VirtualMachines, View)),
     ("virtual_machines", "status", page(VirtualMachines, View)),
@@ -204,6 +209,26 @@ pub const SETUP_ALLOWED: &[(&str, &str)] = &[
     ("users", "update"),
     ("users", "set_password"),
 ];
+
+/// Payload fields that only administrators (and remote controllers) may set,
+/// because they point an action at arbitrary host paths. The setup session
+/// and granted users always get the defaults.
+const ADMIN_ONLY_FIELDS: &[(&str, &str)] = &[
+    ("reverse_proxy", "config_dir"),
+    ("quadlets", "base_dir"),
+    ("quadlets", "files_base_dir"),
+    ("apps", "base_dir"),
+    ("apps", "files_base_dir"),
+];
+
+/// The first admin-only field set in a `module` payload, if any.
+#[must_use]
+pub fn admin_only_field(module: &str, payload: &Value) -> Option<&'static str> {
+    ADMIN_ONLY_FIELDS
+        .iter()
+        .find(|(m, field)| *m == module && payload.get(field).is_some())
+        .map(|(_, field)| *field)
+}
 
 /// The requirement for `module.action`.
 #[must_use]
@@ -336,7 +361,13 @@ impl GrantStore {
     /// Fails when the file exists but cannot be read.
     pub fn effective(&self, uid: u32) -> Result<Permissions> {
         let mut permissions = default_permissions();
-        for (page, level) in self.get(uid)? {
+        // A stored grant that is no longer grantable (an action became
+        // admin-only in a later release) is ignored.
+        for (page, level) in self
+            .get(uid)?
+            .into_iter()
+            .filter(|(page, level)| grantable(*page, *level))
+        {
             let entry = permissions.entry(page).or_insert(level);
             *entry = (*entry).max(level);
         }
@@ -455,7 +486,7 @@ mod tests {
     fn root_equivalent_permissions_cannot_be_granted() {
         for page in [
             Users,
-            Files,
+            Page::Files,
             Settings,
             Services,
             Apps,
@@ -469,8 +500,11 @@ mod tests {
             );
         }
         for page in Page::ALL {
-            assert!(grantable(page, View), "{page:?} view should be grantable");
+            // The files module reads any path as root.
+            let expected = page != Page::Files;
+            assert_eq!(grantable(page, View), expected, "{page:?} view");
         }
+        assert_eq!(requirement("files", "read"), AdminOnly);
         assert!(grantable(Network, Manage));
         assert!(grantable(Sharing, Manage));
         let alice = user(false, BTreeMap::from([(Storage, View)]));
@@ -541,5 +575,34 @@ mod tests {
             .set(1000, &BTreeMap::from([(Network, None)]))
             .unwrap();
         assert_eq!(grants.get(1000).unwrap().get(&Network), None);
+    }
+
+    #[test]
+    fn grants_that_are_no_longer_grantable_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grants.json");
+        // Written by a release in which `files.read` needed `files: view`.
+        fs::write(
+            &path,
+            r#"{"schema": 1, "compat": 1, "grants": {"1000": {"files": "view", "storage": "view"}}}"#,
+        )
+        .unwrap();
+        let effective = GrantStore::new(path).effective(1000).unwrap();
+        assert_eq!(effective.get(&Page::Files), None);
+        assert_eq!(effective.get(&Storage), Some(&View));
+    }
+
+    #[test]
+    fn path_overrides_are_admin_only_fields() {
+        let payload = serde_json::json!({"filename": "x", "files_base_dir": "/etc"});
+        assert_eq!(
+            admin_only_field("quadlets", &payload),
+            Some("files_base_dir")
+        );
+        assert_eq!(
+            admin_only_field("quadlets", &serde_json::json!({"filename": "x"})),
+            None
+        );
+        assert_eq!(requirement("recipes", "render"), AdminOnly);
     }
 }

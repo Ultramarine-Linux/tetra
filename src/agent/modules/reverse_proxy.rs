@@ -122,7 +122,7 @@ actions!(Action [payload user] => {
         let site = SiteMetadata::new(&payload.domain, &payload.upstream, payload.tls)?;
         Ok(jsonf! {
             payload.config_dir,
-            "filename": site_filename(&site.domain),
+            "filename": site_filename(&site.domain)?,
             "contents": site.render()?,
             site,
             payload.dry_run,
@@ -143,8 +143,9 @@ actions!(Action [payload user] => {
     } => {
         let config_dir = &payload.config_dir;
         let site = SiteMetadata::new(&payload.domain, &payload.upstream, payload.tls)?;
-        let filename = site_filename(&site.domain);
+        let filename = site_filename(&site.domain)?;
         let path = safe_join(config_dir, &filename)?;
+        ensure_managed(&path)?;
         let contents = site.render()?;
 
         if !payload.dry_run {
@@ -180,8 +181,9 @@ actions!(Action [payload user] => {
     } => {
         let config_dir = &payload.config_dir;
         let domain = validate_domain(&payload.domain)?;
-        let filename = site_filename(&domain);
+        let filename = site_filename(&domain)?;
         let path = safe_join(config_dir, &filename)?;
+        ensure_managed(&path)?;
 
         if !payload.dry_run && path.exists() {
             fs::remove_file(&path)
@@ -271,11 +273,35 @@ fn validate_upstream(upstream: &str) -> Result<String> {
 /// `*` (wildcard site labels) becomes `wildcard` and `.` becomes `_`, so
 /// `*.example.com` -> `wildcard_example_com.caddy`. The domain is already
 /// validated to contain only `[a-z0-9-.]`, so no further escaping is needed.
-fn site_filename(domain: &str) -> String {
-    format!(
+///
+/// A domain whose filename would be the dashboard's own site (such as
+/// `00-ultramarine-dashboard`) is refused.
+fn site_filename(domain: &str) -> Result<String> {
+    let filename = format!(
         "{}.caddy",
         domain.replace('*', "wildcard").replace('.', "_")
-    )
+    );
+    ensure!(
+        filename != DASHBOARD_SITE_FILE,
+        "`{domain}` is reserved for the dashboard site"
+    );
+    Ok(filename)
+}
+
+/// Refuse to touch an existing file that Tetra's `write` action did not
+/// create (operator files, the dashboard site).
+fn ensure_managed(path: &Path) -> Result<()> {
+    match fs::read_to_string(path) {
+        Ok(contents) if !contents.starts_with(MANAGED_HEADER) => bail!(
+            "`{}` is not managed by Tetra reverse_proxy; refusing to change it",
+            path.display()
+        ),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to read `{}`", path.display()))
+        }
+    }
 }
 
 /// List Tetra-managed sites in `config_dir`.
@@ -333,7 +359,7 @@ fn reload_caddy(action: &str, dry_run: bool, user: Option<&str>) -> Result<Value
 ///
 /// Written by Tetra's `access.set` operation rather than by a module action.
 /// It does not start with the `MANAGED_HEADER` line, so `list` (which reports
-/// app sites) skips it and `delete` cannot remove it. The `00-` prefix keeps
+/// app sites) skips it, and `write` and `delete` refuse its name. The `00-` prefix keeps
 /// it first in the import order.
 pub const DASHBOARD_SITE_FILE: &str = "00-ultramarine-dashboard.caddy";
 const DASHBOARD_HEADER: &str = "# Managed by Tetra access.set: Ultramarine Server dashboard";
@@ -503,6 +529,44 @@ mod tests {
         write_dashboard_site(dir.path(), &site, false, false).unwrap();
         assert!(dir.path().join(DASHBOARD_SITE_FILE).exists());
         assert_eq!(list_sites(dir.path()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn write_and_delete_leave_unmanaged_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |domain: &str| Write {
+            config_dir: dir.path().to_path_buf(),
+            domain: domain.into(),
+            upstream: "127.0.0.1:9999".into(),
+            tls: true,
+            dry_run: false,
+            reload: false,
+        };
+        let delete = |domain: &str| Delete {
+            config_dir: dir.path().to_path_buf(),
+            domain: domain.into(),
+            dry_run: false,
+            reload: false,
+        };
+
+        // The dashboard site's name is reserved, even before it exists.
+        write("00-ultramarine-dashboard").handle(None).unwrap_err();
+        delete("00-ultramarine-dashboard").handle(None).unwrap_err();
+
+        let operator = dir.path().join("mine_example_com.caddy");
+        fs::write(&operator, "mine.example.com {\n}\n").unwrap();
+        write("mine.example.com").handle(None).unwrap_err();
+        delete("mine.example.com").handle(None).unwrap_err();
+        assert_eq!(
+            fs::read_to_string(&operator).unwrap(),
+            "mine.example.com {\n}\n"
+        );
+
+        // Managed sites can still be rewritten and deleted.
+        write("app.example.com").handle(None).unwrap();
+        write("app.example.com").handle(None).unwrap();
+        delete("app.example.com").handle(None).unwrap();
+        assert!(!dir.path().join("app_example_com.caddy").exists());
     }
 
     #[test]

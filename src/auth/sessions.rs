@@ -8,7 +8,8 @@
 //! Sessions survive a Tetra restart through `/var/lib/tetra/auth/sessions.json`.
 //! The file is rewritten when a session is issued or revoked; `last_seen`
 //! changes stay in memory and are written by [`SessionStore::flush`], which
-//! the daemon calls periodically, so requests never wait on disk.
+//! the daemon calls periodically, so requests never wait on disk. Issuing and
+//! flushing also drop expired sessions, so abandoned tokens do not pile up.
 
 use std::{collections::HashMap, sync::Mutex};
 
@@ -220,6 +221,7 @@ impl SessionStore {
             extra: Extra::new(),
         };
         let mut state = self.lock();
+        self.prune(&mut state, now);
         state.sessions.insert(token_hash, session.clone());
         let persisted = self.persist(&mut state);
         drop(state);
@@ -292,12 +294,14 @@ impl SessionStore {
         sessions
     }
 
-    /// Write pending `last_seen` updates and expiries, if any.
+    /// Drop sessions that have expired by `now`, then write pending
+    /// `last_seen` updates and expiries, if any.
     ///
     /// # Errors
     /// Fails when the session file cannot be written.
-    pub fn flush(&self) -> Result<()> {
+    pub fn flush(&self, now: i64) -> Result<()> {
         let mut state = self.lock();
+        self.prune(&mut state, now);
         let persisted = if state.dirty {
             self.persist(&mut state)
         } else {
@@ -305,6 +309,16 @@ impl SessionStore {
         };
         drop(state);
         persisted
+    }
+
+    fn prune(&self, state: &mut State, now: i64) {
+        let before = state.sessions.len();
+        state
+            .sessions
+            .retain(|_, session| live(&self.policy, session, now));
+        if state.sessions.len() != before {
+            state.dirty = true;
+        }
     }
 
     fn persist(&self, state: &mut State) -> Result<()> {
@@ -449,12 +463,37 @@ mod tests {
             .validate(&token, ClientKind::Dashboard, 60)
             .unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), written);
-        sessions.flush().unwrap();
+        sessions.flush(60).unwrap();
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
                 .contains("\"last_seen\": 60")
         );
+    }
+
+    #[test]
+    fn abandoned_sessions_are_dropped_on_flush_and_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let sessions = store(dir.path());
+        let idle = SessionPolicy::default().idle;
+        let (abandoned, _) = sessions.issue(new_user(ClientKind::Dashboard), 0).unwrap();
+        sessions.flush(idle).unwrap();
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains(&hash_token(&abandoned))
+        );
+
+        let (abandoned, _) = sessions
+            .issue(new_user(ClientKind::Dashboard), idle)
+            .unwrap();
+        let (kept, _) = sessions
+            .issue(new_user(ClientKind::Dashboard), 2 * idle)
+            .unwrap();
+        let file = fs::read_to_string(&path).unwrap();
+        assert!(!file.contains(&hash_token(&abandoned)));
+        assert!(file.contains(&hash_token(&kept)));
     }
 
     #[test]

@@ -149,16 +149,30 @@ or, when TOTP is enrolled:
   "methods": ["totp", "recovery_code"], "expires_at": 0 }
 ```
 
-Failures: `invalid_credentials`, `password_expired`. Repeated failures lock
-the account through `pam_faillock` (shared with console and SSH logins).
+Failures: `invalid_credentials`, `password_expired` (only for accounts that
+may log in to the dashboard; for others a right but expired password is
+`invalid_credentials`). Repeated wrong passwords lock password logins to the
+dashboard through `pam_faillock`. The dashboard keeps its own tally in
+`/var/lib/tetra/faillock`, so dashboard failures never lock console or SSH
+logins and theirs never lock the dashboard. `deny=` and `unlock_time=` come
+from `/etc/security/faillock.conf`; unlock with
+`faillock --dir /var/lib/tetra/faillock --user NAME --reset`. A lockout does
+not block passkey logins: they run only the account stack, which has no
+`pam_faillock`, and Tetra limits passkey ceremonies per address instead.
 
 **`auth.second_factor`** `{pending, code}` or `{pending, recovery_code}`
 
 Returns the `authenticated` result. A pending login lasts 5 minutes and allows
-5 wrong codes. A TOTP code is accepted only once; recovery codes are single
-use.
+5 wrong codes. Wrong codes are also counted per account, across logins and
+restarts: after 10 wrong TOTP codes in a row each further TOTP attempt waits
+twice as long as the last (capped at 15 minutes) and gets `rate_limited`
+without the code being checked; the pending login is kept. Recovery codes are
+too strong to guess and keep working during the wait. A right code resets the
+count. The same limit applies to the operations that need a current code
+(`account.totp_*`).
+A TOTP code is accepted only once; recovery codes are single use.
 
-**`auth.passkey_begin`** `{username?, conditional?}`
+**`auth.passkey_begin`** `{username?, conditional?, remote_addr?}`
 
 ```json
 { "ceremony": "…", "options": { "publicKey": { … } }, "expires_at": 0 }
@@ -166,10 +180,25 @@ use.
 
 `options` is a WebAuthn `PublicKeyCredentialRequestOptions` wrapper to pass to
 `navigator.credentials.get()` (after base64url decoding the binary fields).
-With a `username` that has passkeys, the challenge lists that user's
-credentials. Without one (or for an unknown user) it is a discoverable
-challenge; `conditional: true` keeps `mediation: "conditional"` for autofill
-UI. Ceremonies expire after 5 minutes and are single use.
+
+The primary form has no `username`: a discoverable challenge with an empty
+`allowCredentials`, and Tetra identifies the user from the credential's user
+handle. Passkeys are registered as discoverable credentials where the
+authenticator can store one, so this works for them. `conditional: true`
+keeps `mediation: "conditional"` for autofill UI.
+
+With a `username` (the fallback for keys that could not store a discoverable
+credential) the challenge lists that user's credentials, and never uses
+conditional mediation. For any other `username` (unknown, not allowed to log
+in, or without passkeys) it lists one decoy credential derived from the name;
+no authenticator holds it.
+
+Ceremonies expire after 5 minutes and are single use. `remote_addr` is the browser's IP address: each
+address (IPv6 by `/64`) may have 16 pending ceremonies, and a 17th replaces
+its oldest, so one client cannot use up the shared limit of 4096. Without a
+valid IP address the ceremony only counts against the shared limit. The decoy
+looks like one platform passkey, so it hides users with exactly that; a user
+with several passkeys or security keys can still be told apart.
 
 **`auth.passkey_finish`** `{ceremony, credential, remote_addr?}`
 
@@ -210,7 +239,7 @@ code is replaced after 20 wrong attempts), `setup_complete`.
 | `account.totp_confirm` | `enrollment, code` | `{recovery_codes: [10 codes]}`; shown once |
 | `account.totp_disable` | `code` or `recovery_code` | `{totp_enrolled: false}` |
 | `account.recovery_regenerate` | `code` or `recovery_code` | `{recovery_codes}` |
-| `account.passkey_register_begin` | `name?` | `{ceremony, options, expires_at}`; pass `options` to `navigator.credentials.create()` |
+| `account.passkey_register_begin` | `name?` | `{ceremony, options, expires_at}`; pass `options` to `navigator.credentials.create()`. Asks for a discoverable credential (`residentKey: "preferred"`), so usernameless login works; keys that cannot store one still register |
 | `account.passkey_register_finish` | `ceremony, credential, name?` | `{id, name, created_at}` |
 | `account.passkey_list` | | `{passkeys: [{id, name, created_at, last_used_at}]}` |
 | `account.passkey_remove` | `id` | `{removed}` |
@@ -278,7 +307,7 @@ Every dispatched action is recorded in the action log.
 | Page | `view` | `manage` (grantable) | Administrator only |
 | --- | --- | --- | --- |
 | `services` | `services.list/status/logs` | — | start, stop, restart, enable, disable, daemon_reload |
-| `apps` | `apps.list/get`, `quadlets.list/read/validate/list_files`, `recipes.*` | — | apps create/update/remove, quadlets write/delete/install |
+| `apps` | `apps.list/get`, `quadlets.list/read/validate/list_files`, `recipes.render_inline/context_inline` | — | apps create/update/remove, quadlets write/delete/install, `recipes.render/context` (read paths as root) |
 | `containers` | `podman.containers/inspect/images/volumes/networks/logs` | — | podman start/stop/restart/remove |
 | `storage` | `storage.list/status/zfs` | — | `storage.mount/unmount/configure` |
 | `sharing` | `samba.list_shares/get_config`, `nfs.list_exports/get_config` | `samba/nfs.set_config/reload` | samba/nfs enable, disable |
@@ -286,9 +315,17 @@ Every dispatched action is recorded in the action log.
 | `virtual_machines` | `virtual_machines.list/status/logs` | — | start, stop, restart, create, delete |
 | `settings` | `selinux.status/booleans/file_contexts` | — | `settings.set_hostname`, SELinux changes |
 | `users` | `users.list/status/groups` | — | create, update, delete, set_password |
-| `files` | `files.read` | — | `files.write` |
+| `files` | — | — | `files.read/write` |
 
-Managing users, files, settings or storage (mounting is root-equivalent), and
+Payload fields that point an action at arbitrary host paths are
+administrator-only: `config_dir` on `reverse_proxy` actions and
+`base_dir`/`files_base_dir` on `quadlets` and `apps` actions. The setup session
+and granted users always get the default directories. Stored grants that are
+no longer grantable (such as `files: view` from an earlier release) are
+ignored.
+
+Managing users, reading or writing files (the files module runs as root on
+any path), settings or storage (mounting is root-equivalent), and
 anything that manages rootful systemd units, containers or VMs, is never
 grantable. Apps are currently installed as
 system-scope units, so app management is administrator-only until apps run
@@ -311,7 +348,10 @@ is recorded with `origin: "remote"`.
   over SSH.
 - The code stays the same across reboots until setup completes or the
   wrong-code limit replaces it. Tetra republishes a replaced code itself.
-- `sudo tetra setup code` prints the current code.
+- `sudo tetra setup code` prints the current code (and, like `--publish`,
+  writes it to the console, so the printed code is always the one shown).
+  Publishing only creates the files; `/run/tetra` keeps the socket unit's
+  `0755` mode so the OOBE can reach the socket.
 - `sudo tetra setup complete` finishes setup from the console, with the same
   check as `setup.complete` (an eligible administrator must exist). Use it on
   upgraded hosts and development machines that have no OOBE run.
@@ -327,6 +367,7 @@ All under `/var/lib/tetra` (`0700`, files `0600`, root only):
 | `auth/grants.json` | Grants per UID |
 | `auth/sessions.json` | Session token hashes |
 | `auth/setup-code.json` | Encrypted setup code and wrong-attempt state |
+| `faillock/` | `pam_faillock` tally for dashboard password logins only |
 | `access.json` | Access mode, hostname, port, dashboard upstream |
 | `setup-complete` | Setup completion marker |
 | `audit/actions.jsonl` | Action log (rotated at 4 MiB) |
