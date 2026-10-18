@@ -108,6 +108,12 @@ async fn the_setup_session_is_denied_every_action_not_on_the_allowlist() {
         "admin.grants_set",
         "admin.sessions_revoke",
         "admin.actions",
+        "launcher.list",
+        "launcher.get",
+        "launcher.set",
+        "launcher.remove",
+        "launcher.public_get",
+        "launcher.public_set",
         "no.such_operation",
     ] {
         fails(
