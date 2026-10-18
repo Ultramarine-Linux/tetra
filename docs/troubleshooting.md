@@ -11,8 +11,9 @@ system CA certificates available and Rust is up to date (edition 2024 is
 required).
 
 ```sh
-# On Fedora / Ultramarine
-sudo dnf install openssl-devel ca-certificates
+# On Fedora / Ultramarine. pam-devel and clang-devel are needed to generate
+# the libpam bindings; openssl-devel for webauthn-rs.
+sudo dnf install openssl-devel pam-devel clang-devel ca-certificates
 
 # Update Rust if edition 2024 is not recognized
 rustup update

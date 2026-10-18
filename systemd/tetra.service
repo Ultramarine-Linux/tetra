@@ -12,6 +12,10 @@ ExecStart=/usr/bin/tetra agent-serve --identity-dir /var/lib/tetra/identity
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
+# Credentials, grants, sessions, the setup marker and the dashboard's
+# pam_faillock tally. Root only.
+StateDirectory=tetra tetra/faillock
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target

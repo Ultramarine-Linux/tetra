@@ -16,8 +16,10 @@ dashboard session protocol.
 
 Local clients (the dashboard container and the server OOBE) connect to Tetra
 over the Unix socket `/run/tetra/tetra.sock` (`tetra agent-serve`) and speak the
-authenticated WebSocket protocol on it. Production installs do not listen on
-the network.
+session protocol described in [auth-protocol.md](auth-protocol.md): users log
+in through Tetra and each request carries a session token. Module commands are
+sent with the `module.dispatch` operation using the envelope documented below.
+Production installs do not listen on the network.
 
 An outbound connection to a remote control plane is optional and ships
 disabled. It runs only while `remote.enabled` is `true` in

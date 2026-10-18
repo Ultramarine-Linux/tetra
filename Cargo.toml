@@ -79,12 +79,23 @@ phf = { version = "0.14.0", features = ["macros"] }
 enum_dispatch = "0.3.13"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 x509-parser = "0.18.1"
+# Login and authorization (`src/auth`). `pam-client` links the system libpam
+# (bindgen, so it needs pam-devel and clang-devel to build); `webauthn-rs`
+# links the system OpenSSL dynamically (openssl-devel).
+chacha20poly1305 = "0.10"
+nix = { version = "0.31", features = ["fs", "user"] }
+pam-client = { version = "0.5", default-features = false }
+sha2 = "0.11"
+subtle = "2.6"
+totp-rs = { version = "6", features = ["gen_secret", "otpauth"] }
+webauthn-rs = { version = "0.5", features = ["conditional-ui"] }
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 tempfile = "3"
 time = "0.3"
 tokio-rustls = "0.26"
+webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
 
 [lints]
 workspace = true

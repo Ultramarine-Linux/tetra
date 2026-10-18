@@ -12,6 +12,7 @@
 //! The binary in `src/main.rs` wires these into CLI subcommands.
 
 pub mod agent;
+pub mod auth;
 pub mod catalog;
 pub mod enrollment;
 pub mod prelude;

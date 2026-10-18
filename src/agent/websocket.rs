@@ -18,10 +18,17 @@ use tokio_tungstenite::{
 
 use super::{
     AgentBackend, AgentCommand, AgentResponse,
+    protocol::unix_timestamp,
     queue::{DEFAULT_QUEUE_CAPACITY, DispatchQueue, QueueError},
     transport::{TransportConfig, TransportEndpoint},
 };
-use crate::enrollment::renewal::{self, ClientFiles, Lifetime};
+use crate::{
+    auth::{
+        audit::{self, AuditLog, Origin},
+        authz::Principal,
+    },
+    enrollment::renewal::{self, ClientFiles, Lifetime},
+};
 
 /// Protocol version advertised in the `Hello` frame. Bumped when the wire
 /// format changes in a way the control plane must notice; the control plane
@@ -116,19 +123,32 @@ impl TransportFrame {
             .context("failed to send websocket frame")
     }
 
-    /// Dispatch one received frame. `Command` frames go to the backend actor and
-    /// the response is sent back as a `Response` frame; `Ping` is echoed as a
-    /// `Pong`; anything else (including `Hello`, `Response`, `Pong`, `Error`) is
-    /// rejected with an `Error` frame — the control plane should never send those
-    /// to an agent.
-    async fn handle<S>(self, socket: &mut S, queue: &DispatchQueue) -> Result<()>
+    /// Dispatch one received frame. `Command` frames are authorized as the
+    /// remote controller, go to the backend actor, are recorded in the action
+    /// log as remote actions, and the response is sent back as a `Response`
+    /// frame; `Ping` is echoed as a `Pong`; anything else (including `Hello`,
+    /// `Response`, `Pong`, `Error`) is rejected with an `Error` frame — the
+    /// control plane should never send those to an agent.
+    async fn handle<S>(self, socket: &mut S, queue: &DispatchQueue, remote: &Remote) -> Result<()>
     where
         S: SinkExt<Message> + Unpin,
         <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
     {
         match self {
-            Self::Command { command } => match queue.dispatch(command).await {
-                Ok(response) => Self::Response { response }.send(socket).await?,
+            Self::Command { command }
+                if !Principal::RemoteController.allows(&command.module, &command.action) =>
+            {
+                Self::Error {
+                    error: format!("{}.{} is not allowed", command.module, command.action),
+                }
+                .send(socket)
+                .await?;
+            }
+            Self::Command { command } => match queue.dispatch(command.clone()).await {
+                Ok(response) => {
+                    remote.record(&command, &response);
+                    Self::Response { response }.send(socket).await?;
+                }
                 Err(QueueError::Full) => {
                     Self::Error {
                         error: "Tetra command queue is full; retry after backoff".into(),
@@ -167,6 +187,31 @@ impl TransportFrame {
     }
 }
 
+/// Who is sending commands on an outbound session, for authorization and the
+/// action log.
+struct Remote {
+    host_id: String,
+    audit: AuditLog,
+}
+
+impl Remote {
+    fn record(&self, command: &AgentCommand, response: &AgentResponse) {
+        self.audit.record(&audit::Entry {
+            at: unix_timestamp(),
+            origin: Origin::Remote,
+            client: None,
+            uid: None,
+            username: command.user.clone(),
+            host_id: Some(self.host_id.clone()),
+            command_id: command.id.clone(),
+            module: command.module.clone(),
+            action: command.action.clone(),
+            ok: response.ok,
+            error: response.error.clone(),
+        });
+    }
+}
+
 /// Connect to the control plane, exchange frames until the session closes, and
 /// (if `reconnect`) reconnect with backoff.
 ///
@@ -174,12 +219,17 @@ impl TransportFrame {
 /// session.
 pub async fn run(config: WebSocketAgentConfig) -> Result<()> {
     let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), DEFAULT_QUEUE_CAPACITY);
-    run_with_queue(config, queue).await
+    run_with_queue(config, queue, AuditLog::new(audit::DEFAULT_DIR.into())).await
 }
 
 /// [`run`] against an existing dispatch queue, so the outbound session shares
-/// one dispatcher with the local transports.
-pub async fn run_with_queue(config: WebSocketAgentConfig, queue: DispatchQueue) -> Result<()> {
+/// one dispatcher with the local transports, recording remote actions in
+/// `audit`.
+pub async fn run_with_queue(
+    config: WebSocketAgentConfig,
+    queue: DispatchQueue,
+    audit: AuditLog,
+) -> Result<()> {
     let url = match config.transport.endpoint()? {
         TransportEndpoint::WebSocket { url } => url,
         TransportEndpoint::Vsock(_) => {
@@ -193,7 +243,7 @@ pub async fn run_with_queue(config: WebSocketAgentConfig, queue: DispatchQueue) 
     let mut renewal = RenewalState::default();
 
     loop {
-        match connect_once(&url, &config, queue.clone(), &mut renewal).await {
+        match connect_once(&url, &config, queue.clone(), &audit, &mut renewal).await {
             // Reconnect straight away with the renewed certificate, whether
             // or not `reconnect` is set: the session only ended to swap it.
             Ok(SessionEnd::Renewed) => {
@@ -249,6 +299,7 @@ async fn connect_once(
     url: &str,
     config: &WebSocketAgentConfig,
     queue: DispatchQueue,
+    audit: &AuditLog,
     renewal: &mut RenewalState,
 ) -> Result<SessionEnd> {
     let files = ClientFiles::from_transport(&config.transport);
@@ -268,6 +319,10 @@ async fn connect_once(
     let mut session = Session {
         renewer: files.and_then(|files| Renewer::new(files, &config.host_id)),
         queue,
+        remote: Remote {
+            host_id: config.host_id.clone(),
+            audit: audit.clone(),
+        },
     };
     loop {
         let wake = session
@@ -354,6 +409,8 @@ async fn sleep_until(wake: Option<SystemTime>) {
 struct Session {
     renewer: Option<Renewer>,
     queue: DispatchQueue,
+    /// Records the controller's actions in the action log.
+    remote: Remote,
 }
 
 impl Session {
@@ -396,7 +453,7 @@ impl Session {
                 Ok(None)
             }
             (frame, _) => {
-                frame.handle(socket, &self.queue).await?;
+                frame.handle(socket, &self.queue, &self.remote).await?;
                 Ok(None)
             }
         }
@@ -584,6 +641,33 @@ mod tests {
             server_ca_path: Some("ca.crt".into()),
         };
         (plaintext.validate(&plaintext.control_plane_url)).unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn remote_commands_are_recorded_as_remote_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Remote {
+            host_id: "host-01".into(),
+            audit: AuditLog::new(dir.path().to_path_buf()),
+        };
+        let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), DEFAULT_QUEUE_CAPACITY);
+        let frame = TransportFrame::Command {
+            command: AgentCommand {
+                id: "cmd-remote".into(),
+                module: "settings".into(),
+                action: "get_system".into(),
+                ..Default::default()
+            },
+        };
+        frame
+            .handle(&mut futures_util::sink::drain(), &queue, &remote)
+            .await
+            .unwrap();
+        let logged = remote.audit.recent(10, Some(Origin::Remote)).unwrap();
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].command_id, "cmd-remote");
+        assert_eq!(logged[0].host_id.as_deref(), Some("host-01"));
+        assert!(logged[0].ok);
     }
 
     #[test]

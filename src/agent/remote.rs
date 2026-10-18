@@ -21,16 +21,18 @@ use super::{
     queue::DispatchQueue,
     websocket::{self, WebSocketAgentConfig},
 };
-use crate::enrollment::store::Enrollment;
+use crate::{auth::audit::AuditLog, enrollment::store::Enrollment};
 
 /// Run the outbound connection whenever `settings` holds one, sharing `queue`
-/// with the local transports. Returns when the sender is dropped.
+/// with the local transports and recording remote actions in `audit`. Returns
+/// when the sender is dropped.
 pub async fn supervise(
     settings: watch::Receiver<Option<WebSocketAgentConfig>>,
     queue: DispatchQueue,
+    audit: AuditLog,
 ) {
     supervise_with(settings, |config| {
-        websocket::run_with_queue(config, queue.clone())
+        websocket::run_with_queue(config, queue.clone(), audit.clone())
     })
     .await;
 }

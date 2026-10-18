@@ -2,9 +2,11 @@
 //! container and the server OOBE).
 //!
 //! This is the only listener `tetra.service` runs: production installs do not
-//! listen on the network. The socket carries the same authenticated WebSocket
-//! protocol as [`super::websocket_server`], so clients only swap TCP for a
-//! Unix stream.
+//! listen on the network. Each connection is identified by its peer
+//! credentials ([`super::peer`]) and then speaks the session protocol in
+//! [`super::local_protocol`]: every request carries a Tetra-issued session
+//! token. The controller-key login of [`super::websocket_server`] is not
+//! accepted here; it remains only on the development TCP listener.
 //!
 //! The socket is normally created by systemd (`tetra.socket`) as
 //! `root:tetra 0660`, and handed over through socket activation. When Tetra is
@@ -25,7 +27,7 @@ use anyhow::{Context, Result, bail, ensure};
 use socket2::{Domain, Socket, Type};
 use tokio::net::{UnixListener, UnixStream};
 
-use super::websocket_server::ServerState;
+use super::local_protocol::LocalServer;
 
 /// Default socket path. Matches `ListenStream=` in `systemd/tetra.socket`.
 pub const DEFAULT_SOCKET_PATH: &str = "/run/tetra/tetra.sock";
@@ -114,20 +116,21 @@ fn bind(path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-/// Accept local clients forever, running the authenticated WebSocket protocol
-/// on each connection.
-pub async fn serve(listener: UnixListener, state: ServerState) -> Result<()> {
+/// Accept local clients forever, running the session protocol on each
+/// connection.
+pub async fn serve(listener: UnixListener, server: LocalServer) -> Result<()> {
     loop {
         let (stream, _) = listener
             .accept()
             .await
             .context("failed to accept local client")?;
         let peer = peer_label(&stream);
-        tokio::spawn(state.clone().handle(stream, peer));
+        let uid = stream.peer_cred().ok().map(|cred| cred.uid());
+        tokio::spawn(server.clone().handle(stream, uid, peer));
     }
 }
 
-/// Describe a local peer for logs. Credentials are informational only here.
+/// Describe a local peer for logs.
 fn peer_label(stream: &UnixStream) -> String {
     stream.peer_cred().map_or_else(
         |_| "unix:unknown".to_owned(),
@@ -143,86 +146,95 @@ fn peer_label(stream: &UnixStream) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{
-        AgentCommand,
-        crypto::{public_key_fingerprint, sign_challenge, sign_command},
-        protocol::{AuthFrame, unix_timestamp},
+    use crate::{
+        agent::{
+            local_protocol::{ClientFrame, ServerFrame},
+            peer::{PeerMatch, PeerPolicy},
+        },
+        auth::{api::Request, sessions::ClientKind, testing::TestHost},
     };
-    use ed25519_dalek::SigningKey;
     use futures_util::{SinkExt, StreamExt};
+    use serde_json::json;
+    use std::path::PathBuf;
     use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message};
 
-    async fn exchange(
-        socket: &mut WebSocketStream<UnixStream>,
-        frame: Option<&AuthFrame>,
-    ) -> AuthFrame {
-        if let Some(frame) = frame {
-            let text = serde_json::to_string(frame).unwrap();
-            socket.send(Message::Text(text.into())).await.unwrap();
-        }
+    async fn receive(socket: &mut WebSocketStream<UnixStream>) -> ServerFrame {
         let message = socket.next().await.unwrap().unwrap();
         serde_json::from_str(message.to_text().unwrap()).unwrap()
     }
 
+    fn serve_as(dir: &Path, dashboard: u32) -> (PathBuf, TestHost) {
+        let host = TestHost::new(&dir.join("host")).unwrap();
+        let path = dir.join("tetra.sock");
+        let server = LocalServer {
+            auth: host.service.clone(),
+            peers: PeerPolicy {
+                dashboard: PeerMatch::Uid(dashboard),
+                oobe: PeerMatch::Uid(u32::MAX),
+            },
+            host_fingerprint: "fingerprint".into(),
+        };
+        tokio::spawn(serve(bind(&path).unwrap(), server));
+        (path, host)
+    }
+
+    fn own_uid() -> u32 {
+        nix::unistd::getuid().as_raw()
+    }
+
     #[tokio::test]
-    async fn local_client_can_dispatch_a_module_command() {
-        let controller = SigningKey::from_bytes(&[17_u8; 32]);
+    async fn the_dashboard_peer_gets_hello_and_answers() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tetra.sock");
-        let state = ServerState::load(
-            &dir.path().join("identity"),
-            Some(public_key_fingerprint(&controller.verifying_key())),
-            None,
-        )
-        .unwrap();
-        tokio::spawn(serve(bind(&path).unwrap(), state));
-
-        let stream = UnixStream::connect(&path).await.unwrap();
-        let (mut socket, _) = client_async("ws://localhost/", stream).await.unwrap();
-        let AuthFrame::Challenge {
+        let (path, _host) = serve_as(dir.path(), own_uid());
+        let (mut socket, _) =
+            client_async("ws://localhost/", UnixStream::connect(&path).await.unwrap())
+                .await
+                .unwrap();
+        let ServerFrame::Hello {
+            client,
+            setup_required,
             protocol_version,
-            session_id,
-            challenge,
             ..
-        } = exchange(&mut socket, None).await
+        } = receive(&mut socket).await
         else {
-            panic!("expected challenge")
+            panic!("expected hello")
         };
-        let authenticate = AuthFrame::Authenticate {
-            protocol_version: protocol_version.clone(),
-            session_id: session_id.clone(),
-            public_key: public_key_fingerprint(&controller.verifying_key()),
-            signature: sign_challenge(&controller, &protocol_version, &session_id, &challenge),
-            user: None,
-        };
-        assert!(matches!(
-            exchange(&mut socket, Some(&authenticate)).await,
-            AuthFrame::Response { response } if response.ok
-        ));
+        assert_eq!(client, ClientKind::Dashboard);
+        assert!(setup_required);
+        assert_eq!(protocol_version, crate::auth::api::PROTOCOL_VERSION);
 
-        let timestamp = unix_timestamp();
-        let nonce = "nonce-000000000001".to_owned();
-        let mut command = AgentCommand {
-            id: "cmd-settings".into(),
-            module: "settings".into(),
-            action: "get_system".into(),
-            ..Default::default()
+        let request = ClientFrame::Request(Request {
+            id: "1".into(),
+            token: None,
+            op: "module.dispatch".into(),
+            params: json!({"module": "settings", "action": "get_system"}),
+        });
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&request).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        let ServerFrame::Response(response) = receive(&mut socket).await else {
+            panic!("expected response")
         };
-        command.signature =
-            Some(sign_command(&controller, &command, &session_id, 0, timestamp, &nonce).unwrap());
-        let command = AuthFrame::Command {
-            session_id,
-            sequence: 0,
-            timestamp,
-            nonce,
-            command,
-        };
-        let AuthFrame::Response { response } = exchange(&mut socket, Some(&command)).await else {
-            panic!("expected command response")
-        };
-        assert!(response.ok);
-        assert_eq!(response.id, "cmd-settings");
+        assert_eq!(response.id, "1");
+        assert!(!response.ok, "module commands need a token");
         socket.close(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn other_peers_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _host) = serve_as(dir.path(), own_uid().wrapping_add(1));
+        let (mut socket, _) =
+            client_async("ws://localhost/", UnixStream::connect(&path).await.unwrap())
+                .await
+                .unwrap();
+        assert!(matches!(
+            receive(&mut socket).await,
+            ServerFrame::Error { .. }
+        ));
     }
 
     #[test]
