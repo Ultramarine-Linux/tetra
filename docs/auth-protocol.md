@@ -94,7 +94,7 @@ without an `id`.
 | `wrong_client` | The token or operation belongs to the other local client. |
 | `setup_complete` | Setup has already completed. |
 | `setup_incomplete` | Setup cannot complete yet (no eligible administrator). |
-| `not_found` | No such session, passkey, enrollment or account. |
+| `not_found` | No such session, passkey, enrollment, account or launcher entry (including entries the caller cannot see). |
 | `conflict` | Already enrolled or already registered. |
 | `action_failed` | The module action ran and failed; `message` has its error. |
 | `queue_full` | Tetra's command queue is full; retry after backoff. |
@@ -221,6 +221,19 @@ Errors: `wrong_client` (not the OOBE), `invalid_credentials`,
 `rate_limited` (3 free attempts, then a doubling wait capped at 5 minutes; the
 code is replaced after 20 wrong attempts), `setup_complete`.
 
+### App access check (no token)
+
+**`launcher.can_access`** `{uid, id}` (dashboard only) → `{allowed}`
+
+Whether the account `uid` may open launcher entry `id`, by the same rules as
+`launcher.list` (see [Launcher](#launcher)). For the dashboard's OIDC provider
+and Caddy `forward_auth`, which can run without the user's session (for
+example an app refreshing its tokens). It takes no token because it only
+answers yes or no about an entry, and only to the dashboard; the OOBE gets
+`wrong_client`. `allowed` is `false` for unknown or hidden entries, unknown
+UIDs and accounts that may not log in (see [Who can log in](#who-can-log-in)),
+so the answer does not reveal whether an entry exists.
+
 ### Session
 
 | Op | Params | Result |
@@ -248,13 +261,70 @@ code is replaced after 20 wrong attempts), `setup_complete`.
 
 | Op | Params | Result |
 | --- | --- | --- |
-| `authz.catalog` | | `{pages: [{page, grantable: ["view", "manage"], default}]}` |
+| `authz.catalog` | | `{pages: [{page, label, grantable: ["view", "manage"], default}]}`; `label` is the name to show, such as `"System services"` |
 | `admin.grants_get` | `uid?` | one user's `{uid, grants, effective}` or `{grants: {uid: {page: level}}}` |
 | `admin.grants_set` | `uid, grants: {page: "view" \| "manage" \| null}` | `{uid, grants, effective}`; `null` removes a grant |
 | `admin.sessions_revoke` | `uid` | `{revoked}`; also invalidates sessions not yet loaded |
 | `admin.actions` | `limit?` (100), `origin?` (`local`, `setup`, `remote`) | `{actions: [...]}`, newest first |
 
 `admin.*` operations need an administrator.
+
+### Launcher
+
+The launcher is the dashboard's Services page: the apps a user can open. Each
+entry has an id, a name, an icon, a URL, a visibility, a `public` flag and a
+source.
+
+| Op | Params | Result |
+| --- | --- | --- |
+| `launcher.list` | | `{entries: [entry]}`, the entries the caller can see, in stored order |
+| `launcher.get` | `id` | `{entry}`; `not_found` for missing entries and for entries the caller cannot see alike |
+| `launcher.set` | `id?, entry: {name, icon, url, visibility, public}` | `{entry}`; without `id` adds an entry, with `id` replaces it (`not_found` if there is none) |
+| `launcher.remove` | `id` | `{removed: id}` |
+| `launcher.public_get` | | `{enabled, path}` |
+| `launcher.public_set` | `enabled` | `{enabled, path}` |
+
+`launcher.list` and `launcher.get` need `launcher: view`, which every user
+has. The other operations need an administrator. The setup session has no
+launcher. Changes are recorded in the action log.
+
+An entry as administrators see it:
+
+```json
+{ "id": "Vb3sQe1xKp0a", "name": "Photos", "icon": "lucide:image",
+  "url": "https://photos.example.com/",
+  "visibility": { "kind": "members", "users": ["alice"], "groups": ["media"] },
+  "public": false, "source": "manual" }
+```
+
+Everyone else gets `id`, `name`, `icon` and `url` only: no visibility,
+public flag, source, unit names, status or logs.
+
+- `visibility` is `{"kind": "everyone"}` (every user who can log in),
+  `{"kind": "admins"}`, or `{"kind": "members", "users": [...], "groups":
+  [...]}` (the listed usernames and members of the listed groups, including
+  primary groups). Administrators see and can open every entry. Group
+  membership is read on every request.
+- `icon` is `null`, an icon name (up to 64 letters, digits, `-`, `_`, `.`,
+  `:`; the dashboard decides how to draw it), or a small image as a
+  `data:image/{png,jpeg,gif,webp,svg+xml};base64,…` URL of at most 64 KiB.
+- `url` is any absolute `http` or `https` URL with a host, stored as given.
+- `source` is `manual` for entries added with `launcher.set`. `catalog` is
+  reserved for apps installed from the catalog (not available yet); their URL
+  is built from the app's route and `access.json` (domain mode:
+  `https://<app>.<hostname>/` or `https://<hostname>/<path>/`; IP mode:
+  `https://<ip>:<port>/`, IPv6 in brackets), so it follows changes of the
+  access mode. Replacing an entry keeps its source.
+
+**Public page.** When an administrator enables it with
+`launcher.public_set {enabled: true}`, Tetra writes a static page listing the
+entries marked `public` (names, icons and URLs only, whatever their
+visibility) to `/var/lib/tetra-public/index.html` (`tetra agent-serve
+--public-dir`). The dashboard's Caddy site serves it without a login at
+`/public/`. It is off by default; while it is off the file does not exist and
+the route answers 404. Tetra regenerates the page whenever entries or the
+setting change, after `access.set`, and when it starts. The page loads nothing
+from other origins (its CSP allows only inline styles and `data:` images).
 
 ### Access and setup completion
 
@@ -269,7 +339,8 @@ administrator.
 
 - `access.set` stores `/var/lib/tetra/access.json`, then regenerates the
   dashboard's Caddy site (`/etc/caddy/tetra-sites/00-ultramarine-dashboard.caddy`)
-  and reloads Caddy.
+  and reloads Caddy. The site also routes `/public/` to the launcher's
+  public page.
 - Domain mode (custom domains and Tailscale `*.ts.net` names) uses automatic
   HTTPS and enables passkeys, with the hostname as the RP ID and
   `https://hostname[:port]` as the origin.
@@ -294,8 +365,8 @@ Every dispatched action is recorded in the action log.
 
 - **Administrators** (members of `ultramarine-admin` or `wheel`, checked on
   every action) may run everything.
-- **Other users** have `services: view` by default, plus their grants.
-  `manage` implies `view`.
+- **Other users** have `launcher: view` by default (the Services page: the
+  apps shared with them), plus their grants. `manage` implies `view`.
 - **The setup session** may run only OOBE operations: `settings.get_system`,
   `settings.set_hostname`, `network.configure` and `network.confirm`, all of
   `reverse_proxy.*`,
@@ -306,7 +377,8 @@ Every dispatched action is recorded in the action log.
 
 | Page | `view` | `manage` (grantable) | Administrator only |
 | --- | --- | --- | --- |
-| `services` | `services.list/status/logs` | — | start, stop, restart, enable, disable, daemon_reload |
+| `launcher` (default) | `launcher.list/get` | — | `launcher.set/remove/public_get/public_set` |
+| `system_services` | `services.list/status/logs` (systemd units and their journal; not a default, grant it explicitly) | — | start, stop, restart, enable, disable, daemon_reload |
 | `apps` | `apps.list/get`, `quadlets.list/read/validate/list_files`, `recipes.render_inline/context_inline` | — | apps create/update/remove, quadlets write/delete/install, `recipes.render/context` (read paths as root) |
 | `containers` | `podman.containers/inspect/images/volumes/networks/logs` | — | podman start/stop/restart/remove |
 | `storage` | `storage.list/status/zfs` | — | `storage.mount/unmount/configure` |
@@ -322,7 +394,8 @@ administrator-only: `config_dir` on `reverse_proxy` actions and
 `base_dir`/`files_base_dir` on `quadlets` and `apps` actions. The setup session
 and granted users always get the default directories. Stored grants that are
 no longer grantable (such as `files: view` from an earlier release) are
-ignored.
+ignored. Grants stored under the page's earlier name, `services`, are read as
+`system_services`.
 
 Managing users, reading or writing files (the files module runs as root on
 any path), settings or storage (mounting is root-equivalent), and
@@ -369,12 +442,25 @@ All under `/var/lib/tetra` (`0700`, files `0600`, root only):
 | `auth/setup-code.json` | Encrypted setup code and wrong-attempt state |
 | `faillock/` | `pam_faillock` tally for dashboard password logins only |
 | `access.json` | Access mode, hostname, port, dashboard upstream |
+| `launcher.json` | Launcher entries and the public page setting |
 | `setup-complete` | Setup completion marker |
 | `audit/actions.jsonl` | Action log (rotated at 4 MiB) |
 
+The public page is the one launcher file outside this directory:
+`/var/lib/tetra-public/index.html` (`0644`, directory `0755`), so Caddy can
+read it. It holds only what the page shows.
+
 Every file carries `schema` and `compat` versions. A Tetra build refuses a file
 whose `compat` is newer than it understands, and keeps unknown fields when it
-rewrites a file, so rolling back one release keeps working.
+rewrites a file, so rolling back one release keeps working. Values a newer
+release added to a stored list (a permission page or level, a session's
+client, kind or method, a launcher visibility, source or route kind) are kept
+as they are and grant nothing: unknown grants are ignored, unknown sessions
+are not accepted (and dropped once their `expires_at` passes), entries with
+an unknown visibility are shown to administrators only, and unknown sources
+or route kinds open the stored URL. An `access.json` with an unknown mode
+reads as no access configuration until `access.set` replaces it. Action log
+lines that cannot be read are left out of `admin.actions`.
 
 ## Console recovery
 

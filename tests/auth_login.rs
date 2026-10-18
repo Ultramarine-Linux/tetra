@@ -81,7 +81,7 @@ async fn password_login_issues_a_working_session() {
     assert_eq!(info["user"]["username"], "alice");
     assert_eq!(info["user"]["admin"], false);
     assert_eq!(info["session"]["method"], "password");
-    assert_eq!(info["permissions"], json!({"services": "view"}));
+    assert_eq!(info["permissions"], json!({"launcher": "view"}));
 }
 
 #[tokio::test]

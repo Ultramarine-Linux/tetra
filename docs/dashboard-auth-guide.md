@@ -173,7 +173,11 @@ current code. If a user loses everything, an administrator runs
 
 - `session.info` returns `permissions`:
   - `{"all": true}` for administrators,
-  - `{"services": "view", "network": "manage", …}` for everyone else.
+  - `{"launcher": "view", "network": "manage", …}` for everyone else.
+    `launcher: view` is the default every user has; it backs the Services
+    page (section 8). Systemd units and their logs are the separate
+    `system_services` page, which users only have if an administrator
+    granted it.
 - Show a page when the user has at least `view` on it, and enable mutating
   controls with `manage`.
 - Some actions are administrator-only whatever the grants; see the table in
@@ -183,8 +187,8 @@ current code. If a user loses everything, an administrator runs
 
 The grant editor (administrators only):
 
-1. `authz.catalog` lists the pages and which levels each can be granted.
-   Offer only those.
+1. `authz.catalog` lists the pages, their display `label` and which levels
+   each can be granted. Offer only those.
 2. `admin.grants_get {uid}` shows a user's grants and effective permissions.
 3. `admin.grants_set {uid, grants: {"storage": "view", "network": null}}`
    changes them. `null` removes a grant. Changes apply to the user's next
@@ -194,7 +198,40 @@ Other administrator tools: `session.list {uid}`,
 `admin.sessions_revoke {uid}` (log a user out everywhere) and
 `admin.actions {origin: "remote"}` (remote action log).
 
-## 8. Running module actions
+## 8. The Services page (launcher)
+
+The landing page for every user is the list of apps they can open. Build it
+from `launcher.list` with the user's token; never from `services.*` (those are
+systemd units, and non-administrators normally cannot call them).
+
+- `launcher.list` → `{entries: [{id, name, icon, url}]}`. Tetra has already
+  filtered the list for this user, so show all of it. `icon` is `null`, an
+  icon name or a `data:image/…` URL. Treat every field as untrusted text when
+  rendering, and open `url` as a plain link.
+- `launcher.get {id}` → `{entry}` for the edit form or a deep link. An entry
+  the user cannot see is `not_found`, the same as a deleted one.
+- Administrators also get `visibility`, `public` and `source` on each entry.
+  Show the editor only to them and save with
+  `launcher.set {id?, entry: {name, icon, url, visibility, public}}` (no `id`
+  adds an entry) and `launcher.remove {id}`. `bad_request` carries a message
+  you can show next to the form.
+- The public page is a separate administrator setting:
+  `launcher.public_get` and `launcher.public_set {enabled}`. When enabled,
+  everyone (logged in or not) can see the names, icons and URLs of entries
+  marked `public` at `https://<dashboard>/public/`. Say so next to the
+  switch and the per-entry checkbox.
+
+**Letting users into apps.** When the OIDC provider is about to issue or
+refresh tokens for an app, or a Caddy `forward_auth` request reaches the
+dashboard, ask Tetra with `launcher.can_access {uid, id}` → `{allowed}` and
+refuse unless `allowed` is `true`. `id` is the launcher entry of the app (keep
+the mapping from OIDC client or host to entry id in the dashboard). This
+operation takes no token, so it also works for token refreshes when the user
+has no dashboard session; pass the UID Tetra reported for the user at login
+(`session.info`), never one taken from the request. It applies the same rules
+as the list, so a user can get into exactly the apps they can see.
+
+## 9. Running module actions
 
 Send `module.dispatch {module, action, payload}` with the user's token. Keep
 the existing `dry_run` preview flow from [agent-protocol.md](agent-protocol.md).
@@ -212,7 +249,7 @@ Privileged actions are now authorized per request from the user's admin
 status and grants. Web shell `sudo` still asks for the system password
 separately.
 
-## 9. OOBE flow
+## 10. OOBE flow
 
 1. Connect as `ultramarine-oobe`. `hello.setup_required` tells you whether
    setup is still open.

@@ -232,6 +232,7 @@ impl TestHost {
             caddy_sites_dir: root.join("etc/caddy/tetra-sites"),
             reload_caddy: false,
             dashboard_upstream: super::access::DEFAULT_DASHBOARD_UPSTREAM.to_owned(),
+            public_dir: root.join("var/lib/tetra-public"),
             session_policy: super::sessions::SessionPolicy::default(),
         };
         let accounts = Arc::new(StaticAccounts::default());

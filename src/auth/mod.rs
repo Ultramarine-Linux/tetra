@@ -14,6 +14,7 @@ pub mod api;
 pub mod audit;
 pub mod authz;
 pub mod clock;
+pub mod launcher;
 pub mod pam;
 pub mod passkey;
 pub mod recovery;

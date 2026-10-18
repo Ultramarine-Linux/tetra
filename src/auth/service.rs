@@ -28,6 +28,7 @@ use super::{
     audit::{self, AuditLog, Origin},
     authz::{self, GrantStore, Level, Page, Principal},
     clock::Clock,
+    launcher::{ChangeError, EntryInput, LauncherStore, Viewer},
     pam::{PamOutcome, PasswordBackend},
     passkey::{self, Authentication, AuthenticationState, CEREMONY_TTL, Pending, Registration},
     recovery,
@@ -73,6 +74,8 @@ pub struct AuthConfig {
     /// Dashboard address for the Caddy site when `access.set` does not name
     /// one.
     pub dashboard_upstream: String,
+    /// Where the launcher's public page is written, readable by Caddy.
+    pub public_dir: PathBuf,
     pub session_policy: SessionPolicy,
 }
 
@@ -87,6 +90,7 @@ impl AuthConfig {
             caddy_sites_dir: "/etc/caddy/tetra-sites".into(),
             reload_caddy: true,
             dashboard_upstream: super::access::DEFAULT_DASHBOARD_UPSTREAM.to_owned(),
+            public_dir: super::launcher::DEFAULT_PUBLIC_DIR.into(),
             session_policy: SessionPolicy::default(),
         }
     }
@@ -99,6 +103,11 @@ impl AuthConfig {
     #[must_use]
     pub fn access_path(&self) -> PathBuf {
         self.state_dir.join("access.json")
+    }
+
+    #[must_use]
+    pub fn launcher_path(&self) -> PathBuf {
+        self.state_dir.join("launcher.json")
     }
 
     #[must_use]
@@ -152,6 +161,7 @@ struct Inner {
     queue: DispatchQueue,
     users: UserStore,
     grants: GrantStore,
+    launcher: LauncherStore,
     sessions: SessionStore,
     setup: Setup,
     audit: AuditLog,
@@ -169,6 +179,9 @@ struct Caller {
     client: ClientKind,
     session: Session,
     principal: Principal,
+    /// The user's groups, for launcher visibility. Empty for other
+    /// principals.
+    groups: Vec<String>,
 }
 
 impl Caller {
@@ -189,6 +202,34 @@ impl Caller {
         } else {
             Err(ApiError::forbidden("this operation needs an administrator"))
         }
+    }
+
+    /// Check `module.action` against the authorization table.
+    fn authorize(&self, module: &str, action: &str) -> Result<(), ApiError> {
+        if self.principal.allows(module, action) {
+            return Ok(());
+        }
+        let reason = match (&self.principal, authz::requirement(module, action)) {
+            (Principal::Setup, _) => "the setup session may only run OOBE operations".to_owned(),
+            (_, authz::Requirement::Page(page, level)) => format!(
+                "{module}.{action} needs {} permission on {}",
+                json_value(&level).as_str().unwrap_or_default(),
+                json_value(&page).as_str().unwrap_or_default()
+            ),
+            _ => format!("{module}.{action} is limited to administrators"),
+        };
+        Err(ApiError::forbidden(reason))
+    }
+
+    /// The caller as a launcher viewer, after checking `launcher.action`.
+    fn viewer(&self, action: &str) -> Result<Viewer, ApiError> {
+        self.authorize("launcher", action)?;
+        let (_, username) = self.user()?;
+        Ok(Viewer {
+            username: username.to_owned(),
+            groups: self.groups.clone(),
+            admin: self.is_admin(),
+        })
     }
 
     fn require_setup_or_admin(&self) -> Result<(), ApiError> {
@@ -279,10 +320,22 @@ impl AuthService {
                 None
             }
         };
+        let launcher = LauncherStore::new(config.launcher_path(), config.public_dir.clone());
+        // Bring the public page in line with the stored entries, for example
+        // after a rollback or a manual edit.
+        if let Err(error) = launcher.refresh_public_page(
+            AccessConfig::load(&config.access_path())
+                .ok()
+                .flatten()
+                .as_ref(),
+        ) {
+            eprintln!("failed to write the launcher's public page: {error:#}");
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 users: UserStore::new(auth_dir.join("users")),
                 grants: GrantStore::new(auth_dir.join("grants.json")),
+                launcher,
                 setup: Setup::new(config.setup_paths()),
                 audit: AuditLog::new(config.state_dir.join("audit")),
                 sessions,
@@ -361,6 +414,7 @@ impl AuthService {
             "auth.passkey_finish" => return self.auth_passkey_finish(client, params(p)?).await,
             "setup.status" => return self.setup_status(client, request.token.as_deref()),
             "setup.redeem" => return self.setup_redeem(client, &params(p)?),
+            "launcher.can_access" => return self.launcher_can_access(client, &params(p)?),
             _ => {}
         }
         let caller = self.authenticate(client, request.token.as_deref())?;
@@ -383,6 +437,12 @@ impl AuthService {
             "admin.grants_set" => self.grants_set(&caller, &params(p)?),
             "admin.sessions_revoke" => self.admin_sessions_revoke(&caller, params(p)?),
             "admin.actions" => self.admin_actions(&caller, params(p)?),
+            "launcher.list" => self.launcher_list(&caller),
+            "launcher.get" => self.launcher_get(&caller, &params(p)?),
+            "launcher.set" => self.launcher_set(&caller, params(p)?),
+            "launcher.remove" => self.launcher_remove(&caller, &params(p)?),
+            "launcher.public_get" => self.launcher_public_get(&caller),
+            "launcher.public_set" => self.launcher_public_set(&caller, params(p)?),
             "access.get" => self.access_get(),
             "access.set" => self.access_set(&caller, params(p)?).await,
             "setup.complete" => self.setup_complete(&caller),
@@ -483,6 +543,7 @@ impl AuthService {
             self.inner.sessions.revoke(|s| s.id == id).ok();
             ApiError::unauthenticated()
         };
+        let mut groups = Vec::new();
         let principal = match session.kind {
             SessionKind::Setup => {
                 if self.inner.setup.is_complete() {
@@ -506,6 +567,7 @@ impl AuthService {
                     return Err(revoke(&session));
                 }
                 let admin = account.is_admin();
+                groups = account.groups;
                 Principal::User {
                     uid,
                     username,
@@ -522,6 +584,7 @@ impl AuthService {
             client,
             session,
             principal,
+            groups,
         })
     }
 
@@ -1484,6 +1547,11 @@ impl AuthService {
         // Ceremonies in flight were made for the previous relying party.
         self.inner.registrations.remove_where(|_| true);
         self.inner.authentications.remove_where(|_| true);
+        // Catalog entries' URLs depend on the access configuration. The
+        // access change itself has already been applied.
+        if let Err(error) = self.inner.launcher.refresh_public_page(Some(&config)) {
+            eprintln!("failed to write the launcher's public page: {error:#}");
+        }
         self.record_action(caller, "access-set", "access", "set", Ok(()));
         Ok(jsonf! {
             "access": config,
@@ -1494,7 +1562,7 @@ impl AuthService {
 
     #[cfg(feature = "reverse-proxy")]
     async fn write_dashboard_site(&self, config: &AccessConfig) -> Result<Value, ApiError> {
-        let site = config.dashboard_site();
+        let site = config.dashboard_site(Some(&self.inner.config.public_dir));
         let dir = self.inner.config.caddy_sites_dir.clone();
         let reload = self.inner.config.reload_caddy;
         Ok(tokio::task::spawn_blocking(move || {
@@ -1502,6 +1570,122 @@ impl AuthService {
         })
         .await
         .map_err(|error| anyhow::anyhow!(error))??)
+    }
+
+    // --- Launcher --------------------------------------------------------
+
+    fn access(&self) -> Option<AccessConfig> {
+        AccessConfig::load(&self.inner.config.access_path()).unwrap_or_else(|error| {
+            eprintln!("ignoring the access configuration: {error:#}");
+            None
+        })
+    }
+
+    fn launcher_list(&self, caller: &Caller) -> ApiResult {
+        let viewer = caller.viewer("list")?;
+        let access = self.access();
+        let entries: Vec<Value> = self
+            .inner
+            .launcher
+            .visible(&viewer)?
+            .iter()
+            .map(|entry| entry.to_json(viewer.admin, access.as_ref()))
+            .collect();
+        Ok(jsonf! { entries })
+    }
+
+    fn launcher_get(&self, caller: &Caller, p: &LauncherIdParams) -> ApiResult {
+        let viewer = caller.viewer("get")?;
+        // Hidden entries are `not_found` too, so callers cannot tell them
+        // from missing ones.
+        let entry = self
+            .inner
+            .launcher
+            .get(&p.id, &viewer)?
+            .ok_or_else(launcher_not_found)?;
+        Ok(jsonf! { "entry": entry.to_json(viewer.admin, self.access().as_ref()) })
+    }
+
+    fn launcher_set(&self, caller: &Caller, p: LauncherSetParams) -> ApiResult {
+        caller.authorize("launcher", "set")?;
+        let access = self.access();
+        let entry = self
+            .inner
+            .launcher
+            .set(p.id.as_deref(), p.entry, access.as_ref())?
+            .map_err(launcher_change_error)?;
+        self.record_action(
+            caller,
+            &format!("launcher-set:{}", entry.id),
+            "launcher",
+            "set",
+            Ok(()),
+        );
+        Ok(jsonf! { "entry": entry.to_json(true, access.as_ref()) })
+    }
+
+    fn launcher_remove(&self, caller: &Caller, p: &LauncherIdParams) -> ApiResult {
+        caller.authorize("launcher", "remove")?;
+        self.inner
+            .launcher
+            .remove(&p.id, self.access().as_ref())?
+            .map_err(launcher_change_error)?;
+        self.record_action(
+            caller,
+            &format!("launcher-remove:{}", p.id),
+            "launcher",
+            "remove",
+            Ok(()),
+        );
+        Ok(jsonf! { "removed": p.id })
+    }
+
+    fn launcher_public_json(&self) -> ApiResult {
+        Ok(jsonf! {
+            "enabled": self.inner.launcher.load()?.public_page,
+            "path": self.inner.launcher.public_page_path(),
+        })
+    }
+
+    fn launcher_public_get(&self, caller: &Caller) -> ApiResult {
+        caller.authorize("launcher", "public_get")?;
+        self.launcher_public_json()
+    }
+
+    fn launcher_public_set(&self, caller: &Caller, p: LauncherPublicParams) -> ApiResult {
+        caller.authorize("launcher", "public_set")?;
+        self.inner
+            .launcher
+            .set_public_page(p.enabled, self.access().as_ref())?;
+        self.record_action(
+            caller,
+            "launcher-public-set",
+            "launcher",
+            "public_set",
+            Ok(()),
+        );
+        self.launcher_public_json()
+    }
+
+    /// Whether `uid` may open entry `id`: for the dashboard's OIDC provider
+    /// and Caddy `forward_auth`, which may run without the user's session (a
+    /// token refresh, for example). Dashboard only; no token. Accounts that
+    /// may not log in, unknown entries and hidden entries are all `false`.
+    fn launcher_can_access(&self, client: ClientKind, p: &CanAccessParams) -> ApiResult {
+        require_client(client, ClientKind::Dashboard)?;
+        let viewer = match self.inner.accounts.by_uid(p.uid)? {
+            Some(account) if self.inner.policy.check(&account).is_ok() => Some(Viewer {
+                admin: account.is_admin(),
+                username: account.name,
+                groups: account.groups,
+            }),
+            _ => None,
+        };
+        let allowed = match viewer {
+            Some(viewer) => self.inner.launcher.get(&p.id, &viewer)?.is_some(),
+            None => false,
+        };
+        Ok(jsonf! { allowed })
     }
 
     // --- Module actions --------------------------------------------------
@@ -1537,22 +1721,7 @@ impl AuthService {
     }
 
     async fn dispatch(&self, caller: &Caller, id: &str, p: DispatchParams) -> ApiResult {
-        if !caller.principal.allows(&p.module, &p.action) {
-            let reason = match (&caller.principal, authz::requirement(&p.module, &p.action)) {
-                (Principal::Setup, _) => {
-                    "the setup session may only run OOBE operations".to_owned()
-                }
-                (_, authz::Requirement::Page(page, level)) => format!(
-                    "{}.{} needs {} permission on {}",
-                    p.module,
-                    p.action,
-                    json_value(&level).as_str().unwrap_or_default(),
-                    json_value(&page).as_str().unwrap_or_default()
-                ),
-                _ => format!("{}.{} is limited to administrators", p.module, p.action),
-            };
-            return Err(ApiError::forbidden(reason));
-        }
+        caller.authorize(&p.module, &p.action)?;
         if let Some(field) = authz::admin_only_field(&p.module, &p.payload)
             && !matches!(caller.principal, Principal::RemoteController)
             && !caller.is_admin()
@@ -1646,6 +1815,17 @@ pub fn reset_second_factor(
 
 fn json_value<T: Serialize>(value: &T) -> Value {
     serde_json::to_value(value).unwrap_or(Value::Null)
+}
+
+fn launcher_not_found() -> ApiError {
+    ApiError::new(ErrorCode::NotFound, "no such entry")
+}
+
+fn launcher_change_error(error: ChangeError) -> ApiError {
+    match error {
+        ChangeError::NotFound => launcher_not_found(),
+        ChangeError::Invalid(message) => ApiError::bad_request(message),
+    }
 }
 
 fn passkey_name(name: Option<String>) -> Result<String, ApiError> {
@@ -1839,6 +2019,34 @@ struct GrantsSetParams {
     uid: u32,
     /// `{page: "view" | "manage" | null}`; `null` removes the grant.
     grants: BTreeMap<Page, Option<Level>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LauncherIdParams {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LauncherSetParams {
+    /// The entry to replace; a new entry is added without one.
+    #[serde(default)]
+    id: Option<String>,
+    entry: EntryInput,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LauncherPublicParams {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanAccessParams {
+    uid: u32,
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
