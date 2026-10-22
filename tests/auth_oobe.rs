@@ -624,14 +624,22 @@ async fn dns_01_credentials_reach_caddy_only_through_its_environment() {
     // Caddy gets it from a group-readable environment file.
     let env = std::fs::read_to_string(&host.config.caddy_env_file).unwrap();
     assert!(env.contains(&format!("TETRA_DNS_API_TOKEN=\"{DNS_TOKEN}\"\n")));
-    assert_eq!(
-        std::fs::metadata(&host.config.caddy_env_file)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
+    // As root (as in CI) it belongs to `root:caddy`, or is root-only when
+    // there is no `caddy` group.
+    let metadata = std::fs::metadata(&host.config.caddy_env_file).unwrap();
+    let caddy = nix::unistd::Group::from_name("caddy").unwrap();
+    let mode = if nix::unistd::geteuid().is_root() && caddy.is_none() {
+        0o600
+    } else {
         0o640
-    );
+    };
+    assert_eq!(metadata.permissions().mode() & 0o777, mode);
+    if nix::unistd::geteuid().is_root()
+        && let Some(caddy) = caddy
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!((metadata.uid(), metadata.gid()), (0, caddy.gid.as_raw()));
+    }
     let drop_in = std::fs::read_to_string(
         host.config
             .systemd_dir
