@@ -33,18 +33,24 @@ fn fresh(dir: &std::path::Path) -> TestHost {
 }
 
 async fn setup_token(host: &TestHost) -> String {
+    setup_session(host).await.0
+}
+
+/// A setup session's token and public ID.
+async fn setup_session(host: &TestHost) -> (String, String) {
     let code = host.service.publish_setup_code().unwrap().unwrap();
-    ok(
+    let session = ok(
         &host.service,
         Oobe,
         None,
         "setup.redeem",
         json!({"code": code, "remote_addr": "192.0.2.50"}),
     )
-    .await["token"]
-        .as_str()
-        .unwrap()
-        .to_owned()
+    .await;
+    (
+        session["token"].as_str().unwrap().to_owned(),
+        session["session"]["id"].as_str().unwrap().to_owned(),
+    )
 }
 
 async fn dispatch(
@@ -241,6 +247,111 @@ async fn add_admin_is_only_for_the_first_administrator() {
         "users",
         "update",
         json!({"name": "alice", "groups": ["wheel"], "dry_run": true}),
+    )
+    .await;
+    assert_eq!(response.error.unwrap().code, ErrorCode::Forbidden);
+}
+
+#[tokio::test]
+async fn the_setup_session_only_sets_up_accounts_it_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = fresh(dir.path());
+    let (token, session) = setup_session(&host).await;
+    // An administrator Readymade created, and root.
+    host.accounts.add("admin", 1001, &["ultramarine-admin"]);
+    host.accounts.add("root", 0, &["root"]);
+    let set_password = |name: &'static str| {
+        dispatch(
+            &host,
+            &token,
+            "users",
+            "set_password",
+            json!({"name": name, "password_hash": "$y$j9T$hash", "dry_run": true}),
+        )
+    };
+    let set_keys = |name: &'static str| {
+        dispatch(
+            &host,
+            &token,
+            "users",
+            "set_authorized_keys",
+            json!({"name": name, "keys": ["ssh-ed25519 AAAAC3Nza attacker"], "dry_run": true}),
+        )
+    };
+
+    // A dry-run users.create does not make the account the session's.
+    let response = dispatch(
+        &host,
+        &token,
+        "users",
+        "create",
+        json!({"name": "alice", "dry_run": true}),
+    )
+    .await;
+    assert!(response.ok, "{:?}", response.error);
+    assert_eq!(
+        set_password("alice").await.error.unwrap().code,
+        ErrorCode::Forbidden
+    );
+
+    host.record_setup_account(&session, "alice").unwrap();
+    let response = set_password("alice").await;
+    assert!(response.ok, "{:?}", response.error);
+    // Not forbidden; it only fails because the test host has no `alice`.
+    let response = set_keys("alice").await;
+    assert_ne!(response.error.unwrap().code, ErrorCode::Forbidden);
+
+    for name in ["admin", "root", "nobody-here"] {
+        for response in [set_password(name).await, set_keys(name).await] {
+            assert_eq!(response.error.unwrap().code, ErrorCode::Forbidden, "{name}");
+        }
+    }
+    // Root stays off limits even if the session somehow recorded it.
+    host.record_setup_account(&session, "root").unwrap();
+    for response in [set_password("root").await, set_keys("root").await] {
+        assert_eq!(response.error.unwrap().code, ErrorCode::Forbidden);
+    }
+
+    // The record is kept with the session, across a Tetra restart.
+    let service = host.restart().unwrap();
+    let response = call(
+        &service,
+        Oobe,
+        Some(&token),
+        "module.dispatch",
+        json!({
+            "module": "users",
+            "action": "set_password",
+            "payload": {"name": "alice", "password_hash": "$y$j9T$hash", "dry_run": true},
+        }),
+    )
+    .await;
+    assert!(response.ok, "{:?}", response.error);
+
+    // A new setup session starts with no accounts of its own.
+    let (token, _) = setup_session(&host).await;
+    let response = dispatch(
+        &host,
+        &token,
+        "users",
+        "set_password",
+        json!({"name": "alice", "password_hash": "$y$j9T$hash", "dry_run": true}),
+    )
+    .await;
+    assert_eq!(response.error.unwrap().code, ErrorCode::Forbidden);
+}
+
+#[tokio::test]
+async fn the_setup_session_may_not_choose_a_home_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = fresh(dir.path());
+    let token = setup_token(&host).await;
+    let response = dispatch(
+        &host,
+        &token,
+        "users",
+        "create",
+        json!({"name": "alice", "home": "/root", "dry_run": true}),
     )
     .await;
     assert_eq!(response.error.unwrap().code, ErrorCode::Forbidden);

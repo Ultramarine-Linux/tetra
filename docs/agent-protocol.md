@@ -1581,6 +1581,8 @@ account:
 
 The group must exist on the host. A setup session may only call `add_admin`
 while no eligible administrator exists (see `docs/auth-protocol.md`).
+A setup session may only call `set_password` and `set_authorized_keys` on
+accounts it created with `create`, never on `root`, and may not set `home`.
 
 ### virtual_machines
 

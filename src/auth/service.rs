@@ -2109,6 +2109,45 @@ impl AuthService {
         });
     }
 
+    /// Record that the setup session `session_id` created the account
+    /// `name`, which lets it set that account's password and SSH keys.
+    pub(crate) fn record_setup_account(&self, session_id: &str, name: &str) -> Result<()> {
+        self.inner.sessions.add_created_account(session_id, name)
+    }
+
+    /// Refuse a setup-session `module.action` on any account but one the
+    /// session created with `users.create`, and always on `root`.
+    fn require_setup_account(
+        &self,
+        caller: &Caller,
+        module: &str,
+        action: &str,
+        payload: &Value,
+    ) -> Result<(), ApiError> {
+        let name = payload
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let root = name == "root"
+            || self
+                .inner
+                .accounts
+                .by_name(name)?
+                .is_some_and(|account| account.uid == 0);
+        if root
+            || !caller
+                .session
+                .created_accounts
+                .iter()
+                .any(|created| created == name)
+        {
+            return Err(ApiError::forbidden(format!(
+                "the setup session may only run {module}.{action} on accounts it created, never root"
+            )));
+        }
+        Ok(())
+    }
+
     async fn dispatch(&self, caller: &Caller, id: &str, p: DispatchParams) -> ApiResult {
         if caller.principal == Principal::Setup
             && authz::setup_needs_no_admin(&p.module, &p.action)
@@ -2120,6 +2159,11 @@ impl AuthService {
             )));
         }
         caller.authorize(&p.module, &p.action)?;
+        if caller.principal == Principal::Setup
+            && authz::setup_own_accounts_only(&p.module, &p.action)
+        {
+            self.require_setup_account(caller, &p.module, &p.action, &p.payload)?;
+        }
         if let Some(field) = authz::admin_only_field(&p.module, &p.payload)
             && !matches!(caller.principal, Principal::RemoteController)
             && !caller.is_admin()
@@ -2133,6 +2177,22 @@ impl AuthService {
             Principal::User { username, .. } => Some(username.clone()),
             _ => None,
         };
+        // Accounts the setup session creates are the ones it may then set up.
+        let created = (caller.principal == Principal::Setup
+            && p.module == "users"
+            && p.action == "create"
+            && !p
+                .payload
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))
+        .then(|| {
+            p.payload
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .flatten();
         let command = AgentCommand {
             id: id.to_owned(),
             module: p.module.clone(),
@@ -2160,6 +2220,11 @@ impl AuthService {
             &p.action,
             response.error.as_deref().map_or(Ok(()), Err),
         );
+        if response.ok
+            && let Some(name) = created
+        {
+            self.record_setup_account(&caller.session.id, &name)?;
+        }
         if response.ok {
             Ok(response.payload.unwrap_or(Value::Null))
         } else {

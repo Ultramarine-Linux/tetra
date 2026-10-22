@@ -455,7 +455,10 @@ Every dispatched action is recorded in the action log.
   No `services.*`, no raw network configuration (`network.get_config/set_config`),
   no `reverse_proxy.*` and no `users.update` (which can change group
   memberships). `users.add_admin` is refused once an eligible administrator
-  exists. Of the socket operations it may only use `session.info`,
+  exists. `users.set_password` and `users.set_authorized_keys` only accept an
+  account the same setup session created with `users.create` (not a dry run),
+  and never `root`, so the setup code cannot take over an existing account
+  such as an administrator Readymade created. Of the socket operations it may only use `session.info`,
   `session.logout`, `setup.status`, `setup.complete`, `access.get`,
   `access.set` and `module.dispatch` (`SETUP_OPERATIONS`); anything else is
   `forbidden`.
@@ -477,8 +480,9 @@ Every dispatched action is recorded in the action log.
 | `files` | — | — | `files.read/write` |
 
 Payload fields that point an action at arbitrary host paths are
-administrator-only: `config_dir` on `reverse_proxy` actions and
-`base_dir`/`files_base_dir` on `quadlets` and `apps` actions. The setup session
+administrator-only: `config_dir` on `reverse_proxy` actions,
+`base_dir`/`files_base_dir` on `quadlets` and `apps` actions, and `home` on
+`users` actions. The setup session
 and granted users always get the default directories. Stored grants that are
 no longer grantable (such as `files: view` from an earlier release) are
 ignored. Grants stored under the page's earlier name, `services`, are read as

@@ -317,6 +317,15 @@ impl TestHost {
         })
     }
 
+    /// Record that the setup session `session_id` created `name`, as a
+    /// successful `users.create` does (tests cannot run `useradd`).
+    ///
+    /// # Errors
+    /// Fails when the session is gone or cannot be written.
+    pub fn record_setup_account(&self, session_id: &str, name: &str) -> Result<()> {
+        self.service.record_setup_account(session_id, name)
+    }
+
     /// Re-create the service over the same directories and fakes, as after a
     /// Tetra restart.
     ///

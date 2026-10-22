@@ -272,7 +272,9 @@ with the setup session.
      `users.create {name}`, `users.set_password {name, password_hash}`, then
      `users.add_admin {name}` (adds `ultramarine-admin`; refused once an
      administrator exists). Optionally `users.set_authorized_keys {name, keys}`
-     to install SSH keys;
+     to install SSH keys. The setup session may only set the password and keys
+     of accounts it created itself (never `root` or an existing administrator),
+     and may not pass `home` to `users.create`;
    - hostname (`settings.set_hostname`) and network: `network.interfaces` and
      `network.status` to show the current state; for Wi-Fi,
      `network.scan_wifi {interface}` and `network.connect_wifi {interface,

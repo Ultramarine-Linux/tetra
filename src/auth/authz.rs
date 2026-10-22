@@ -285,6 +285,14 @@ pub const SETUP_ALLOWED: &[(&str, &str)] = &[
 /// a host installed with one by Readymade).
 pub const SETUP_ONLY_WITHOUT_ADMIN: &[(&str, &str)] = &[("users", "add_admin")];
 
+/// Setup actions limited to accounts the same setup session created.
+///
+/// The `name` must be an account `users.create` made in that session, and
+/// never `root`, so the setup code cannot take over an existing account (for
+/// example an administrator Readymade created).
+pub const SETUP_OWN_ACCOUNTS_ONLY: &[(&str, &str)] =
+    &[("users", "set_password"), ("users", "set_authorized_keys")];
+
 /// The socket operations (other than login and `setup.redeem`) the setup
 /// session may use.
 ///
@@ -310,6 +318,9 @@ const ADMIN_ONLY_FIELDS: &[(&str, &str)] = &[
     ("quadlets", "files_base_dir"),
     ("apps", "base_dir"),
     ("apps", "files_base_dir"),
+    // A new account sharing another's home could replace that account's SSH
+    // keys with `set_authorized_keys`.
+    ("users", "home"),
 ];
 
 /// The first admin-only field set in a `module` payload, if any.
@@ -346,6 +357,15 @@ pub fn setup_allows(module: &str, action: &str) -> bool {
 #[must_use]
 pub fn setup_needs_no_admin(module: &str, action: &str) -> bool {
     SETUP_ONLY_WITHOUT_ADMIN
+        .iter()
+        .any(|(m, a)| *m == module && *a == action)
+}
+
+/// Whether the setup session may run `module.action` only on accounts it
+/// created.
+#[must_use]
+pub fn setup_own_accounts_only(module: &str, action: &str) -> bool {
+    SETUP_OWN_ACCOUNTS_ONLY
         .iter()
         .any(|(m, a)| *m == module && *a == action)
 }
@@ -728,6 +748,13 @@ mod tests {
         }
         assert!(setup_needs_no_admin("users", "add_admin"));
         assert!(!setup_needs_no_admin("users", "create"));
+        assert!(setup_own_accounts_only("users", "set_password"));
+        assert!(setup_own_accounts_only("users", "set_authorized_keys"));
+        assert!(!setup_own_accounts_only("users", "create"));
+        assert_eq!(
+            admin_only_field("users", &serde_json::json!({"home": "/root"})),
+            Some("home")
+        );
     }
 
     #[test]
