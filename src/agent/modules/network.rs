@@ -3,8 +3,9 @@
 //! This module splits host networking into two concerns:
 //!
 //! - *Live state* (`interfaces`, `status`) is read from `/sys/class/net` sysfs
-//!   and `ip -json addr show`, so callers can see what is currently up. Both
-//!   report every address with a scope (`global`, `private`, `ula`,
+//!   and `ip -json addr show`, so callers can see what is currently up.
+//!   `interfaces` reports each interface's [`InterfaceKind`] (`wifi`,
+//!   `ethernet`, or `other`) as `type`. Both report every address with a scope (`global`, `private`, `ula`,
 //!   `link-local`, ...) derived from its prefix; see [`addresses`].
 //! - *Persistent configuration* is managed as NetworkManager *keyfiles*:
 //!   INI-style `.nmconnection` profiles under
@@ -109,7 +110,7 @@ actions!(Action [payload user] => {
             .and_then(|result: CommandResult| serde_json::from_str(&result.stdout).ok())
             .map(|data: Value| parse_ip_addr_json(&data))
             .unwrap_or_default();
-        Ok(jsonf! { "interfaces": read_interfaces(&addresses).unwrap_or_default() })
+        Ok(jsonf! { "interfaces": read_interfaces(Path::new(SYSFS_NET), &addresses).unwrap_or_default() })
     },
     Status: NetworkInterfaceRequest => {
         // `ip -json addr show` returns structured JSON we pass through
@@ -358,18 +359,53 @@ fn restorecon(path: &Path, dry_run: bool) -> Result<Vec<Value>> {
     Ok(vec![crate::cmd!((dry_run) "restorecon" ["-v", &*path] json)?])
 }
 
+/// Where the kernel lists network interfaces.
+const SYSFS_NET: &str = "/sys/class/net";
+
+/// What kind of device an interface is, as reported in `interfaces` and
+/// checked by `configure` (Ethernet) and the Wi-Fi actions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum InterfaceKind {
+    /// A wireless (cfg80211) device.
+    Wifi,
+    /// A physical Ethernet device: link type `ARPHRD_ETHER`, backed by a
+    /// device, and not wireless.
+    Ethernet,
+    /// Anything else: loopback, bridges, veth, tun, and other virtual links.
+    Other,
+}
+
+/// Classifies the interface whose sysfs directory is `dir`
+/// (`/sys/class/net/<interface>`). Missing attributes count as absent.
+fn interface_kind(dir: &Path) -> InterfaceKind {
+    let is_wlan = fs::read_to_string(dir.join("uevent"))
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line == "DEVTYPE=wlan");
+    if is_wlan || dir.join("wireless").exists() || dir.join("phy80211").exists() {
+        return InterfaceKind::Wifi;
+    }
+    // `type` 1 is ARPHRD_ETHER; only physical devices have a `device` link.
+    let link_type = fs::read_to_string(dir.join("type")).unwrap_or_default();
+    if link_type.trim() == "1" && dir.join("device").exists() {
+        return InterfaceKind::Ethernet;
+    }
+    InterfaceKind::Other
+}
+
+/// Classifies `interface`, failing if the host has no such interface.
+fn existing_interface_kind(interface: &str) -> Result<InterfaceKind> {
+    let dir = Path::new(SYSFS_NET).join(interface);
+    ensure!(dir.exists(), "interface `{interface}` does not exist");
+    Ok(interface_kind(&dir))
+}
+
 /// `configure` writes `type=ethernet` profiles; refuse anything else so a
 /// wrong interface choice fails up front instead of at activation.
 fn ensure_ethernet(interface: &str) -> Result<()> {
-    let sysfs = Path::new("/sys/class/net").join(interface);
-    ensure!(sysfs.exists(), "interface `{interface}` does not exist");
-    let link_type = fs::read_to_string(sysfs.join("type")).unwrap_or_default();
-    let has_devtype = fs::read_to_string(sysfs.join("uevent"))
-        .unwrap_or_default()
-        .lines()
-        .any(|line| line.starts_with("DEVTYPE="));
     ensure!(
-        link_type.trim() == "1" && !has_devtype && !sysfs.join("wireless").exists(),
+        existing_interface_kind(interface)? == InterfaceKind::Ethernet,
         "interface `{interface}` is not an Ethernet device"
     );
     Ok(())
@@ -377,14 +413,8 @@ fn ensure_ethernet(interface: &str) -> Result<()> {
 
 /// `scan_wifi` and `connect_wifi` need a wireless device.
 fn ensure_wireless(interface: &str) -> Result<()> {
-    let sysfs = Path::new("/sys/class/net").join(interface);
-    ensure!(sysfs.exists(), "interface `{interface}` does not exist");
-    let is_wlan = fs::read_to_string(sysfs.join("uevent"))
-        .unwrap_or_default()
-        .lines()
-        .any(|line| line == "DEVTYPE=wlan");
     ensure!(
-        is_wlan || sysfs.join("wireless").exists(),
+        existing_interface_kind(interface)? == InterfaceKind::Wifi,
         "interface `{interface}` is not a Wi-Fi device"
     );
     Ok(())
@@ -445,17 +475,20 @@ fn read_optional(path: &str) -> Option<String> {
         .map(|contents| contents.trim().to_owned())
 }
 
-/// Reads the live interface list from `/sys/class/net` sysfs.
+/// Reads the live interface list from `sysfs_root` (`/sys/class/net`).
 ///
 /// Each entry exposes `operstate` (up/down) and `address` (MAC) as plain text
 /// files. Missing attributes are tolerated via `unwrap_or_default` (e.g.
 /// virtual or bond devices may not report an operstate), so a single unreadable
-/// file does not fail the whole snapshot. Each interface also lists its IPv4
-/// and IPv6 `addresses` from `addresses`. Results are sorted by name for stable
-/// output to the control plane.
-fn read_interfaces(addresses: &[InterfaceAddress]) -> Result<Vec<Value>> {
+/// file does not fail the whole snapshot. Each interface also reports its
+/// [`InterfaceKind`] as `type` and lists its IPv4 and IPv6 `addresses` from
+/// `addresses`. Results are sorted by name for stable output to the control
+/// plane.
+fn read_interfaces(sysfs_root: &Path, addresses: &[InterfaceAddress]) -> Result<Vec<Value>> {
     let mut interfaces = Vec::new();
-    for entry in fs::read_dir("/sys/class/net").context("failed to read /sys/class/net")? {
+    let entries = fs::read_dir(sysfs_root)
+        .with_context(|| format!("failed to read {}", sysfs_root.display()))?;
+    for entry in entries {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let operstate = fs::read_to_string(entry.path().join("operstate"))
@@ -470,7 +503,8 @@ fn read_interfaces(addresses: &[InterfaceAddress]) -> Result<Vec<Value>> {
             .iter()
             .filter(|address| address.interface == name)
             .collect();
-        interfaces.push(jsonf! { name, operstate, "mac": address, addresses });
+        let kind = interface_kind(&entry.path());
+        interfaces.push(jsonf! { name, "type": kind, operstate, "mac": address, addresses });
     }
     interfaces.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
     Ok(interfaces)
@@ -921,16 +955,67 @@ mod tests {
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
+    /// Builds a fake sysfs whose `class/net` (the returned path) holds a
+    /// Wi-Fi card, a physical NIC, a veth, a bridge, a tun, and loopback,
+    /// laid out like the kernel's.
+    fn fake_sysfs() -> (tempfile::TempDir, PathBuf) {
+        let sysfs = tempfile::tempdir().unwrap();
+        let net = sysfs.path().join("class/net");
+        let devices = sysfs.path().join("devices");
+        let iface = |name: &str, link_type: &str, uevent: &str, device: bool, extra: &[&str]| {
+            let dir = net.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("type"), format!("{link_type}\n")).unwrap();
+            fs::write(dir.join("uevent"), format!("INTERFACE={name}\n{uevent}")).unwrap();
+            fs::write(dir.join("operstate"), "up\n").unwrap();
+            if device {
+                let target = devices.join(name);
+                fs::create_dir_all(&target).unwrap();
+                std::os::unix::fs::symlink(&target, dir.join("device")).unwrap();
+            }
+            for entry in extra {
+                fs::create_dir_all(dir.join(entry)).unwrap();
+            }
+        };
+        iface("wlan0", "1", "DEVTYPE=wlan\n", true, &["wireless", "phy80211"]);
+        iface("enp1s0", "1", "", true, &[]);
+        iface("veth0", "1", "", false, &[]);
+        iface("br0", "1", "DEVTYPE=bridge\n", false, &["bridge"]);
+        iface("tailscale0", "65534", "", false, &[]);
+        iface("lo", "772", "", false, &[]);
+        (sysfs, net)
+    }
+
     #[test]
-    fn interfaces_include_classified_addresses() {
+    fn interface_kind_tells_wifi_ethernet_and_virtual_links_apart() {
+        let (_sysfs, net) = fake_sysfs();
+        let kind = |name: &str| interface_kind(&net.join(name));
+        assert_eq!(kind("wlan0"), InterfaceKind::Wifi);
+        assert_eq!(kind("enp1s0"), InterfaceKind::Ethernet);
+        assert_eq!(kind("veth0"), InterfaceKind::Other);
+        assert_eq!(kind("br0"), InterfaceKind::Other);
+        assert_eq!(kind("tailscale0"), InterfaceKind::Other);
+        assert_eq!(kind("lo"), InterfaceKind::Other);
+    }
+
+    #[test]
+    fn interfaces_include_type_and_classified_addresses() {
+        let (_sysfs, net) = fake_sysfs();
         let addresses = parse_ip_addr_json(&json!([{
             "ifname": "lo",
             "addr_info": [{ "local": "::1", "prefixlen": 128 }]
         }]));
-        let interfaces = read_interfaces(&addresses).unwrap();
-        let lo = interfaces.iter().find(|i| i["name"] == "lo").unwrap();
-        assert_eq!(lo["addresses"][0]["family"], "ipv6");
-        assert_eq!(lo["addresses"][0]["scope"], "loopback");
+        let interfaces = read_interfaces(&net, &addresses).unwrap();
+        let names: Vec<_> = interfaces.iter().map(|i| i["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["br0", "enp1s0", "lo", "tailscale0", "veth0", "wlan0"]);
+        let by_name = |name: &str| interfaces.iter().find(|i| i["name"] == name).unwrap();
+        assert_eq!(by_name("lo")["type"], "other");
+        assert_eq!(by_name("lo")["operstate"], "up");
+        assert_eq!(by_name("lo")["addresses"][0]["family"], "ipv6");
+        assert_eq!(by_name("lo")["addresses"][0]["scope"], "loopback");
+        assert_eq!(by_name("wlan0")["type"], "wifi");
+        assert_eq!(by_name("enp1s0")["type"], "ethernet");
+        assert_eq!(by_name("veth0")["type"], "other");
     }
 
     #[test]

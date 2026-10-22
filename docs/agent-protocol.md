@@ -1264,12 +1264,13 @@ Actions:
 - `scan_wifi` (privileged)
 - `connect_wifi` (privileged)
 
-`interfaces` returns interface names, MAC addresses, and operstate from
-`/sys/class/net`, plus each interface's IPv4 and IPv6 `addresses`:
+`interfaces` returns interface names, types, MAC addresses, and operstate
+from `/sys/class/net`, plus each interface's IPv4 and IPv6 `addresses`:
 
 ```json
 {
   "name": "eth0",
+  "type": "ethernet",
   "operstate": "up",
   "mac": "52:54:00:12:34:56",
   "addresses": [
@@ -1278,6 +1279,17 @@ Actions:
   ]
 }
 ```
+
+`type` is read from the interface's sysfs directory:
+
+- `wifi`: a wireless device (`DEVTYPE=wlan` in `uevent`, or a `wireless` or
+  `phy80211` entry). Only these can be used with `scan_wifi` and
+  `connect_wifi`.
+- `ethernet`: a physical Ethernet device: link `type` is `1` (`ARPHRD_ETHER`),
+  it has a `device` link, and it is not wireless. Only these can be used with
+  `configure`.
+- `other`: everything else, such as loopback, bridges, veth pairs, Podman
+  networks, Tailscale and other tun devices, and other virtual interfaces.
 
 `scope` is derived from the address prefix, not the kernel's scope field:
 `global`, `private` (RFC 1918 and RFC 6598 IPv4), `ula` (`fc00::/7`),
