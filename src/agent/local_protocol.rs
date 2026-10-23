@@ -124,7 +124,7 @@ impl LocalServer {
             anyhow::bail!("refused a peer that is neither the dashboard nor the OOBE");
         };
 
-        let hello = self.auth.hello();
+        let hello = self.auth.hello().await?;
         let flag = |name: &str| hello.get(name).and_then(Value::as_bool).unwrap_or_default();
         sink.send(text(&ServerFrame::Hello {
             protocol_version: PROTOCOL_VERSION.to_owned(),

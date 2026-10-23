@@ -3,10 +3,11 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use webauthn_rs::prelude::{DiscoverableKey, Passkey, PublicKeyCredential};
+use webauthn_rs::prelude::{AuthenticationResult, DiscoverableKey, Passkey, PublicKeyCredential};
 
 use crate::{
     auth::{
+        accounts::Account,
         api::{ApiError, ApiResult, ErrorCode},
         pam::{PamOutcome, PasswordBackend},
         passkey::{self, Authentication, AuthenticationState, CEREMONY_TTL},
@@ -58,14 +59,28 @@ impl AuthService {
                 return Err(anyhow::anyhow!("PAM failed: {error}").into());
             }
         }
+        let expired = outcome == PamOutcome::PasswordExpired;
+        let this = self.clone();
+        blocking(move || this.finish_password_login(client, &username, expired)).await?
+    }
+
+    /// The rest of `auth.password` once PAM accepted the password (`expired`
+    /// or not), on the blocking pool: it reads the user record and writes
+    /// the session file.
+    fn finish_password_login(
+        &self,
+        client: ClientKind,
+        username: &str,
+        expired: bool,
+    ) -> ApiResult {
         // Eligibility is checked after PAM so that failures take the same
         // time whether or not the account exists, and before reporting an
         // expired password so that root and other accounts that may never log
         // in do not learn that a guess was right.
-        let Some(account) = self.eligible_by_name(&username)? else {
+        let Some(account) = self.eligible_by_name(username)? else {
             return Err(ApiError::invalid_credentials());
         };
-        if outcome == PamOutcome::PasswordExpired {
+        if expired {
             return Err(ApiError::new(
                 ErrorCode::PasswordExpired,
                 "the password has expired; change it on the console or over SSH",
@@ -309,8 +324,39 @@ impl AuthService {
         client: ClientKind,
         p: PasskeyFinishParams,
     ) -> ApiResult {
-        let webauthn = self.webauthn()?;
         let now = self.now();
+        let remote_addr = p.remote_addr.clone();
+        let this = self.clone();
+        let (account, uid, username, result) =
+            blocking(move || this.identify_passkey(client, &p, now)).await??;
+        let name = account.name.clone();
+        let rhost = passkey::client_ip(remote_addr.as_deref()).map(|ip| ip.to_string());
+        let outcome = self
+            .pam(move |passwords| passwords.check_account(&name, rhost.as_deref()))
+            .await?;
+        match outcome {
+            // An expired password does not stop a passwordless login.
+            PamOutcome::Success | PamOutcome::PasswordExpired => {}
+            PamOutcome::Denied => {
+                eprintln!("passkey login refused by PAM account stack for `{username}`");
+                return Err(ApiError::invalid_credentials());
+            }
+            PamOutcome::Error(error) => return Err(anyhow::anyhow!("PAM failed: {error}").into()),
+        }
+        let this = self.clone();
+        blocking(move || this.finish_passkey_login(client, &account, uid, &username, &result, now))
+            .await?
+    }
+
+    /// The first half of `auth.passkey_finish`, on the blocking pool: check
+    /// the assertion of `p`'s ceremony and find its eligible account.
+    fn identify_passkey(
+        &self,
+        client: ClientKind,
+        p: &PasskeyFinishParams,
+        now: i64,
+    ) -> Result<(Account, u32, String, AuthenticationResult), ApiError> {
+        let webauthn = self.webauthn()?;
         let Some(ceremony) = self
             .inner
             .authentications
@@ -360,32 +406,32 @@ impl AuthService {
         };
 
         // A passkey proves who the user is, not that the account may still
-        // log in: check eligibility and run PAM's account stack.
+        // log in: check eligibility (and the caller runs PAM's account stack).
         let Some(account) = self.eligible_by_uid(uid, &username)? else {
             return Err(ApiError::invalid_credentials());
         };
-        let name = account.name.clone();
-        let rhost = passkey::client_ip(p.remote_addr.as_deref()).map(|ip| ip.to_string());
-        let outcome = self
-            .pam(move |passwords| passwords.check_account(&name, rhost.as_deref()))
-            .await?;
-        match outcome {
-            // An expired password does not stop a passwordless login.
-            PamOutcome::Success | PamOutcome::PasswordExpired => {}
-            PamOutcome::Denied => {
-                eprintln!("passkey login refused by PAM account stack for `{username}`");
-                return Err(ApiError::invalid_credentials());
-            }
-            PamOutcome::Error(error) => return Err(anyhow::anyhow!("PAM failed: {error}").into()),
-        }
+        Ok((account, uid, username, result))
+    }
 
-        let updated = self.inner.users.update(uid, &username, |record| {
+    /// The rest of `auth.passkey_finish` once PAM's account stack allowed
+    /// the login, on the blocking pool: record the passkey's use and issue
+    /// the session.
+    fn finish_passkey_login(
+        &self,
+        client: ClientKind,
+        account: &Account,
+        uid: u32,
+        username: &str,
+        result: &AuthenticationResult,
+        now: i64,
+    ) -> ApiResult {
+        let updated = self.inner.users.update(uid, username, |record| {
             let stored = record
                 .passkeys
                 .iter_mut()
                 .find(|stored| stored.passkey.cred_id() == result.cred_id())
                 .context("the passkey was removed")?;
-            stored.passkey.update_credential(&result);
+            stored.passkey.update_credential(result);
             stored.last_used_at = Some(now);
             Ok(())
         });
@@ -393,7 +439,7 @@ impl AuthService {
             eprintln!("passkey login for `{username}` failed: {error:#}");
             return Err(ApiError::invalid_credentials());
         }
-        self.issue_user_session(client, &account, AuthMethod::Passkey)
+        self.issue_user_session(client, account, AuthMethod::Passkey)
     }
 }
 

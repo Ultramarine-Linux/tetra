@@ -21,7 +21,7 @@ use crate::auth::api::ErrorCode;
 
 #[cfg(feature = "reverse-proxy")]
 use super::CADDY_UNIT;
-use super::{AuthService, Caller, DASHBOARD_UNIT, blocking, error_text};
+use super::{AuthService, Caller, DASHBOARD_UNIT, error_text};
 
 /// `caddy.service` drop-in that loads the DNS-01 environment file.
 #[cfg(feature = "reverse-proxy")]
@@ -35,12 +35,11 @@ impl AuthService {
         Ok(json!({ "access": access, "passkeys_available": self.webauthn().is_ok() }))
     }
 
-    pub(super) async fn access_set(&self, caller: &Caller, request: AccessRequest) -> ApiResult {
+    pub(super) fn access_set(&self, caller: &Caller, request: AccessRequest) -> ApiResult {
         caller.require_setup_or_admin()?;
         let config = AccessConfig::from_request(&request, &self.inner.config.dashboard_upstream)
             .map_err(ApiError::bad_request)?;
-        let this = self.clone();
-        let applied = blocking(move || this.set_access(config, request.dns_credentials)).await??;
+        let applied = self.set_access(config, request.dns_credentials)?;
         Ok(json!({
             "access": applied.config,
             "passkeys_available": self.webauthn().is_ok(),

@@ -214,6 +214,15 @@ impl Caller {
     }
 }
 
+/// Where [`AuthService::route_sync`] leaves a request.
+enum Routed {
+    /// Answered.
+    Done(Value),
+    /// An authenticated `module.dispatch`, which waits for the dispatch
+    /// queue.
+    Dispatch(Arc<Caller>),
+}
+
 /// Login and authorization authority. Cheap to clone.
 #[derive(Clone)]
 pub struct AuthService {
@@ -351,9 +360,18 @@ impl AuthService {
         self.inner.clock.now()
     }
 
+    /// Facts for the `hello` frame, read on the blocking pool (the setup
+    /// marker is a file).
+    ///
+    /// # Errors
+    /// Fails only when the blocking task panics.
+    pub async fn hello(&self) -> Result<Value> {
+        let this = self.clone();
+        Ok(tokio::task::spawn_blocking(move || this.hello_facts()).await?)
+    }
+
     /// Facts for the `hello` frame.
-    #[must_use]
-    pub fn hello(&self) -> Value {
+    fn hello_facts(&self) -> Value {
         json!({
             "setup_required": !self.inner.setup.is_complete(),
             "passkeys_available": self.webauthn().is_ok(),
@@ -369,8 +387,13 @@ impl AuthService {
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            if let Err(error) = self.inner.sessions.flush(self.now()) {
-                eprintln!("failed to save sessions: {error:#}");
+            // Writes and syncs the session file, so off the async workers.
+            let this = self.clone();
+            let flushed = tokio::task::spawn_blocking(move || this.flush_sessions()).await;
+            match flushed {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("failed to save sessions: {error:#}"),
+                Err(error) => eprintln!("failed to save sessions: {error}"),
             }
         }
     }
@@ -385,20 +408,19 @@ impl AuthService {
 
     /// Run one request from `client`.
     pub async fn handle(&self, client: ClientKind, request: Request) -> Response {
+        let request = Arc::new(request);
         let result = self.route(client, &request).await;
-        Response::new(request.id, result)
+        Response::new(request.id.clone(), result)
     }
 
-    async fn route(&self, client: ClientKind, request: &Request) -> ApiResult {
+    /// Run `request`. Logins wait for PAM and `module.dispatch` for the
+    /// dispatch queue here; everything else reads and writes the stores, so
+    /// it runs in one [`blocking`] call ([`Self::route_sync`]).
+    async fn route(&self, client: ClientKind, request: &Arc<Request>) -> ApiResult {
         let p = &request.params;
         match request.op.as_str() {
             "auth.password" => return self.auth_password(client, params(p)?).await,
-            "auth.second_factor" => return self.auth_second_factor(client, params(p)?),
-            "auth.passkey_begin" => return self.auth_passkey_begin(client, &params(p)?),
             "auth.passkey_finish" => return self.auth_passkey_finish(client, params(p)?).await,
-            "setup.status" => return self.setup_status(client, request.token.as_deref()),
-            "setup.redeem" => return self.setup_redeem(client, &params(p)?),
-            "launcher.can_access" => return self.launcher_can_access(client, &params(p)?),
             // Turns a connection into a shell stream, so the transport
             // handles it, and only as a connection's first request.
             "shell.open" => {
@@ -407,6 +429,33 @@ impl AuthService {
                 ));
             }
             _ => {}
+        }
+        let this = self.clone();
+        let shared = Arc::clone(request);
+        match blocking(move || this.route_sync(client, &shared)).await?? {
+            Routed::Done(value) => Ok(value),
+            // Module actions are recorded by `dispatch`, with their own
+            // outcome.
+            Routed::Dispatch(caller) => self.dispatch(caller, &request.id, params(p)?).await,
+        }
+    }
+
+    /// The synchronous part of [`Self::route`]: authenticate, authorize and
+    /// run every operation but the logins that need PAM, and record the
+    /// [`AUDITED_OPERATIONS`] before answering. `module.dispatch` comes back
+    /// authenticated, for `route` to queue.
+    fn route_sync(&self, client: ClientKind, request: &Request) -> Result<Routed, ApiError> {
+        let p = &request.params;
+        let unauthenticated = match request.op.as_str() {
+            "auth.second_factor" => Some(self.auth_second_factor(client, params(p)?)),
+            "auth.passkey_begin" => Some(self.auth_passkey_begin(client, &params(p)?)),
+            "setup.status" => Some(self.setup_status(client, request.token.as_deref())),
+            "setup.redeem" => Some(self.setup_redeem(client, &params(p)?)),
+            "launcher.can_access" => Some(self.launcher_can_access(client, &params(p)?)),
+            _ => None,
+        };
+        if let Some(result) = unauthenticated {
+            return result.map(Routed::Done);
         }
         let caller = self.authenticate(client, request.token.as_deref())?;
         if caller.principal == Principal::Setup && !authz::setup_allows_operation(&request.op) {
@@ -441,16 +490,15 @@ impl AuthService {
             "launcher.public_get" => self.launcher_public_get(&caller),
             "launcher.public_set" => self.launcher_public_set(&caller, params(p)?),
             "access.get" => self.access_get(),
-            "access.set" => self.access_set(&caller, params(p)?).await,
-            "setup.complete" => self.setup_complete(&caller).await,
-            "module.dispatch" => self.dispatch(&caller, &request.id, params(p)?).await,
+            "access.set" => self.access_set(&caller, params(p)?),
+            "setup.complete" => self.setup_complete(&caller),
+            "module.dispatch" => return Ok(Routed::Dispatch(Arc::new(caller))),
             "shell.ticket" => self.shell_ticket(&caller, params(p)?),
             op => Err(ApiError::new(
                 ErrorCode::UnknownOperation,
                 format!("unknown operation `{op}`"),
             )),
         };
-        // Module actions are recorded by `dispatch`, with their own outcome.
         // Requests refused before anything changed are not recorded.
         let refused = matches!(
             &result,
@@ -469,7 +517,7 @@ impl AuthService {
                 .map_err(|error| error.message.as_str());
             self.record_action(&caller, &request.id, module, action, outcome);
         }
-        result
+        result.map(Routed::Done)
     }
 
     // --- Accounts and sessions ------------------------------------------

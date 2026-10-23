@@ -16,8 +16,8 @@ use crate::{
 #[cfg(feature = "reverse-proxy")]
 use super::CADDY_UNIT;
 use super::{
-    AuthService, Caller, DASHBOARD_UNIT, HANDOFF_SECONDS, OOBE_UNIT, SETUP_CODE_UNIT, blocking,
-    error_text, require_client, session_json,
+    AuthService, Caller, DASHBOARD_UNIT, HANDOFF_SECONDS, OOBE_UNIT, SETUP_CODE_UNIT, error_text,
+    require_client, session_json,
 };
 
 /// The setup-code throttle bucket shared by every `remote_addr` that is not
@@ -42,7 +42,7 @@ impl AuthService {
     }
 
     pub(super) fn setup_status(&self, client: ClientKind, token: Option<&str>) -> ApiResult {
-        let mut status = self.hello();
+        let mut status = self.hello_facts();
         // Callers allowed to drive setup also learn whether an administrator
         // already exists, so the OOBE can skip creating one.
         if let Some(token) = token {
@@ -142,7 +142,7 @@ impl AuthService {
     /// Write the setup marker, then hand over to the dashboard: start it,
     /// and stop the OOBE [`HANDOFF_SECONDS`] later from a transient timer,
     /// so this response (with the dashboard's URL) reaches the OOBE first.
-    pub(super) async fn setup_complete(&self, caller: &Caller) -> ApiResult {
+    pub(super) fn setup_complete(&self, caller: &Caller) -> ApiResult {
         caller.require_setup_or_admin()?;
         let by = caller.user().ok().map(|(_, name)| name.to_owned());
         self.finish_setup(by.as_deref())?;
@@ -157,8 +157,7 @@ impl AuthService {
         {
             eprintln!("failed to revoke setup sessions: {error:#}");
         }
-        let this = self.clone();
-        let handoff = blocking(move || this.start_handoff(true)).await?;
+        let handoff = self.start_handoff(true);
         Ok(json!({
             "complete": true,
             "dashboard_url": self.dashboard_url(),

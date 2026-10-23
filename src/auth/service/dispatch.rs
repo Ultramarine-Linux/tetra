@@ -1,5 +1,7 @@
 //! Module actions: `module.dispatch`.
 
+use std::sync::Arc;
+
 use crate::{
     agent::{AgentCommand, queue::QueueError},
     auth::{
@@ -9,7 +11,7 @@ use crate::{
     prelude::*,
 };
 
-use super::{AuthService, Caller};
+use super::{AuthService, Caller, blocking};
 
 impl AuthService {
     // --- Module actions --------------------------------------------------
@@ -74,7 +76,15 @@ impl AuthService {
         }
     }
 
-    pub(super) async fn dispatch(&self, caller: &Caller, id: &str, p: DispatchParams) -> ApiResult {
+    /// Run `p` through the dispatch queue for `caller`. The checks before
+    /// and the bookkeeping after it read and write the stores, so they run
+    /// on the blocking pool; no store lock is held while waiting.
+    pub(super) async fn dispatch(
+        &self,
+        caller: Arc<Caller>,
+        id: &str,
+        p: DispatchParams,
+    ) -> ApiResult {
         caller.authorize(&p.module, &p.action)?;
         let _promotion = if caller.principal == Principal::Setup
             && authz::SETUP_ONLY_WITHOUT_ADMIN.contains(&(p.module.as_str(), p.action.as_str()))
@@ -84,7 +94,15 @@ impl AuthService {
             None
         };
         // Accounts the setup session creates are the ones it may then set up.
-        let created = self.setup_dispatch_guard(caller, &p)?;
+        let (p, created) = {
+            let (this, caller) = (self.clone(), Arc::clone(&caller));
+            blocking(move || {
+                let created = this.setup_dispatch_guard(&caller, &p);
+                (p, created)
+            })
+            .await?
+        };
+        let created = created?;
         if let Some(field) = authz::admin_only_field(&p.module, &p.payload)
             && !matches!(caller.principal, Principal::RemoteController)
             && !caller.is_admin()
@@ -99,11 +117,16 @@ impl AuthService {
             Principal::User { username, .. } => Some(username.clone()),
             _ => None,
         };
+        let DispatchParams {
+            module,
+            action,
+            payload,
+        } = p;
         let command = AgentCommand {
             id: id.to_owned(),
-            module: p.module.clone(),
-            action: p.action.clone(),
-            payload: p.payload,
+            module: module.clone(),
+            action: action.clone(),
+            payload,
             signature: None,
             user,
         };
@@ -119,31 +142,36 @@ impl AuthService {
                 return Err(anyhow::anyhow!("dispatch queue closed").into());
             }
         };
-        self.record_action(
-            caller,
-            id,
-            &p.module,
-            &p.action,
-            response.error.as_deref().map_or(Ok(()), Err),
-        );
-        if response.ok
-            && let Some(name) = created
-        {
-            self.record_setup_account(&caller.session.id, &name)?;
-        }
-        if response.ok
-            && let Some(name) = end_sessions
-        {
-            self.end_sessions_of(caller, &name);
-        }
-        if response.ok {
-            Ok(response.payload.unwrap_or(Value::Null))
-        } else {
-            Err(ApiError::new(
-                ErrorCode::ActionFailed,
-                response.error.unwrap_or_default(),
-            ))
-        }
+        let this = self.clone();
+        let id = id.to_owned();
+        blocking(move || -> ApiResult {
+            this.record_action(
+                &caller,
+                &id,
+                &module,
+                &action,
+                response.error.as_deref().map_or(Ok(()), Err),
+            );
+            if response.ok
+                && let Some(name) = created
+            {
+                this.record_setup_account(&caller.session.id, &name)?;
+            }
+            if response.ok
+                && let Some(name) = end_sessions
+            {
+                this.end_sessions_of(&caller, &name);
+            }
+            if response.ok {
+                Ok(response.payload.unwrap_or(Value::Null))
+            } else {
+                Err(ApiError::new(
+                    ErrorCode::ActionFailed,
+                    response.error.unwrap_or_default(),
+                ))
+            }
+        })
+        .await?
     }
 }
 

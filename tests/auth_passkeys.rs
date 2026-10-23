@@ -200,7 +200,10 @@ async fn passkeys_are_unavailable_without_a_domain() {
         ErrorCode::PasskeysUnavailable,
     )
     .await;
-    assert_eq!(host.service.hello()["passkeys_available"], false);
+    assert_eq!(
+        host.service.hello().await.unwrap()["passkeys_available"],
+        false
+    );
 }
 
 #[cfg(feature = "reverse-proxy")]
