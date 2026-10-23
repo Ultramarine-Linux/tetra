@@ -379,6 +379,7 @@ struct InstallOutcome {
 /// overrides keep the protocol testable without touching real system paths.
 #[derive(Debug)]
 struct AppDirs {
+    scope: AppScope,
     base_dir: PathBuf,
     files_root: PathBuf,
     units: Tree,
@@ -396,6 +397,7 @@ impl AppDirs {
         let base_dir = quadlet_base_dir(base_dir, scope);
         let files_root = quadlet_files_base_dir(files_base_dir, scope, None)?;
         Ok(Self {
+            scope,
             units: scope_tree(&base_dir, scope, None),
             files: scope_tree(&files_root, scope, None),
             base_dir,
@@ -418,6 +420,7 @@ impl AppDirs {
     /// keeps names with traversal components from escaping the root.
     fn bundle(&self, name: &str) -> Result<AppBundle> {
         Ok(AppBundle {
+            scope: self.scope,
             base_dir: self.base_dir.clone(),
             dir: safe_join(&self.files_root, name)?,
             units: self.units.clone(),
@@ -514,6 +517,9 @@ fn validate_app_name(name: &str) -> Result<()> {
 /// type so the action handlers stay declarative.
 #[derive(Debug)]
 struct AppBundle {
+    /// The scope the bundle was addressed in, which decides how far its
+    /// manifest is trusted (see [`manifest`](Self::manifest)).
+    scope: AppScope,
     /// Scan directory the app's Quadlet units are installed into.
     base_dir: PathBuf,
     /// Per-app bundle directory under the companion-file data root.
@@ -540,6 +546,18 @@ impl AppBundle {
     }
 
     /// Read and parse `<dir>/app.json`.
+    ///
+    /// In apps scope the manifest is in the apps account's home, so whoever
+    /// runs as that account (any app's container, on a breakout) can write
+    /// it: every field of it is untrusted. Unit and companion names are kept
+    /// to plain names below their directories, and everything they name is
+    /// reached through the scope's [`Tree`]. An on-disk recipe source is
+    /// refused there outright: its paths would be read as root (a FIFO hangs
+    /// the dispatch worker; `templates_dir: /etc` copies root's files into
+    /// the account's units). No release writes one in apps scope —
+    /// manifests store inline snapshots — so only system scope, whose
+    /// manifests root owns, still accepts the `file` source of older
+    /// releases.
     fn manifest(&self) -> Result<AppManifest> {
         let path = self.dir.join(APP_MANIFEST);
         let text = self
@@ -555,6 +573,15 @@ impl AppBundle {
             MANIFEST_VERSION
         );
         validate_manifest_paths(&manifest)?;
+        ensure!(
+            self.scope == AppScope::System
+                || matches!(
+                    manifest.recipe,
+                    crate::types::AppRecipeSource::Inline { .. }
+                ),
+            "app manifest `{}` names an on-disk recipe, which apps-scope manifests may not",
+            path.display()
+        );
         Ok(manifest)
     }
 
@@ -765,13 +792,20 @@ fn list_scope(
 }
 
 /// Whether a key holds a secret: it was a `Secret` parameter at some
-/// render, is one in the current recipe, or the recipe cannot be read.
+/// render, is one in the current recipe, or the recipe is unknown. Never
+/// touches the filesystem: only an inline recipe is parsed, and every key
+/// of an app with an on-disk recipe (a system-scope manifest of an older
+/// release, whose `secret_keys` may well be empty) counts as secret, since
+/// reading the recipe is what `update`'s snapshot is for.
 fn secrets(manifest: &AppManifest) -> impl Fn(&str) -> bool + use<> {
-    let current: Option<std::collections::BTreeSet<String>> = manifest
-        .recipe
-        .load()
-        .ok()
-        .map(|recipe| recipe.secret_keys().map(str::to_owned).collect());
+    let current: Option<std::collections::BTreeSet<String>> = match &manifest.recipe {
+        crate::types::AppRecipeSource::Inline { recipe, .. } => {
+            crate::catalog::AppRecipe::load_str(recipe)
+                .ok()
+                .map(|recipe| recipe.secret_keys().map(str::to_owned).collect())
+        }
+        crate::types::AppRecipeSource::File { .. } => None,
+    };
     let stored = manifest.secret_keys.clone();
     move |key| stored.contains(key) || current.as_ref().is_none_or(|current| current.contains(key))
 }
@@ -1232,6 +1266,7 @@ resources:
         let base_dir = home.join(".config/containers/systemd");
         let files_root = home.join(".local/share/tetra/quadlets");
         let dirs = AppDirs {
+            scope: AppScope::Apps,
             units: Tree::new(&base_dir, Some(&home), Some(owner.clone())),
             files: Tree::new(&files_root, Some(&home), Some(owner)),
             base_dir,
@@ -1461,6 +1496,138 @@ resources:
             rendered.contains("Volume=/opt/sites/html:/usr/share/nginx/html:ro"),
             "{rendered}"
         );
+    }
+
+    /// Swap the recipe of the stored manifest of `demo` for an on-disk one.
+    fn plant_file_recipe(files: &Path, recipe_path: &Path, templates_dir: &Path) {
+        let manifest_path = files.join("demo").join(APP_MANIFEST);
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest["recipe"] = json!({
+            "source": "file",
+            "recipe_path": recipe_path,
+            "templates_dir": templates_dir,
+        });
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
+    /// Run `f` on another thread, failing the test if it does not return
+    /// within a few seconds (a FIFO would block it forever).
+    fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(f()));
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the action blocked")
+    }
+
+    #[test]
+    fn apps_scope_refuses_a_planted_on_disk_recipe() {
+        let base = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        dispatch("create", create_payload(base.path(), files.path())).unwrap();
+        let unit = base.path().join("demo-web.container");
+        let installed = fs::read_to_string(&unit).unwrap();
+
+        // A recipe whose template is a file root reads and the account must
+        // not: `update` would render it into the account's unit.
+        let planted = tempfile::tempdir().unwrap();
+        let secrets = planted.path().join("secrets");
+        fs::create_dir_all(&secrets).unwrap();
+        fs::write(secrets.join("shadow"), "root:SECRET-HASH:::\n").unwrap();
+        let recipe = planted.path().join("recipe.yaml");
+        fs::write(
+            &recipe,
+            DEMO_RECIPE.replace("containers/demo.container.tera", "shadow"),
+        )
+        .unwrap();
+        plant_file_recipe(files.path(), &recipe, &secrets);
+        let request = json!({
+            "name": "demo",
+            "base_dir": base.path(),
+            "files_base_dir": files.path(),
+            "converge": false,
+        });
+        for action in ["get", "update", "remove"] {
+            let error = dispatch(action, request.clone()).unwrap_err();
+            assert!(
+                error.to_string().contains("on-disk recipe"),
+                "{action}: {error:#}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&unit).unwrap(), installed);
+        assert!(
+            files.path().join("demo/app.json").exists(),
+            "remove went ahead"
+        );
+        let listed = dispatch(
+            "list",
+            json!({ "base_dir": base.path(), "files_base_dir": files.path() }),
+        )
+        .unwrap();
+        assert_eq!(listed["apps"], json!([]));
+        assert_eq!(listed["invalid"], json!(["demo"]));
+
+        // A FIFO as the recipe would block the one dispatch worker.
+        let fifo = planted.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        plant_file_recipe(files.path(), &fifo, Path::new("/etc"));
+        for action in ["get", "update", "remove"] {
+            let request = request.clone();
+            let error = bounded(move || dispatch(action, request)).unwrap_err();
+            assert!(
+                error.to_string().contains("on-disk recipe"),
+                "{action}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn system_scope_still_handles_on_disk_recipes_of_older_releases() {
+        let base = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let mut create = create_payload(base.path(), files.path());
+        create["scope"] = json!("system");
+        dispatch("create", create).unwrap();
+
+        let recipes = tempfile::tempdir().unwrap();
+        let recipe = recipes.path().join("recipe.yaml");
+        fs::write(&recipe, DEMO_RECIPE).unwrap();
+        for (name, body) in demo_templates().as_object().unwrap() {
+            let path = recipes.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body.as_str().unwrap()).unwrap();
+        }
+        plant_file_recipe(files.path(), &recipe, recipes.path());
+        let request = json!({
+            "name": "demo",
+            "scope": "system",
+            "base_dir": base.path(),
+            "files_base_dir": files.path(),
+            "converge": false,
+        });
+        let listed = dispatch(
+            "list",
+            json!({ "scope": "system", "base_dir": base.path(), "files_base_dir": files.path() }),
+        )
+        .unwrap();
+        assert_eq!(listed["apps"][0]["name"], "demo");
+
+        // `get` reads no recipe from disk, so every value counts as secret.
+        let got = dispatch("get", request.clone()).unwrap();
+        assert_eq!(got["app"]["recipe"]["source"], "file");
+        assert_eq!(got["app"]["values"]["app_id"], REDACTED);
+
+        // `update` snapshots the recipe (root's, in system scope)...
+        let updated = dispatch("update", request.clone()).unwrap();
+        assert_eq!(updated["app"]["recipe"]["source"], "inline");
+        assert_eq!(updated["app"]["values"]["app_id"], "demo-web");
+        assert!(base.path().join("demo-web.container").exists());
+
+        // ...and `remove` tears one down.
+        plant_file_recipe(files.path(), &recipe, recipes.path());
+        dispatch("remove", request).unwrap();
+        assert!(!files.path().join("demo").exists());
+        assert!(!base.path().join("demo-web.container").exists());
     }
 
     #[test]

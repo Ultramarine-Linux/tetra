@@ -894,7 +894,14 @@ Request payloads deserialize into the `App*` types in `src/types/apps.rs`
 `AppRequest` for `remove`), and the manifest is the serialized `AppManifest`
 type. The recipe source is `AppRecipeSource`: exactly one of an inline recipe
 (`recipe` plus optional `templates`) or an on-disk recipe (`recipe_path` plus
-optional `templates_dir`).
+optional `templates_dir`). An on-disk recipe is read once, when `create` or
+`update` receives it, and stored as an inline snapshot. A stored manifest with
+an on-disk recipe (from an older release) is accepted only in system scope:
+apps-scope manifests live in the apps account's home, which that account (and
+so its containers) can write, so one naming an on-disk recipe is refused by
+`get`, `update` and `remove` and listed as `invalid`. `get` never reads a
+recipe from disk; for a system-scope on-disk recipe it shows every value as
+`"********"`, since it cannot tell which are secrets.
 
 Actions:
 

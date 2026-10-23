@@ -87,6 +87,11 @@ pub struct AppRequest {
 ///
 /// A recipe is either shipped inline (`recipe` + `templates`) or referenced
 /// on disk (`recipe_path` + `templates_dir`); exactly one form must be given.
+///
+/// Only [`snapshot`](Self::snapshot) reads the paths of the `File` form;
+/// everything else works on the inline snapshot it returns. Manifests store
+/// snapshots, so a `File` source in a stored manifest is from an older
+/// release, and only system scope (whose manifests root owns) accepts one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum AppRecipeSource {
@@ -105,6 +110,11 @@ impl AppRecipeSource {
     /// Snapshot disk bytes once, including all resource templates (even conditional
     /// ones), so verification and rendering cannot observe different versions.
     /// Inline bundles retain every supplied template, including unused entries.
+    ///
+    /// The paths are root's (a payload's, or a system-scope manifest's): the
+    /// recipe is read without blocking on a FIFO, and only if it is a regular
+    /// file; templates are resolved below `templates_dir` without following
+    /// a symlink.
     pub fn snapshot(&self) -> Result<Self> {
         match self {
             Self::Inline { .. } => Ok(self.clone()),
@@ -112,7 +122,7 @@ impl AppRecipeSource {
                 recipe_path,
                 templates_dir,
             } => {
-                let recipe = std::fs::read_to_string(recipe_path)?;
+                let recipe = read_recipe(recipe_path)?;
                 let parsed = AppRecipe::load_str(&recipe)?;
                 let mut templates = BTreeMap::new();
                 for resource in parsed.resources {
@@ -141,15 +151,16 @@ impl AppRecipeSource {
         crate::catalog::verification::verify_source(recipe, templates, source, allow_unpinned)
     }
 
-    /// Parse the recipe.
+    /// Parse the recipe of a snapshot. A `File` source is refused: reading
+    /// its paths is [`snapshot`](Self::snapshot)'s job alone.
     pub fn load(&self) -> Result<AppRecipe> {
         match self {
             Self::Inline { recipe, .. } => AppRecipe::load_str(recipe),
-            Self::File { recipe_path, .. } => AppRecipe::load(recipe_path),
+            Self::File { .. } => bail!("an on-disk recipe must be snapshotted first"),
         }
     }
 
-    /// Render the recipe with `values`, returning the parsed recipe alongside
+    /// Render a snapshot with `values`, returning the parsed recipe alongside
     /// the rendered resources so callers can record `recipe_id`/`version`.
     /// Generated values are added to `values` first, so callers store them.
     pub fn render(
@@ -157,13 +168,44 @@ impl AppRecipeSource {
         values: &mut BTreeMap<String, YamlValue>,
     ) -> Result<(AppRecipe, Vec<RenderedResource>)> {
         let recipe = self.load()?;
-        recipe.fill_generated(values);
-        let resources = match self {
-            Self::Inline { templates, .. } => recipe.render_with_templates(values, templates)?,
-            Self::File { templates_dir, .. } => recipe.render(values, templates_dir)?,
+        let Self::Inline { templates, .. } = self else {
+            unreachable!("`load` refuses on-disk recipes");
         };
+        recipe.fill_generated(values);
+        let resources = recipe.render_with_templates(values, templates)?;
         Ok((recipe, resources))
     }
+}
+
+/// Read the recipe file at `path`: a regular file of at most
+/// [`MAX_READ`](crate::agent::tree::MAX_READ) bytes, opened with
+/// `O_NONBLOCK` so a FIFO cannot hang the dispatch worker.
+fn read_recipe(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let context = || format!("failed to read recipe `{}`", path.display());
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .with_context(context)?;
+    ensure!(
+        file.metadata().with_context(context)?.is_file(),
+        "recipe `{}` is not a regular file",
+        path.display()
+    );
+    let max = crate::agent::tree::MAX_READ;
+    let mut contents = String::new();
+    file.take(max.saturating_add(1))
+        .read_to_string(&mut contents)
+        .with_context(context)?;
+    ensure!(
+        u64::try_from(contents.len()).is_ok_and(|len| len <= max),
+        "recipe `{}` is larger than {max} bytes",
+        path.display()
+    );
+    Ok(contents)
 }
 
 /// Payload for `apps.create`: cook a recipe into an installed app bundle.
