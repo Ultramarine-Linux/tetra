@@ -470,8 +470,9 @@ so they can never be read as an option. Unknown payload fields are ignored
 unless a section says otherwise.
 
 Request payloads are plain JSON objects. Payload types shared across modules —
-such as `SelinuxOptions`, `ServiceScope`, `AppScope`, and the `apps` module's
-`App*` requests — are defined in `src/types/` and deserialized with `serde`.
+such as `ServiceScope`, `AppScope`, and the `apps` module's `App*` requests —
+are defined in `src/types/`; the shared `SelinuxOptions` lives in
+`src/agent/module_support.rs`. All are deserialized with `serde`.
 
 ### settings
 
