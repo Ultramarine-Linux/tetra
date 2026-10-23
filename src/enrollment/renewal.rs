@@ -258,6 +258,20 @@ mod tests {
     }
 
     #[test]
+    fn staged_files_are_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let files = files(root.path());
+        files.stage("new key", "new cert").unwrap();
+        for path in [files.staged_key(), files.staged_certificate()] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
     fn promote_replaces_the_current_pair() {
         let root = tempfile::tempdir().unwrap();
         let files = files(root.path());
