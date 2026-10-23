@@ -246,7 +246,14 @@ impl ShellServer {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let opened = self.open(auth, client, &request);
+        // Redeeming reads the session and user stores, and starting the shell
+        // runs systemd-run: both block, so keep them off the async workers.
+        let opened = {
+            let (this, auth, request) = (self.clone(), auth.clone(), request.clone());
+            tokio::task::spawn_blocking(move || this.open(&auth, client, &request))
+                .await
+                .unwrap_or_else(|error| Err(anyhow::anyhow!(error).into()))
+        };
         let (grant, slot, shell, unit, size) = match opened {
             Ok(opened) => opened,
             Err(error) => {
@@ -283,7 +290,12 @@ impl ShellServer {
             .map(|status| format!("; status {status}"))
             .unwrap_or_default();
         let detail = format!("unit {unit}.service; {:?}{status}", end.reason);
-        auth.record_shell(&grant, &request.id, "close", Ok(()), Some(detail));
+        let auth = auth.clone();
+        tokio::task::spawn_blocking(move || {
+            auth.record_shell(&grant, &request.id, "close", Ok(()), Some(detail));
+        })
+        .await
+        .ok();
         Ok(())
     }
 
@@ -455,7 +467,13 @@ impl ShellServer {
                     if touch {
                         last_input = Instant::now();
                     }
-                    if let Err(error) = auth.check_shell_session(grant, touch) {
+                    let checked = {
+                        let (auth, grant) = (auth.clone(), grant.clone());
+                        tokio::task::spawn_blocking(move || auth.check_shell_session(&grant, touch))
+                            .await
+                            .unwrap_or_else(|error| Err(anyhow::anyhow!(error).into()))
+                    };
+                    if let Err(error) = checked {
                         eprintln!(
                             "ending the web shell of `{}`: {}",
                             grant.username, error.message
