@@ -17,9 +17,9 @@
 
 use serde_json::json;
 
-use crate::agent::module_support::{
-    ModuleInfo, ModuleStatus, NamedPayload, positional, run_for,
-};
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, NamedPayload, positional, run_for};
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 use crate::types::{VirtualMachineCreateRequest, VirtualMachineLogsRequest};
 
@@ -190,6 +190,7 @@ fn parse_virsh_dominfo(stdout: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::modules::Act;
     #[test]
     fn dry_run_start_does_not_call_virsh() {
         let response = Start(NamedPayload {

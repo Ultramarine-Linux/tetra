@@ -14,8 +14,10 @@
 
 use serde_json::json;
 
+use crate::actions;
 use crate::agent::apps_account::{APPS_USER, AppsAccount};
-use crate::agent::module_support::{positional, run_for};
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, positional, run_for};
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 use crate::types::{
@@ -151,6 +153,7 @@ fn unit_verb(verb: &str, payload: &ServiceRequest, user: Option<&str>) -> Result
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::modules::Act;
     use serde_json::json;
 
     use super::*;

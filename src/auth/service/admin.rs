@@ -1,5 +1,7 @@
 //! Administration: `admin.*` (grants, sessions, the action log).
 
+use std::collections::BTreeMap;
+
 use serde_json::json;
 
 use crate::{

@@ -9,9 +9,11 @@
 
 use serde_json::json;
 
+use crate::actions;
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
-use crate::agent::module_support::{apply_selinux, run_for};
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, apply_selinux, run_for};
 use crate::types::{DryRunRequest, NfsConfigRequest, NfsWriteConfigRequest};
 
 /// NFS module entry point registered under feature `nfs`.
@@ -118,6 +120,7 @@ fn parse_exports(contents: &str) -> Vec<Value> {
 mod tests {
     use super::*;
     use crate::agent::module_support::SelinuxOptions;
+    use crate::agent::modules::Act;
 
     #[test]
     fn parses_exports_file() {

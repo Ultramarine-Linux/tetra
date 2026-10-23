@@ -23,6 +23,7 @@
 //! cycles between the daemon and the root-only CLI.
 
 use std::{
+    ffi::OsStr,
     fs::{File, OpenOptions, Permissions},
     io::{ErrorKind, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},

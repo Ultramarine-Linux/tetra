@@ -35,7 +35,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{
@@ -1094,6 +1094,7 @@ pub(super) mod fake {
 mod tests {
     use super::fake::FakeHost;
     use super::*;
+    use itertools::Itertools;
 
     /// Where tests in `dir` keep the pending change.
     fn state(dir: &Path) -> PathBuf {

@@ -1,5 +1,6 @@
 //! Setup and the handoff to the dashboard: `setup.*`.
 
+use itertools::Itertools;
 use serde_json::json;
 
 use crate::{

@@ -21,7 +21,7 @@
 //! it), and a lone `client.crt.next` that staging or discarding was (remove
 //! it).
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rcgen::KeyPair;
 

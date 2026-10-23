@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use std::{path::Component, process::Command};
+use std::{ffi::OsStr, path::Component, process::Command};
 
 use serde_json::json;
 

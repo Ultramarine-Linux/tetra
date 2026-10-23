@@ -23,14 +23,14 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 
+use itertools::Itertools;
 use rand::RngExt as _;
 
 use super::addresses::AddressScope;
 use crate::prelude::*;
 use crate::types::{
     EapMethod, IpAddressConfig, IpConfig, Ipv4Config, Ipv4Method, Ipv6Config, Ipv6Method,
-    NetworkConfigureRequest,
-    Phase2Method, Wired8021x, is_pem,
+    NetworkConfigureRequest, Phase2Method, Wired8021x, is_pem,
 };
 
 /// Upper bound on addresses per family, to keep payloads reasonable.

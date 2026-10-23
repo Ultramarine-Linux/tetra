@@ -6,6 +6,8 @@
 //! is ignored (and replaced on the next write), so a new account never
 //! inherits someone else's second factor or passkeys.
 
+use std::ffi::OsStr;
+
 use webauthn_rs::prelude::{Passkey, Uuid};
 
 use crate::prelude::*;

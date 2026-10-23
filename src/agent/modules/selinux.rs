@@ -12,9 +12,12 @@
 //! code; they share the `SelinuxOptions` payload via `apply_selinux()` in
 //! `module_support.rs`.
 
+use itertools::Itertools;
 use serde_json::json;
 
-use crate::agent::module_support::{NO_ARGS, positional, run_for};
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, NO_ARGS, positional, run_for};
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 /// SELinux module entry point registered under feature `selinux`.
@@ -236,6 +239,7 @@ fn normalize_key(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::modules::Act;
 
     #[test]
     fn parses_sestatus_output() {

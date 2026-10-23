@@ -1,5 +1,7 @@
 //! `apps` module payloads and the installed-app manifest.
 
+use std::collections::BTreeMap;
+
 use serde_norway::Value as YamlValue;
 
 use crate::agent::module_support::SelinuxOptions;

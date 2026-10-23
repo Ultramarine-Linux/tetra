@@ -9,6 +9,9 @@
 
 use serde_json::json;
 
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus};
+use crate::agent::modules::Mod;
 use crate::{
     agent::module_support::{apply_selinux, run_for},
     prelude::*,
@@ -112,6 +115,7 @@ fn parse_samba_shares(contents: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use crate::agent::module_support::SelinuxOptions;
+    use crate::agent::modules::Act;
     use std::fs;
 
     use super::*;

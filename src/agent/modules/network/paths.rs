@@ -9,12 +9,12 @@
 //! target is replaced rather than followed.
 
 use std::{
+    ffi::OsStr,
     fs::OpenOptions,
     io::Read as _,
     os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
     path::Component,
 };
-
 
 use crate::prelude::*;
 

@@ -21,9 +21,11 @@
 
 use serde_json::json;
 
+use crate::actions;
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
-use crate::agent::module_support::{run_for, safe_join};
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, run_for, safe_join};
 pub use crate::auth::dns::DnsValue;
 
 /// Agent module that manages Caddy reverse proxy snippets.
@@ -637,6 +639,7 @@ pub fn remove_setup_site(config_dir: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::modules::Act;
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;

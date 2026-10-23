@@ -43,9 +43,13 @@ use std::{
 
 use serde_json::json;
 
+use crate::actions;
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
-use crate::agent::module_support::{CommandResult, SelinuxOptions, restorecon, run, run_for};
+use crate::agent::module_support::{
+    CommandResult, ModuleInfo, ModuleStatus, SelinuxOptions, restorecon, run, run_for,
+};
 use crate::types::{
     DryRunRequest, NetworkConfigRequest, NetworkConfigureRequest, NetworkConfirmRequest,
     NetworkConnectWifiRequest, NetworkInterfaceRequest, NetworkScanWifiRequest,
@@ -53,7 +57,9 @@ use crate::types::{
 };
 use addresses::{InterfaceAddress, parse_ip_addr_json};
 use apply::{Change, NetworkHost, SafeApply};
-use paths::{SYSTEM_CONNECTIONS_DIR, keyfile_path_for, read_keyfile, validate_keyfile_path, write_keyfile};
+use paths::{
+    SYSTEM_CONNECTIONS_DIR, keyfile_path_for, read_keyfile, validate_keyfile_path, write_keyfile,
+};
 
 /// Marker type for the network module. Stateless apart from the pending
 /// rollback held by [`SAFE_APPLY`] (and NetworkManager); all behavior lives in the [`Mod`] impl
@@ -605,6 +611,8 @@ fn read_interfaces(sysfs_root: &Path, addresses: &[InterfaceAddress]) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::modules::Act;
+    use itertools::Itertools;
     use std::os::unix::fs::PermissionsExt;
 
     use serde_json::json;

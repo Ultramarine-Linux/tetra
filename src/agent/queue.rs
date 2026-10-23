@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use super::Dispatcher;
+use crate::agent::{AgentCommand, AgentResponse};
 use crate::prelude::*;
 
 /// Maximum number of commands waiting for the dispatcher by default.

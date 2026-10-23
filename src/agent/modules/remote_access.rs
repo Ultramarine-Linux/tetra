@@ -27,17 +27,16 @@
 //! and forget its drop-in (and cloudflared's token), even when the service is
 //! missing.
 
-use std::{
-    io::Write as _,
-    os::unix::fs::OpenOptionsExt as _,
-};
+use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
 
 use serde_json::json;
 
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 use crate::agent::module_support::{
-    Commands, NoPayload, drop_in, install_drop_in, parse_action, run, unit_enabled,
+    Commands, ModuleInfo, ModuleStatus, NoPayload, drop_in, install_drop_in, parse_action, run,
+    unit_enabled,
 };
 use crate::auth::{
     access::{AccessConfig, HTTPS_PORT},

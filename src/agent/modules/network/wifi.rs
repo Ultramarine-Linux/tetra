@@ -10,6 +10,7 @@
 
 use std::{collections::BTreeMap, fmt::Write as _};
 
+use itertools::Itertools;
 use serde::Serialize;
 
 use super::keyfile::{

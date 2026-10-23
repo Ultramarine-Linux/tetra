@@ -12,7 +12,7 @@ tetra/
 ├── src/
 │   ├── main.rs           # CLI entry point (subcommands, argument parsing)
 │   ├── lib.rs            # Public API: agent, auth, catalog, enrollment, types
-│   ├── prelude.rs        # Common imports for modules (Mod, ModuleInfo, actions!, ...)
+│   ├── prelude.rs        # The few imports nearly every file needs (anyhow, serde, Value, Path, fs, io)
 │   ├── catalog.rs        # Recipe engine (YAML → Tera → Quadlet units)
 │   ├── types/            # Shared module payload types (serde), one file per module area
 │   ├── auth/             # Login, sessions, authorization (see auth-protocol.md)
@@ -195,7 +195,9 @@ A module whose host state belongs to the apps account (`podman`) overrides
 ```rust
 use serde_json::json;
 
-use crate::agent::module_support::{positional, run_for};
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, positional, run_for};
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 #[derive(Clone, Copy, Debug)]

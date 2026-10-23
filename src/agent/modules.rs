@@ -1,7 +1,9 @@
 // `settings` is always compiled — it provides the always-available `get_system`
 // action that other modules and the dashboard rely on for host identification.
 pub mod settings;
-pub use crate::prelude::*;
+use crate::agent::dispatcher::RunAs;
+use crate::agent::module_support::ModuleInfo;
+use crate::prelude::*;
 pub use settings::SettingsModule;
 
 macro_rules! modules {
@@ -123,9 +125,9 @@ macro_rules! actions {
     (@[$payload:ident $user:ident $Action:ident]{$a:ident {$($struct:tt)*} => $body:expr, $($rest:tt)*}[$($done:ident)*]) => {
         #[derive(Debug, ::serde::Deserialize)]
         struct $a {$($struct)*}
-        impl $crate::prelude::Act for $a {
+        impl $crate::agent::modules::Act for $a {
             // fn is_priviledged(&self) -> bool { false }
-            fn handle(self, user: Option<&str>) -> Result<Value> {
+            fn handle(self, user: Option<&str>) -> ::anyhow::Result<::serde_json::Value> {
                 #[allow(unused_variables)]
                 let ($user, $payload) = (user, self);
                 $body
@@ -137,9 +139,9 @@ macro_rules! actions {
         // Takes no payload: any object (or `null`, see `parse_action`).
         #[derive(Debug, ::serde::Deserialize)]
         struct $a {}
-        impl $crate::prelude::Act for $a {
+        impl $crate::agent::modules::Act for $a {
             // fn is_priviledged(&self) -> bool { false }
-            fn handle(self, user: Option<&str>) -> Result<Value> {
+            fn handle(self, user: Option<&str>) -> ::anyhow::Result<::serde_json::Value> {
                 #[allow(unused_variables)]
                 let ($user, $payload) = (user, self);
                 $body
@@ -150,9 +152,9 @@ macro_rules! actions {
     (@[$payload:ident $user:ident $Action:ident]{$a:ident: $t:ty => $body:expr, $($rest:tt)*}[$($done:ident)*]) => {
         #[derive(Debug, ::serde::Deserialize)]
         struct $a($t);
-        impl $crate::prelude::Act for $a {
+        impl $crate::agent::modules::Act for $a {
             // fn is_priviledged(&self) -> bool { false }
-            fn handle(self, user: Option<&str>) -> Result<Value> {
+            fn handle(self, user: Option<&str>) -> ::anyhow::Result<::serde_json::Value> {
                 #[allow(unused_variables)]
                 let ($user, $payload) = (user, self.0);
                 $body
@@ -164,17 +166,23 @@ macro_rules! actions {
         #[derive(Debug, ::serde::Deserialize)]
         #[serde(rename_all = "snake_case")]
         enum $Action { $( $done($done), )* }
-        impl $crate::prelude::Act for $Action {
+        impl $crate::agent::modules::Act for $Action {
             // fn is_priviledged(&self) -> bool { match self {
             //     $( Self::$done(a) => a.is_priviledged(), )*
             // }}
-            fn handle(self, user: Option<&str>) -> Result<::serde_json::Value> { match self {
-                $( Self::$done(a) => a.handle(user), )*
+            fn handle(self, user: Option<&str>) -> ::anyhow::Result<::serde_json::Value> { match self {
+                $( Self::$done(a) => $crate::agent::modules::Act::handle(a, user), )*
             }}
         }
         impl $Action {
-            fn from_payload(action: &str, payload: Value) -> Result<impl Act> {
+            fn from_payload(action: &str, payload: ::serde_json::Value) -> ::anyhow::Result<Self> {
                 $crate::agent::module_support::parse_action::<$Action>(action, payload)
+            }
+
+            /// [`Act::handle`]($crate::agent::modules::Act::handle), callable
+            /// without the trait in scope.
+            fn handle(self, user: Option<&str>) -> ::anyhow::Result<::serde_json::Value> {
+                $crate::agent::modules::Act::handle(self, user)
             }
         }
     };
@@ -201,14 +209,14 @@ mod tests {
             let response = Action::from_payload("ping", payload).unwrap().handle(None);
             assert_eq!(response.unwrap(), "pong");
         }
-        assert!(Action::from_payload("ping", json!("")).is_err());
-        assert!(Action::from_payload("ping", json!([1])).is_err());
+        Action::from_payload("ping", json!("")).unwrap_err();
+        Action::from_payload("ping", json!([1])).unwrap_err();
         // A payload whose fields all have defaults may be left out.
         let response = Action::from_payload("stop", Value::Null)
             .unwrap()
             .handle(None);
         assert_eq!(response.unwrap(), false);
-        assert!(Action::from_payload("echo", Value::Null).is_err());
+        Action::from_payload("echo", Value::Null).unwrap_err();
         let response = Action::from_payload("echo", json!({ "value": 7 }))
             .unwrap()
             .handle(None);

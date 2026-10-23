@@ -21,12 +21,16 @@
 //! here. Full update management (status, history, manual runs) is a later
 //! module.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde_json::json;
 
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 use crate::agent::module_support::{
-    Commands, NoPayload, drop_in, install_drop_in, parse_action, unit_enabled,
+    Commands, ModuleInfo, ModuleStatus, NoPayload, drop_in, install_drop_in, parse_action,
+    unit_enabled,
 };
 use crate::auth::service::{AuthConfig, DEFAULT_STATE_DIR};
 use crate::auth::store::{self, Extra, Header, Record};

@@ -6,7 +6,10 @@
 //! code never selects them. Like test code, they panic on poisoned locks.
 #![allow(clippy::missing_panics_doc, clippy::unwrap_in_result)]
 
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
+
+use itertools::Itertools;
 
 use crate::prelude::*;
 

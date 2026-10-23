@@ -41,10 +41,14 @@
 
 use serde_json::json;
 
+use crate::actions;
 use crate::agent::apps_account::{
     APPS_USER, AppsAccount, Owner, check_no_symlinks, create_dir_owned, write_owned,
 };
-use crate::agent::module_support::{SelinuxOptions, apply_selinux, resolve_under, safe_join};
+use crate::agent::module_support::{
+    ModuleInfo, ModuleStatus, SelinuxOptions, apply_selinux, resolve_under, safe_join,
+};
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 use crate::types::AppScope;
 
@@ -573,6 +577,7 @@ pub(crate) fn is_quadlet_filename(filename: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::modules::Act;
 
     #[test]
     fn rejects_paths_outside_base_dir() {

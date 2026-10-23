@@ -6,7 +6,9 @@
 
 use serde_json::json;
 
-use crate::agent::module_support::run_dry;
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, run_dry};
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 /// Marker type for the power module.

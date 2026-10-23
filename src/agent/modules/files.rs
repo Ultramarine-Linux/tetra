@@ -9,7 +9,9 @@
 
 use serde_json::json;
 
-use crate::agent::module_support::apply_selinux;
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, apply_selinux};
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 use crate::types::{FileReadRequest, FileWriteRequest};
@@ -62,6 +64,7 @@ actions!(Action [payload user] => {
 mod tests {
     use super::*;
     use crate::agent::module_support::SelinuxOptions;
+    use crate::agent::modules::Act;
 
     #[test]
     fn dry_run_write_does_not_create_file() {

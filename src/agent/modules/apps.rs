@@ -62,15 +62,18 @@
 //! rendered resources, target paths, and `systemctl` commands — before
 //! committing.
 
-use serde_norway::Value as YamlValue;
-use serde_json::json;
+use std::collections::{BTreeMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::agent::apps_account::{
-    AppsAccount, HostPaths, Owner, create_dir_owned, write_owned,
-};
+use serde_json::json;
+use serde_norway::Value as YamlValue;
+
+use crate::actions;
+use crate::agent::apps_account::{AppsAccount, HostPaths, Owner, create_dir_owned, write_owned};
 use crate::agent::module_support::{
-    Commands, apply_selinux, remove_under, resolve_under, safe_join,
+    Commands, ModuleInfo, ModuleStatus, apply_selinux, remove_under, resolve_under, safe_join,
 };
+use crate::agent::modules::Mod;
 use crate::agent::modules::quadlets::{
     list_companion_files, owner_name, quadlet_base_dir, quadlet_files_base_dir, scope_owner,
     validate_quadlet,

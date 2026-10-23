@@ -12,7 +12,9 @@
 
 use serde_json::json;
 
-use crate::agent::module_support::run_for;
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, run_for};
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 /// Marker type for the always-on settings module. It carries no state: all

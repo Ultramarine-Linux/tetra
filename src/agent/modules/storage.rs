@@ -9,10 +9,12 @@
 
 use serde_json::json;
 
+use crate::actions;
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 use crate::agent::module_support::{
-    SelinuxOptions, apply_selinux, option_arg, positional, run_for,
+    ModuleInfo, ModuleStatus, SelinuxOptions, apply_selinux, option_arg, positional, run_for,
 };
 use std::process::Command;
 
@@ -302,6 +304,7 @@ fn validate_fstab_entry(entry: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::modules::Act;
 
     #[test]
     fn absent_zfs_is_reported_without_failing() {

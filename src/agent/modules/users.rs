@@ -40,7 +40,9 @@ use nix::{
 };
 use serde_json::json;
 
-use crate::agent::module_support::{option_arg, run_for};
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, option_arg, run_for};
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 /// Group whose members are Tetra administrators (with `wheel`).
@@ -382,6 +384,7 @@ fn parse_group(contents: &str) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::modules::Act;
 
     #[test]
     fn parses_passwd_entries() {

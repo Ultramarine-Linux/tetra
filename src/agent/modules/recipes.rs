@@ -15,15 +15,22 @@
 //!   remote catalog publish new recipes without bumping the installed Tetra
 //!   version, as long as the recipe schema is one the agent understands.
 
+use std::collections::BTreeMap;
+
 use serde_json::json;
 use serde_norway::Value as YamlValue;
 
-use crate::agent::module_support::write_under;
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, write_under};
+use crate::agent::modules::Mod;
 
 use crate::{
-    catalog::{AppRecipe, load_values, verification::{RecipeSource, verify_images}},
-    types::AppRecipeSource,
+    catalog::{
+        AppRecipe, load_values,
+        verification::{RecipeSource, verify_images},
+    },
     prelude::*,
+    types::AppRecipeSource,
 };
 
 /// Agent module that wraps the recipe catalog for remote rendering.

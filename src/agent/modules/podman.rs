@@ -15,7 +15,10 @@
 //! `run_as` picks the signed-in user or root instead. `inspect` hides
 //! environment values unless an administrator sends `show_env: true`.
 
-use crate::agent::module_support::{positional, run_for};
+use crate::actions;
+use crate::agent::dispatcher::RunAs;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, positional, run_for};
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 /// Marker type for the podman module. Stateless; all behavior lives in the
@@ -216,6 +219,7 @@ fn redact_env(result: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::modules::Act;
 
     #[test]
     fn dry_run_remove_does_not_call_podman() {
