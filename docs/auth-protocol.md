@@ -676,8 +676,11 @@ action that passes authorization is recorded in the action log.
 | `users` | `users.list/status/groups` | — | create, update, delete, set_password, set_authorized_keys, add_admin |
 | `files` | — | — | `files.read/write` |
 
-Payload fields that point an action at arbitrary host paths are
-administrator-only (`ADMIN_ONLY_FIELDS`): `config_dir` on `reverse_proxy`
+Some payload fields need more than the action itself (`RESTRICTED_FIELDS`).
+`scope` other than `"apps"` on `apps` and `quadlets` actions (system scope,
+or `"all"` on `apps.list`) needs the `system_services` grant, since system
+scope holds the rootful system services. Payload fields that point an action
+at arbitrary host paths are administrator-only: `config_dir` on `reverse_proxy`
 actions, `base_dir`/`files_base_dir` on `quadlets` and `apps` actions, `home`
 on `users` actions, and `path` on `samba` and `nfs` actions, which may only
 be left out or set to the default (`/etc/samba/smb.conf`, `/etc/exports`).

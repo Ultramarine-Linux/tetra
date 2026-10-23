@@ -103,14 +103,21 @@ impl AuthService {
             .await?
         };
         let created = created?;
-        if let Some(field) = authz::admin_only_field(&p.module, &p.payload)
-            && !matches!(caller.principal, Principal::RemoteController)
-            && !caller.is_admin()
+        if let Some((field, requirement)) =
+            authz::unmet_field(&caller.principal, &p.module, &p.payload)
         {
-            return Err(ApiError::forbidden(format!(
-                "only administrators may set `{field}` on {}.{}",
-                p.module, p.action
-            )));
+            return Err(ApiError::forbidden(match requirement {
+                authz::Requirement::Page(page, level) => format!(
+                    "`{field}` on {}.{} needs {} {level:?} access",
+                    p.module,
+                    p.action,
+                    page.label()
+                ),
+                _ => format!(
+                    "only administrators may set `{field}` on {}.{}",
+                    p.module, p.action
+                ),
+            }));
         }
         let end_sessions = sessions_to_end(&p);
         let user = match &caller.principal {

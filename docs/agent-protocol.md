@@ -870,7 +870,13 @@ Every action takes `scope`, an `AppScope`:
 The manifest records the scope, and `get`, `update` and `remove` refuse an
 app whose manifest names another scope, so an app stays where it was
 installed: apps that earlier releases installed in system scope keep working
-with `"scope": "system"` (they are not listed in apps scope). Tetra does not
+with `"scope": "system"` (they are not listed in apps scope).
+
+`list` takes `scope`: `"apps"` (the default), `"system"` or `"all"`, and
+returns `{apps: [...], invalid: [...], roots: [{scope, files_base_dir}]}`,
+plus `files_base_dir` when one scope is listed. Each app carries its `scope`.
+Any `scope` other than `"apps"`, on any `apps` or `quadlets` action, needs the
+`system_services` grant: system scope belongs to the system services page. Tetra does not
 move them; reinstalling one in apps scope (and moving its data) is up to the
 administrator. A `"user"` scope (earlier releases' per-user home) is refused,
 and a manifest that says `user` is listed as `invalid`. The manifest records the recipe source, parameter

@@ -131,42 +131,26 @@ impl Mod for AppsModule {
 
 actions!(Action [payload user] => {
     List: AppListRequest => {
-        let dirs = AppDirs::resolve(payload.base_dir, payload.files_base_dir, payload.scope)?;
         let mut apps = Vec::new();
         // Directories under the data root whose `app.json` cannot be read are
         // reported by name rather than failing the whole listing — they are
         // either corrupted bundles or stray unmanaged directories, both of
         // which the dashboard should surface.
         let mut invalid = Vec::new();
-        if dirs.files_root.exists() {
-            for entry in fs::read_dir(&dirs.files_root)
-                .with_context(|| format!("failed to read `{}`", dirs.files_root.display()))?
-            {
-                let entry = entry?;
-                let entry_type = entry.file_type()?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if entry_type.is_symlink() {
-                    invalid.push(name);
-                    continue;
-                }
-                if !entry_type.is_dir() {
-                    continue;
-                }
-                let Ok(bundle) = dirs.bundle(&name) else {
-                    invalid.push(name);
-                    continue;
-                };
-                match bundle.manifest() {
-                    Ok(manifest) if manifest.name == name && manifest.scope == payload.scope => {
-                        apps.push(bundle.summary(&manifest));
-                    }
-                    Ok(_) | Err(_) => invalid.push(name),
-                }
-            }
+        let mut roots = Vec::new();
+        for &scope in payload.scope.scopes() {
+            let dirs = AppDirs::resolve(payload.base_dir.clone(), payload.files_base_dir.clone(), scope)?;
+            list_scope(&dirs, scope, &mut apps, &mut invalid)?;
+            roots.push(json!({ "scope": scope, "files_base_dir": dirs.files_root }));
         }
         apps.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
         invalid.sort();
-        Ok(json!({ "files_base_dir": dirs.files_root, "apps": apps, "invalid": invalid }))
+        let mut response = json!({ "apps": apps, "invalid": invalid, "roots": roots });
+        // One scope: keep the single root at the top level, as before.
+        if let [root] = roots.as_slice() {
+            response["files_base_dir"] = root["files_base_dir"].clone();
+        }
+        Ok(response)
     },
     Get: AppGetRequest => {
         validate_app_name(&payload.name)?;
@@ -735,6 +719,43 @@ const PRIVATE_MODE: u32 = 0o600;
 
 /// What `get` shows in place of a secret.
 const REDACTED: &str = "********";
+
+/// Add the apps in `dirs` (of `scope`) to `apps`, and the names of bundles
+/// that cannot be read to `invalid`.
+fn list_scope(
+    dirs: &AppDirs,
+    scope: AppScope,
+    apps: &mut Vec<Value>,
+    invalid: &mut Vec<String>,
+) -> Result<()> {
+    if dirs.files_root.exists() {
+        for entry in fs::read_dir(&dirs.files_root)
+            .with_context(|| format!("failed to read `{}`", dirs.files_root.display()))?
+        {
+            let entry = entry?;
+            let entry_type = entry.file_type()?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry_type.is_symlink() {
+                invalid.push(name);
+                continue;
+            }
+            if !entry_type.is_dir() {
+                continue;
+            }
+            let Ok(bundle) = dirs.bundle(&name) else {
+                invalid.push(name);
+                continue;
+            };
+            match bundle.manifest() {
+                Ok(manifest) if manifest.name == name && manifest.scope == scope => {
+                    apps.push(bundle.summary(&manifest));
+                }
+                Ok(_) | Err(_) => invalid.push(name),
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Whether a key holds a secret: it was a `Secret` parameter at some
 /// render, is one in the current recipe, or the recipe cannot be read.
@@ -1593,6 +1614,38 @@ resources:
         let shown = get();
         assert_eq!(shown["app"]["values"]["token"], "********");
         assert!(!shown.to_string().contains("hunter2"));
+    }
+
+    #[test]
+    fn list_filters_by_scope() {
+        let base = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        dispatch("create", create_payload(base.path(), files.path())).unwrap();
+        let list = |scope: Option<&str>| {
+            let mut payload = json!({ "base_dir": base.path(), "files_base_dir": files.path() });
+            if let Some(scope) = scope {
+                payload["scope"] = json!(scope);
+            }
+            dispatch("list", payload).unwrap()
+        };
+        let names = |response: &Value| {
+            response["apps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|app| app["name"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let default = list(None);
+        assert_eq!(names(&default), ["demo"]);
+        assert_eq!(default["files_base_dir"], json!(files.path()));
+        // The demo app is apps scope; with shared overrides, system scope
+        // sees its manifest and refuses it as another scope's.
+        assert!(names(&list(Some("system"))).is_empty());
+        let all = list(Some("all"));
+        assert_eq!(names(&all), ["demo"]);
+        assert_eq!(all["roots"].as_array().unwrap().len(), 2);
+        assert!(all.get("files_base_dir").is_none());
     }
 
     #[test]

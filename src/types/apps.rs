@@ -28,6 +28,33 @@ pub enum AppScope {
     System,
 }
 
+/// Which apps `apps.list` shows.
+///
+/// The apps account's (the default), the rootful system services, or both.
+/// Anything but `apps` needs the
+/// `system_services` grant (`auth::authz`), since system scope belongs to the
+/// system services page.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppListScope {
+    #[default]
+    Apps,
+    System,
+    All,
+}
+
+impl AppListScope {
+    /// The scopes listed, in order.
+    #[must_use]
+    pub const fn scopes(self) -> &'static [AppScope] {
+        match self {
+            Self::Apps => &[AppScope::Apps],
+            Self::System => &[AppScope::System],
+            Self::All => &[AppScope::Apps, AppScope::System],
+        }
+    }
+}
+
 impl From<AppScope> for ServiceScope {
     fn from(scope: AppScope) -> Self {
         match scope {
@@ -263,7 +290,7 @@ pub struct AppGetRequest {
 #[derive(Debug, Deserialize)]
 pub struct AppListRequest {
     #[serde(default)]
-    pub scope: AppScope,
+    pub scope: AppListScope,
     pub base_dir: Option<PathBuf>,
     pub files_base_dir: Option<PathBuf>,
 }
@@ -346,9 +373,9 @@ mod tests {
     #[test]
     fn apps_default_to_the_apps_account_and_user_scope_is_gone() {
         let list: AppListRequest = serde_json::from_value(json!({})).unwrap();
-        assert_eq!(list.scope, AppScope::Apps);
+        assert_eq!(list.scope, AppListScope::Apps);
         let system: AppListRequest = serde_json::from_value(json!({ "scope": "system" })).unwrap();
-        assert_eq!(system.scope, AppScope::System);
+        assert_eq!(system.scope, AppListScope::System);
         let error = serde_json::from_value::<AppListRequest>(json!({ "scope": "user" }))
             .unwrap_err()
             .to_string();

@@ -335,35 +335,42 @@ pub const SETUP_OPERATIONS: &[&str] = &[
     "module.dispatch",
 ];
 
-/// Payload fields that only administrators (and remote controllers) may set,
-/// because they point an action at arbitrary host paths or widen what it
-/// shows. The setup session and granted users always get the defaults; a
-/// field may still be sent with one of the values in the third element (its
-/// default, written as JSON), since documented payloads do.
-const ADMIN_ONLY_FIELDS: &[(&str, &str, &[&str])] = &[
-    ("reverse_proxy", "config_dir", &[]),
-    ("quadlets", "base_dir", &[]),
-    ("quadlets", "files_base_dir", &[]),
-    ("apps", "base_dir", &[]),
-    ("apps", "files_base_dir", &[]),
+/// Payload fields that need more than the action itself: each entry is the
+/// module (`*` for any), the field, the values that need nothing extra, and
+/// what any other value needs. Most are administrator-only (and remote
+/// controllers') because they point an action at arbitrary host paths; the
+/// setup session and granted users always get the defaults. A field may
+/// still be sent with an allowed value, since documented payloads do.
+const RESTRICTED_FIELDS: &[(&str, &str, &[&str], Requirement)] = &[
+    ("reverse_proxy", "config_dir", &[], AdminOnly),
+    ("quadlets", "base_dir", &[], AdminOnly),
+    ("quadlets", "files_base_dir", &[], AdminOnly),
+    ("apps", "base_dir", &[], AdminOnly),
+    ("apps", "files_base_dir", &[], AdminOnly),
     // A new account sharing another's home could replace that account's SSH
     // keys with `set_authorized_keys`.
-    ("users", "home", &[]),
+    ("users", "home", &[], AdminOnly),
     // The sharing modules read and replace `path` as root; any other path
     // would turn the Sharing page into `files.read`/`files.write`.
-    ("samba", "path", &[SAMBA_CONFIG_PATH]),
+    ("samba", "path", &[SAMBA_CONFIG_PATH], AdminOnly),
+    ("nfs", "path", &[EXPORTS_PATH], AdminOnly),
     // Running a read as root (or as both) shows the host's view: rootful
     // containers with their environment, every VM. The signed-in user's own
     // view and the apps account's (where user apps run) are fine.
-    ("*", "run_as", &["user", "apps"]),
+    ("*", "run_as", &["user", "apps"], AdminOnly),
     // Apps keep secrets in their containers' environment.
-    ("podman", "show_env", &["false"]),
-    ("nfs", "path", &[EXPORTS_PATH]),
+    ("podman", "show_env", &["false"], AdminOnly),
+    // System scope holds the rootful system services, which belong to the
+    // system services page, not the apps page.
+    ("apps", "scope", &["apps"], page(SystemServices, View)),
+    ("quadlets", "scope", &["apps"], page(SystemServices, View)),
 ];
 
-/// The first admin-only field set in a `module` payload, if any.
-#[must_use]
-pub fn admin_only_field(module: &str, payload: &Value) -> Option<&'static str> {
+/// The restricted fields set in a `module` payload, with what each needs.
+fn restricted_fields<'a>(
+    module: &'a str,
+    payload: &'a Value,
+) -> impl Iterator<Item = (&'static str, Requirement)> + 'a {
     // A string, or another JSON value written out (`false`).
     let allowed = |value: &Value, allowed: &[&str]| {
         allowed.iter().any(|allowed| {
@@ -371,15 +378,34 @@ pub fn admin_only_field(module: &str, payload: &Value) -> Option<&'static str> {
                 || serde_json::from_str::<Value>(allowed).is_ok_and(|allowed| allowed == *value)
         })
     };
-    ADMIN_ONLY_FIELDS
+    RESTRICTED_FIELDS
         .iter()
-        .find(|(m, field, values)| {
+        .filter(move |(m, field, values, _)| {
             (*m == module || *m == "*")
                 && payload
                     .get(field)
                     .is_some_and(|value| !allowed(value, values))
         })
-        .map(|(_, field, _)| *field)
+        .map(|(_, field, _, requirement)| (*field, *requirement))
+}
+
+/// The first restricted field in a `module` payload that `principal` may not
+/// set, with what it needs.
+#[must_use]
+pub fn unmet_field(
+    principal: &Principal,
+    module: &str,
+    payload: &Value,
+) -> Option<(&'static str, Requirement)> {
+    restricted_fields(module, payload).find(|(_, requirement)| !principal.meets(*requirement))
+}
+
+/// The first administrator-only field set in a `module` payload, if any.
+#[must_use]
+pub fn admin_only_field(module: &str, payload: &Value) -> Option<&'static str> {
+    restricted_fields(module, payload)
+        .find(|(_, requirement)| *requirement == AdminOnly)
+        .map(|(field, _)| field)
 }
 
 /// The requirement for `module.action`.
@@ -435,21 +461,29 @@ impl Principal {
     #[must_use]
     pub fn allows(&self, module: &str, action: &str) -> bool {
         match self {
-            Self::RemoteController => true,
             Self::Setup => SETUP_ALLOWED.contains(&(module, action)),
+            _ => self.meets(requirement(module, action)),
+        }
+    }
+
+    /// Whether this principal meets `requirement`. The setup session meets
+    /// only [`Authenticated`]; its actions come from [`SETUP_ALLOWED`].
+    #[must_use]
+    pub fn meets(&self, requirement: Requirement) -> bool {
+        match self {
+            Self::RemoteController => true,
+            Self::Setup => requirement == Authenticated,
             Self::User {
                 admin, permissions, ..
             } => {
-                if *admin {
-                    return true;
-                }
-                match requirement(module, action) {
-                    Authenticated => true,
-                    AdminOnly => false,
-                    Requirement::Page(page, level) => {
-                        permissions.get(&page).is_some_and(|held| *held >= level)
+                *admin
+                    || match requirement {
+                        Authenticated => true,
+                        AdminOnly => false,
+                        Requirement::Page(page, level) => {
+                            permissions.get(&page).is_some_and(|held| *held >= level)
+                        }
                     }
-                }
             }
         }
     }
@@ -1008,6 +1042,40 @@ mod tests {
             None
         );
         assert_eq!(requirement("recipes", "render"), AdminOnly);
+    }
+
+    #[test]
+    fn system_scope_needs_the_system_services_grant() {
+        let apps_only = user(false, BTreeMap::from([(Apps, View)]));
+        let system = user(
+            false,
+            BTreeMap::from([(Apps, View), (SystemServices, View)]),
+        );
+        for module in ["apps", "quadlets"] {
+            let default = serde_json::json!({});
+            let apps = serde_json::json!({ "scope": "apps" });
+            assert_eq!(unmet_field(&apps_only, module, &default), None);
+            assert_eq!(unmet_field(&apps_only, module, &apps), None);
+            for scope in ["system", "all"] {
+                let payload = serde_json::json!({ "scope": scope });
+                assert_eq!(
+                    unmet_field(&apps_only, module, &payload),
+                    Some(("scope", page(SystemServices, View))),
+                    "{module} {scope}"
+                );
+                assert_eq!(unmet_field(&system, module, &payload), None);
+                assert_eq!(
+                    unmet_field(&Principal::Setup, module, &payload).map(|f| f.0),
+                    Some("scope")
+                );
+            }
+            // A grant does not lift the administrator-only fields.
+            let path = serde_json::json!({ "base_dir": "/etc" });
+            assert_eq!(
+                unmet_field(&system, module, &path).map(|f| f.0),
+                Some("base_dir")
+            );
+        }
     }
 
     #[test]
