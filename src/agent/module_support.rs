@@ -31,8 +31,8 @@ pub struct ModuleInfo {
     pub description: &'static str,
     pub status: ModuleStatus,
     pub actions: &'static [&'static str],
-    /// Actions that require root privileges and an active elevation grant on
-    /// headless hosts. The dashboard uses this to request elevation proactively.
+    /// Actions that always run as root. The auth authority checks the
+    /// caller's permissions before admitting them to the dispatch queue.
     pub privileged_actions: &'static [&'static str],
 }
 
@@ -263,24 +263,71 @@ pub(crate) fn output_with_timeout(
     command: &mut Command,
     input: Option<&[u8]>,
 ) -> io::Result<(std::process::Output, io::Result<()>)> {
+    output_with_deadline(command, input, COMMAND_TIMEOUT)
+}
+
+fn kill_command_group(child: &mut std::process::Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let group = nix::unistd::Pid::from_raw(pid);
+        nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL).ok();
+    }
+    child.wait().ok();
+}
+
+fn wait_before(
+    child: &mut std::process::Child,
+    deadline: std::time::Instant,
+) -> io::Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn output_with_deadline(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    timeout: std::time::Duration,
+) -> io::Result<(std::process::Output, io::Result<()>)> {
     use std::{
         io::Write as _,
         os::unix::process::CommandExt as _,
         process::Stdio,
+        sync::mpsc::{self, Receiver},
         thread,
-        time::{Duration, Instant},
+        time::Instant,
     };
-    fn drain(mut pipe: impl io::Read + Send + 'static) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+    fn background<T: Send + 'static>(
+        work: impl FnOnce() -> io::Result<T> + Send + 'static,
+    ) -> Receiver<io::Result<T>> {
+        let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
+            sender.send(work()).ok();
+        });
+        receiver
+    }
+    fn drain(mut pipe: impl io::Read + Send + 'static) -> Receiver<io::Result<Vec<u8>>> {
+        background(move || {
             let mut buffer = Vec::new();
             pipe.read_to_end(&mut buffer).map(|_| buffer)
         })
     }
-    fn join(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
-        handle
-            .join()
-            .unwrap_or_else(|_| Err(io::Error::other("output reader panicked")))
+    fn receive<T>(receiver: &Receiver<io::Result<T>>, deadline: Instant) -> io::Result<T> {
+        receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => io::ErrorKind::TimedOut.into(),
+                mpsc::RecvTimeoutError::Disconnected => io::Error::other("pipe worker panicked"),
+            })?
     }
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::other("command timeout overflow"))?;
 
     let mut child = command
         .stdin(if input.is_some() {
@@ -310,39 +357,46 @@ pub(crate) fn output_with_timeout(
     let writer = match (input, child.stdin.take()) {
         (Some(input), Some(mut stdin)) => {
             let input = input.to_vec();
-            Some(thread::spawn(move || stdin.write_all(&input)))
+            Some(background(move || stdin.write_all(&input)))
         }
         _ => None,
     };
-    let deadline = Instant::now().checked_add(COMMAND_TIMEOUT);
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+    let result = (|| {
+        let status = wait_before(&mut child, deadline)?;
+        // The deadline covers pipe completion too: descendants can retain
+        // any of these descriptors after the direct child has exited.
+        let stdout = receive(&stdout, deadline)?;
+        let stderr = receive(&stderr, deadline)?;
+        let written = writer
+            .as_ref()
+            .map_or(Ok(()), |writer| receive(writer, deadline));
+        if written
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
+        {
+            return Err(io::ErrorKind::TimedOut.into());
         }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            if let Ok(pid) = i32::try_from(child.id()) {
-                let group = nix::unistd::Pid::from_raw(pid);
-                nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL).ok();
-            }
-            child.wait().ok();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("timed out after {COMMAND_TIMEOUT:?}"),
-            ));
+        Ok((
+            std::process::Output {
+                status,
+                stdout,
+                stderr,
+            },
+            written,
+        ))
+    })();
+    if result.is_err() {
+        kill_command_group(&mut child);
+        // Do not join pipe workers: even a descendant that escaped the group
+        // must not prevent the dispatch worker from returning.
+    }
+    result.map_err(|error: io::Error| {
+        if error.kind() == io::ErrorKind::TimedOut {
+            io::Error::new(error.kind(), format!("timed out after {timeout:?}"))
+        } else {
+            error
         }
-        thread::sleep(Duration::from_millis(20));
-    };
-    let written = writer.map_or(Ok(()), |writer| {
-        writer
-            .join()
-            .unwrap_or_else(|_| Err(io::Error::other("input writer panicked")))
-    });
-    let output = std::process::Output {
-        status,
-        stdout: join(stdout)?,
-        stderr: join(stderr)?,
-    };
-    Ok((output, written))
+    })
 }
 
 /// Run a host command, optionally impersonating `default_user`.
@@ -722,6 +776,31 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn deadline_covers_pipes_held_by_descendants() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let error = output_with_deadline(
+            Command::new("sh").args(["-c", "sleep 30 & echo hi"]),
+            None,
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn deadline_covers_a_running_child() {
+        let error = output_with_deadline(
+            Command::new("sleep").arg("30"),
+            None,
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
 
     #[derive(Debug, Deserialize, PartialEq)]
     #[serde(rename_all = "snake_case")]
