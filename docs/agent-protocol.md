@@ -471,7 +471,7 @@ unless a section says otherwise.
 
 Request payloads are plain JSON objects. Payload types shared across modules —
 such as `SelinuxOptions`, `ServiceScope`, `AppScope`, and the `apps` module's
-`App*` requests — are defined in `src/types.rs` and deserialized with `serde`.
+`App*` requests — are defined in `src/types/` and deserialized with `serde`.
 
 ### settings
 
@@ -876,7 +876,7 @@ and a manifest that says `user` is listed as `invalid`. The manifest records the
 values, installed unit filenames, and companion files so `update` can
 re-render and `remove` can clean up without the caller resending the recipe.
 
-Request payloads deserialize into the `App*` types in `src/types.rs`
+Request payloads deserialize into the `App*` types in `src/types/apps.rs`
 (`AppCreateRequest`, `AppUpdateRequest`, `AppGetRequest`, `AppListRequest`,
 `AppRequest` for `remove`), and the manifest is the serialized `AppManifest`
 type. The recipe source is `AppRecipeSource`: exactly one of an inline recipe

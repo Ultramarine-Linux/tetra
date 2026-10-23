@@ -14,7 +14,7 @@ tetra/
 │   ├── lib.rs            # Public API: agent, auth, catalog, enrollment, types
 │   ├── prelude.rs        # Common imports for modules (Mod, ModuleInfo, actions!, ...)
 │   ├── catalog.rs        # Recipe engine (YAML → Tera → Quadlet units)
-│   ├── types.rs          # Shared module payload types (serde)
+│   ├── types/            # Shared module payload types (serde), one file per module area
 │   ├── auth/             # Login, sessions, authorization (see auth-protocol.md)
 │   │   ├── service/      # AuthService: every local-socket operation (one file per area; shell_ops.rs: shell.ticket)
 │   │   ├── api.rs        # Request/response/error types
@@ -272,7 +272,7 @@ inventory) behind an action the authorization table gates.
 
 When a payload type is shared with callers or reused across modules — like
 `ServiceRequest` or the `apps` module's `AppCreateRequest`/`AppManifest` —
-define it in `src/types.rs` so both the agent and external consumers can
+define it in `src/types/` so both the agent and external consumers can
 depend on one serde schema.
 
 ### Shared helpers (`module_support`)
