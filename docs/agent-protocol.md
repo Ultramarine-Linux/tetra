@@ -967,7 +967,11 @@ so templates can
 bind-mount companion files with `Volume={{ bundle_dir }}/...` without the
 caller knowing the agent's layout. An explicitly supplied `bundle_dir`
 always wins, and recipes that do not declare the parameter are unaffected
-(undeclared values never reach the render context).
+(undeclared values never reach the render context). Mount subdirectories
+(`Volume={{ bundle_dir }}/site:/usr/share/nginx/html:ro,z`), not the bundle
+root, which holds `app.json`; a pinned kube unit's `Yaml=` must be
+`{{ bundle_dir }}/<bundled file>` in the real bundle directory (see the
+[image policy](recipes.md#rendered-image-policy)).
 
 `create` renders the recipe, writes the Quadlet units and companion files,
 writes `<bundle>/app.json`, optionally applies SELinux contexts to the bundle,

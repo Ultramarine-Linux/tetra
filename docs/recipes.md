@@ -370,5 +370,14 @@ rechecks the stored/replacement bundle and newly rendered images.
   in development and in production deployments.
 - Use `file` resources for companion content (nginx configs, static HTML) and
   install them via the `quadlets.install.files` agent action.
+- Bind-mount companion *subdirectories* of the bundle, never the bundle itself:
+  `apps` keeps `app.json` (the app's values, secrets included) at the bundle
+  root. The shipped `nginx-site` recipe puts content in `site/` and its nginx
+  config in `conf/`, and mounts `Volume={{ bundle_dir }}/site:/usr/share/nginx/html:ro,z`.
+  Use `,z` (shared `container_file_t`), not `,Z`: the bundle belongs to the
+  apps account, so rootless Podman may relabel it, but Tetra rewrites its
+  files on every update and `,Z`'s per-container MCS categories would be
+  relabeled recursively on every start without isolating anything (all apps
+  share the account, and the content is public anyway).
 - `requires` is metadata for the dashboard/catalog; the renderer itself does
   not verify that Podman or Quadlets are installed.

@@ -1696,6 +1696,48 @@ resources:
         .unwrap();
     }
 
+    /// The shipped nginx-site recipe serves only `site/` (not `app.json`)
+    /// and relabels what it mounts.
+    #[test]
+    fn nginx_site_serves_only_its_site_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let templates = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
+        let response = dispatch(
+            "create",
+            json!({
+                "name": "web",
+                "base_dir": base.path(),
+                "files_base_dir": files.path(),
+                "recipe_path": templates.join("recipes/nginx-site.yaml"),
+                "templates_dir": templates,
+                "values": { "app_id": "web" },
+                "converge": false,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            response["files"],
+            json!(["site/index.html", "conf/default.conf"])
+        );
+        let bundle = files.path().join("web");
+        let unit = fs::read_to_string(base.path().join("web.container")).unwrap();
+        let volumes: Vec<_> = unit.lines().filter(|l| l.starts_with("Volume=")).collect();
+        assert_eq!(
+            volumes,
+            [
+                format!(
+                    "Volume={}/site:/usr/share/nginx/html:ro,z",
+                    bundle.display()
+                ),
+                format!("Volume={}/conf:/etc/nginx/conf.d:ro,z", bundle.display()),
+            ]
+        );
+        assert!(bundle.join("app.json").exists());
+        assert!(bundle.join("site/index.html").exists());
+        assert!(!bundle.join("site/app.json").exists());
+    }
+
     #[test]
     fn create_refuses_an_existing_bundle() {
         let base = tempfile::tempdir().unwrap();
