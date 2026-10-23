@@ -228,6 +228,7 @@ impl Remote {
             action: command.action.clone(),
             ok: response.ok,
             error: response.error.clone(),
+            detail: None,
         });
     }
 }

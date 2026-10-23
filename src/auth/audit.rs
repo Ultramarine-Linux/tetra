@@ -55,6 +55,10 @@ pub struct Entry {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// What else is worth knowing, built by Tetra (never from client text):
+    /// for a web shell, its unit and how it ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Append-only action log. Cheap to clone.
@@ -158,6 +162,7 @@ mod tests {
             action: action.into(),
             ok: true,
             error: None,
+            detail: None,
         }
     }
 

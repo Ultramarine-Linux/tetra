@@ -296,6 +296,46 @@ impl SessionStore {
         Ok(session)
     }
 
+    /// Look up the live session with the public `id` for `client`, without a
+    /// token: for work a session started that outlives its request (a web
+    /// shell). With `touch`, record a use, as [`Self::validate`] does.
+    ///
+    /// # Errors
+    /// Returns why the session is not usable.
+    pub fn by_id(
+        &self,
+        id: &str,
+        client: ClientKind,
+        touch: bool,
+        now: i64,
+    ) -> Result<Session, SessionError> {
+        let mut state = self.lock();
+        let (hash, session) = state
+            .sessions
+            .iter()
+            .find(|(_, session)| session.id == id)
+            .ok_or(SessionError::Invalid)?;
+        if session.client != client {
+            return Err(SessionError::WrongClient);
+        }
+        let hash = hash.clone();
+        if !live(&self.policy, session, now) {
+            state.sessions.remove(&hash);
+            state.dirty = true;
+            return Err(SessionError::Expired);
+        }
+        let session = state.sessions.get_mut(&hash).ok_or(SessionError::Invalid)?;
+        if touch {
+            session.last_seen = now;
+        }
+        let session = session.clone();
+        if touch {
+            state.dirty = true;
+        }
+        drop(state);
+        Ok(session)
+    }
+
     /// Revoke every session matching `select`, returning how many were
     /// revoked.
     ///
@@ -639,6 +679,37 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions.validate(&second, ClientKind::Dashboard, 100),
+            Err(SessionError::Invalid)
+        );
+    }
+
+    #[test]
+    fn sessions_are_found_by_public_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = store(dir.path());
+        let idle = SessionPolicy::default().idle;
+        let (_, session) = sessions.issue(new_user(ClientKind::Dashboard), 0).unwrap();
+        assert_eq!(
+            sessions.by_id(&session.id, ClientKind::Oobe, false, 1),
+            Err(SessionError::WrongClient)
+        );
+        // Looking without touching does not keep the session alive.
+        sessions
+            .by_id(&session.id, ClientKind::Dashboard, false, idle - 1)
+            .unwrap();
+        let touched = sessions
+            .by_id(&session.id, ClientKind::Dashboard, true, idle - 1)
+            .unwrap();
+        assert_eq!(touched.last_seen, idle - 1);
+        sessions
+            .by_id(&session.id, ClientKind::Dashboard, false, 2 * idle - 2)
+            .unwrap();
+        assert_eq!(
+            sessions.by_id(&session.id, ClientKind::Dashboard, false, 2 * idle),
+            Err(SessionError::Expired)
+        );
+        assert_eq!(
+            sessions.by_id(&session.id, ClientKind::Dashboard, false, 0),
             Err(SessionError::Invalid)
         );
     }

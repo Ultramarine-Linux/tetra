@@ -26,6 +26,9 @@
 //!   individually; actions in [`SETUP_ONLY_WITHOUT_ADMIN`] only while no
 //!   eligible administrator exists, and actions in
 //!   [`SETUP_OWN_ACCOUNTS_ONLY`] only on accounts the session created.
+//! - Every signed-in user may open their own web shell (`shell.open`, as
+//!   [`Requirement::Authenticated`]); it runs as that user, never as root.
+//!   The setup session may not.
 //! - Remote controllers (the outbound mTLS control plane) may run everything;
 //!   their actions are recorded in the audit log.
 
@@ -136,6 +139,12 @@ const TABLE: &[(&str, &str, Requirement)] = &[
     ("launcher", "remove", AdminOnly),
     ("launcher", "public_get", AdminOnly),
     ("launcher", "public_set", AdminOnly),
+    // The web shell (`shell.ticket`, then `shell.open`) is an operation, not
+    // a module. It runs the user's own login shell as that user, never as
+    // root (elevation is `sudo` inside it), so every signed-in user may open
+    // one. Listed so it can become a page grant later; the setup session
+    // never gets one.
+    ("shell", "open", Authenticated),
     // System units and their journal: viewing can be granted, managing them
     // is admin-only.
     ("services", "list", page(SystemServices, View)),
@@ -843,6 +852,16 @@ mod tests {
         assert!(!alice.allows("network", "get_config"));
         assert!(!alice.allows("network", "configure"));
         assert!(user(true, Permissions::new()).allows("network", "configure"));
+    }
+
+    #[test]
+    fn every_user_may_open_their_own_shell_but_setup_may_not() {
+        assert_eq!(requirement("shell", "open"), Authenticated);
+        assert!(user(false, default_permissions()).allows("shell", "open"));
+        assert!(user(false, Permissions::new()).allows("shell", "open"));
+        assert!(!Principal::Setup.allows("shell", "open"));
+        assert!(!setup_allows_operation("shell.ticket"));
+        assert!(!setup_allows_operation("shell.open"));
     }
 
     #[test]

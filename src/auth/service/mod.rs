@@ -31,6 +31,7 @@ use super::{
         AuthMethod, ClientKind, NewSession, Session, SessionError, SessionKind, SessionStore,
     },
     setup::{AddressThrottle, Setup},
+    shell::ShellTicket,
     users::{UserRecord, UserStore},
 };
 
@@ -42,6 +43,7 @@ mod dispatch;
 mod launcher_ops;
 mod login;
 mod oobe;
+mod shell_ops;
 
 pub use account::reset_second_factor;
 pub use config::AuthConfig;
@@ -138,6 +140,7 @@ struct Inner {
     enrollments: Pending<PendingTotp>,
     registrations: Pending<Registration>,
     authentications: Pending<Authentication>,
+    shell_tickets: Pending<ShellTicket>,
     pam: Semaphore,
 }
 
@@ -318,6 +321,7 @@ impl AuthService {
                 enrollments: Pending::default(),
                 registrations: Pending::default(),
                 authentications: Pending::default(),
+                shell_tickets: Pending::default(),
                 pam: Semaphore::new(PAM_CONCURRENCY),
             }),
         })
@@ -394,6 +398,13 @@ impl AuthService {
             "setup.status" => return self.setup_status(client, request.token.as_deref()),
             "setup.redeem" => return self.setup_redeem(client, &params(p)?),
             "launcher.can_access" => return self.launcher_can_access(client, &params(p)?),
+            // Turns a connection into a shell stream, so the transport
+            // handles it, and only as a connection's first request.
+            "shell.open" => {
+                return Err(ApiError::bad_request(
+                    "shell.open must be the first request on a new connection",
+                ));
+            }
             _ => {}
         }
         let caller = self.authenticate(client, request.token.as_deref())?;
@@ -432,6 +443,7 @@ impl AuthService {
             "access.set" => self.access_set(&caller, params(p)?).await,
             "setup.complete" => self.setup_complete(&caller).await,
             "module.dispatch" => self.dispatch(&caller, &request.id, params(p)?).await,
+            "shell.ticket" => self.shell_ticket(&caller, params(p)?),
             op => Err(ApiError::new(
                 ErrorCode::UnknownOperation,
                 format!("unknown operation `{op}`"),
@@ -528,57 +540,23 @@ impl AuthService {
     fn authenticate(&self, client: ClientKind, token: Option<&str>) -> Result<Caller, ApiError> {
         let token = token.ok_or_else(ApiError::unauthenticated)?;
         let now = self.now();
-        let session =
-            self.inner
-                .sessions
-                .validate(token, client, now)
-                .map_err(|error| match error {
-                    SessionError::WrongClient => ApiError::new(
-                        ErrorCode::WrongClient,
-                        "this token was issued to the other local client",
-                    ),
-                    SessionError::Invalid | SessionError::Expired => ApiError::unauthenticated(),
-                })?;
-        let revoke = |session: &Session| {
-            let id = session.id.clone();
-            self.inner.sessions.revoke(|s| s.id == id).ok();
-            ApiError::unauthenticated()
-        };
+        let session = self
+            .inner
+            .sessions
+            .validate(token, client, now)
+            .map_err(session_error)?;
         let mut groups = Vec::new();
         let principal = match session.kind {
             SessionKind::Setup => {
                 if self.inner.setup.is_complete() {
-                    return Err(revoke(&session));
+                    return Err(self.revoke_session(&session));
                 }
                 Principal::Setup
             }
             SessionKind::User => {
-                let (Some(uid), Some(username)) = (session.uid, session.username.clone()) else {
-                    return Err(revoke(&session));
-                };
-                // Account state is checked on every request, so locking or
-                // deleting an account ends its sessions immediately.
-                let Some(account) = self.eligible_by_uid(uid, &username)? else {
-                    return Err(revoke(&session));
-                };
-                let epoch = self
-                    .record(uid, &username)?
-                    .map_or(0, |record| record.session_epoch);
-                if session.epoch != epoch {
-                    return Err(revoke(&session));
-                }
-                let admin = account.is_admin();
+                let (principal, account) = self.user_principal(&session)?;
                 groups = account.groups;
-                Principal::User {
-                    uid,
-                    username,
-                    admin,
-                    permissions: if admin {
-                        authz::Permissions::new()
-                    } else {
-                        self.inner.grants.effective(uid)?
-                    },
-                }
+                principal
             }
         };
         Ok(Caller {
@@ -587,6 +565,45 @@ impl AuthService {
             principal,
             groups,
         })
+    }
+
+    /// End `session` because it may no longer be used.
+    fn revoke_session(&self, session: &Session) -> ApiError {
+        let id = session.id.clone();
+        self.inner.sessions.revoke(|s| s.id == id).ok();
+        ApiError::unauthenticated()
+    }
+
+    /// The principal of a user session, after checking that its account
+    /// still exists under the same name, may still log in, and has not ended
+    /// its sessions since (session epoch). Ends the session otherwise.
+    fn user_principal(&self, session: &Session) -> Result<(Principal, Account), ApiError> {
+        let (Some(uid), Some(username)) = (session.uid, session.username.clone()) else {
+            return Err(self.revoke_session(session));
+        };
+        // Account state is checked on every request, so locking or
+        // deleting an account ends its sessions immediately.
+        let Some(account) = self.eligible_by_uid(uid, &username)? else {
+            return Err(self.revoke_session(session));
+        };
+        let epoch = self
+            .record(uid, &username)?
+            .map_or(0, |record| record.session_epoch);
+        if session.epoch != epoch {
+            return Err(self.revoke_session(session));
+        }
+        let admin = account.is_admin();
+        let principal = Principal::User {
+            uid,
+            username,
+            admin,
+            permissions: if admin {
+                authz::Permissions::new()
+            } else {
+                self.inner.grants.effective(uid)?
+            },
+        };
+        Ok((principal, account))
     }
 
     // --- Store key, relying party, access configuration -----------------
@@ -655,6 +672,7 @@ impl AuthService {
             action: action.to_owned(),
             ok: outcome.is_ok(),
             error: outcome.err().map(str::to_owned),
+            detail: None,
         });
     }
 
@@ -662,6 +680,17 @@ impl AuthService {
     /// `name`, which lets it set that account's password and SSH keys.
     pub(crate) fn record_setup_account(&self, session_id: &str, name: &str) -> Result<()> {
         self.inner.sessions.add_created_account(session_id, name)
+    }
+}
+
+/// The answer for a session that cannot be used.
+fn session_error(error: SessionError) -> ApiError {
+    match error {
+        SessionError::WrongClient => ApiError::new(
+            ErrorCode::WrongClient,
+            "this token was issued to the other local client",
+        ),
+        SessionError::Invalid | SessionError::Expired => ApiError::unauthenticated(),
     }
 }
 
