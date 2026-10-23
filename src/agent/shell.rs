@@ -1117,6 +1117,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_detached_systemd_run_ends_the_shell_and_stops_its_unit() {
+        let mut h = harness(fast());
+        let token = login(&h.host, "alice").await;
+        let ticket = ticket(&h.host, &token).await;
+        let mut socket = connect(&h.path).await;
+        assert!(open(&mut socket, &ticket).await.ok);
+        let shell = h.shells.recv().await.unwrap();
+        // `^]` three times: systemd-run exits 0 and hangs up its terminal,
+        // while the unit may run on.
+        shell.exit(Some(0));
+        let FakeShell {
+            terminal,
+            terminated,
+            ..
+        } = shell;
+        drop(terminal);
+        assert_eq!(
+            exit_frame(&mut socket).await,
+            ServerControl::Exit {
+                status: Some(0),
+                reason: ExitReason::Exited
+            }
+        );
+        assert!(terminated.load(Ordering::SeqCst));
+        let server = h.server.clone();
+        until(|| server.open_shells() == 0).await;
+    }
+
+    #[tokio::test]
     async fn a_failed_start_is_an_internal_error_and_logged() {
         let h = harness(fast());
         h.spawner.fail();

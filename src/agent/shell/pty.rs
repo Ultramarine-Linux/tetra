@@ -24,8 +24,8 @@
 //! resizes the inner one.
 //!
 //! [`ShellProcess::terminate`] stops the unit (`SIGTERM` then `SIGHUP` to
-//! everything in it, `SIGKILL` after `TimeoutStopSec`), hangs up systemd-run
-//! and reaps it.
+//! everything in it, `SIGKILL` after `TimeoutStopSec`), whether or not
+//! systemd-run is still running, hangs up systemd-run and reaps it.
 
 use std::{
     io,
@@ -362,20 +362,21 @@ impl ShellProcess for SystemdRunProcess {
 
     fn terminate(&mut self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            // systemd-run waits for the unit, so if it exited normally the
-            // unit is done (and its leftovers were killed with it).
-            let finished =
-                matches!(self.child.try_wait(), Ok(Some(status)) if status.code().is_some());
-            if !finished {
-                stop_unit(&self.systemctl, &self.unit).await;
-                if let Some(pid) = self.child.id().and_then(|pid| i32::try_from(pid).ok()) {
-                    // Its own session and process group (setsid).
-                    nix::sys::signal::killpg(
-                        nix::unistd::Pid::from_raw(pid),
-                        nix::sys::signal::Signal::SIGHUP,
-                    )
-                    .ok();
-                }
+            // Always, even when systemd-run has exited: it also exits while
+            // its unit runs on, when the user detaches it (`^]` three times)
+            // or when it is hung up, and a shell that ignores `SIGHUP` would
+            // then outlive whatever ended it (logout, revocation, a lock,
+            // the idle timeout or the maximum lifetime).
+            stop_units(&self.systemctl, std::slice::from_ref(&self.unit)).await;
+            if matches!(self.child.try_wait(), Ok(None))
+                && let Some(pid) = self.child.id().and_then(|pid| i32::try_from(pid).ok())
+            {
+                // Its own session and process group (setsid).
+                nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGHUP,
+                )
+                .ok();
             }
             if tokio::time::timeout(HANGUP_GRACE, self.child.wait())
                 .await
@@ -389,26 +390,38 @@ impl ShellProcess for SystemdRunProcess {
     }
 }
 
-/// `systemctl stop --no-block <unit>`: `SIGTERM` and `SIGHUP` to every process
-/// of the shell's unit, `SIGKILL` after `TimeoutStopSec`. Failures are logged.
-async fn stop_unit(systemctl: &Path, unit: &str) {
-    let mut command = tokio::process::Command::new(systemctl);
+/// `systemctl stop --no-block <units>`: `SIGTERM` and `SIGHUP` to every
+/// process of the units, `SIGKILL` after `TimeoutStopSec`. Failures are
+/// logged.
+async fn stop_units(systemctl: &Path, units: &[String]) {
+    let mut command = systemctl_command(systemctl);
     command
-        .args(["stop", "--no-block", "--", unit])
-        .env_clear()
-        .env("PATH", "/usr/bin:/usr/sbin")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .args(["stop", "--no-block", "--no-ask-password", "--"])
+        .args(units)
+        .stdout(Stdio::null());
+    let units = units.join(" ");
     match tokio::time::timeout(SYSTEMCTL_TIMEOUT, command.status()).await {
         Ok(Ok(status)) if status.success() => {}
-        // 5: the unit is already gone.
+        // 5: a unit is already gone.
         Ok(Ok(status)) if status.code() == Some(5) => {}
-        Ok(Ok(status)) => eprintln!("`systemctl stop {unit}` failed: {status}"),
-        Ok(Err(error)) => eprintln!("failed to run `systemctl stop {unit}`: {error}"),
-        Err(_) => eprintln!("`systemctl stop {unit}` timed out"),
+        Ok(Ok(status)) => eprintln!("`systemctl stop {units}` failed: {status}"),
+        Ok(Err(error)) => eprintln!("failed to run `systemctl stop {units}`: {error}"),
+        Err(_) => eprintln!("`systemctl stop {units}` timed out"),
     }
+}
+
+/// `systemctl` with a minimal environment and no stdin or stderr, killed if
+/// Tetra stops waiting for it.
+fn systemctl_command(systemctl: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(systemctl);
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/usr/sbin")
+        .env("LANG", "C.UTF-8")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -577,8 +590,66 @@ mod fake {
 }
 
 #[cfg(test)]
+pub(super) mod fake_systemctl {
+    //! A `systemctl` for tests.
+    use std::{path::PathBuf, time::Duration};
+
+    /// A `systemctl` that logs its arguments and lists `listing`.
+    pub struct FakeSystemctl {
+        dir: tempfile::TempDir,
+    }
+
+    impl FakeSystemctl {
+        pub fn new(listing: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("log");
+            let list = dir.path().join("listing");
+            std::fs::write(&list, listing).unwrap();
+            let script = format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                 if [ \"$1\" = list-units ]; then cat '{}'; fi\n",
+                log.display(),
+                list.display()
+            );
+            let path = dir.path().join("systemctl");
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let fake = Self { dir };
+            // Another test's fork may briefly hold the script open for
+            // writing (ETXTBSY); once it runs, nothing can any more.
+            for _ in 0..100 {
+                match std::process::Command::new(&path).arg("probe").status() {
+                    Ok(_) => {
+                        std::fs::remove_file(&log).ok();
+                        return fake;
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            panic!("the fake systemctl stayed busy");
+        }
+
+        pub fn path(&self) -> PathBuf {
+            self.dir.path().join("systemctl")
+        }
+
+        pub fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{fake_systemctl::FakeSystemctl, *};
     use crate::auth::sessions::ClientKind;
 
     fn grant(uid: u32, shell: &str) -> ShellGrant {
@@ -717,6 +788,51 @@ mod tests {
             .unwrap();
         assert!(count <= 6, "{output}");
         assert_eq!(child.wait().await.unwrap().code(), Some(7));
+    }
+
+    fn process(child: tokio::process::Child, systemctl: &FakeSystemctl) -> SystemdRunProcess {
+        SystemdRunProcess {
+            child,
+            unit: "tetra-shell-1000-abc.service".into(),
+            systemctl: systemctl.path(),
+        }
+    }
+
+    #[tokio::test]
+    async fn terminate_stops_the_unit_after_systemd_run_exited() {
+        // systemd-run exits 0 when the user detaches it, while the unit runs on.
+        let systemctl = FakeSystemctl::new("");
+        let child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let mut process = process(child, &systemctl);
+        assert_eq!(process.wait().await.unwrap(), Some(0));
+        process.terminate().await;
+        assert_eq!(
+            systemctl.calls(),
+            ["stop --no-block --no-ask-password -- tetra-shell-1000-abc.service"]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminate_stops_the_unit_and_hangs_up_a_running_systemd_run() {
+        let systemctl = FakeSystemctl::new("");
+        let (_io, _resizer, child) = start(
+            Path::new("/bin/sh"),
+            &["-c".into(), "sleep 60".into()],
+            WindowSize { cols: 80, rows: 24 },
+        )
+        .unwrap();
+        let mut process = process(child, &systemctl);
+        tokio::time::timeout(HANGUP_GRACE, process.terminate())
+            .await
+            .expect("the hangup did not end it");
+        assert!(matches!(process.child.try_wait(), Ok(Some(status)) if status.code().is_none()));
+        assert_eq!(
+            systemctl.calls(),
+            ["stop --no-block --no-ask-password -- tetra-shell-1000-abc.service"]
+        );
     }
 
     /// Starts a real shell through systemd. Needs root and a user to run it
