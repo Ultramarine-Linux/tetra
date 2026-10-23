@@ -14,7 +14,7 @@ use crate::prelude::*;
 
 use super::{
     seal::Sealed,
-    store::{self, Extra, Header, Record, StoreLock},
+    store::{self, Cached, Extra, Header, Record, StoreLock},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,12 +126,18 @@ pub struct PasskeyRecord {
 #[derive(Debug, Clone)]
 pub struct UserStore {
     dir: PathBuf,
+    /// Records last read, by UID: every request of a user session checks
+    /// its record's `session_epoch`.
+    cache: Cached<Option<UserRecord>, u32>,
 }
 
 impl UserStore {
     #[must_use]
-    pub const fn new(dir: PathBuf) -> Self {
-        Self { dir }
+    pub fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            cache: Cached::new(),
+        }
     }
 
     fn path(&self, uid: u32) -> PathBuf {
@@ -146,11 +152,14 @@ impl UserStore {
     /// as often as a reused UID, and ignoring its second factor would fail
     /// open. `tetra auth reset-2fa` clears it.
     pub fn get(&self, uid: u32, username: &str) -> Result<Option<UserRecord>> {
-        let Some(record) = self.read_uid(uid)? else {
+        let cached = self
+            .cache
+            .get(uid, &self.path(uid), || self.read_uid(uid))?;
+        let Some(record) = cached.as_ref() else {
             return Ok(None);
         };
         if record.username == username {
-            return Ok(Some(record));
+            return Ok(Some(record.clone()));
         }
         ensure!(
             record.totp.is_none(),
@@ -184,7 +193,9 @@ impl UserStore {
             .filter(|record| record.username == username)
             .unwrap_or_else(|| UserRecord::new(uid, username));
         let result = change(&mut record)?;
-        store::write(&self.path(uid), &mut record)?;
+        let written = store::write(&self.path(uid), &mut record);
+        self.cache.invalidate(&uid);
+        written?;
         Ok(result)
     }
 

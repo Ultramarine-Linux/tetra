@@ -19,11 +19,7 @@
 //! ([`Tolerant`]): such an entry is shown to administrators only, opens its
 //! stored URL, and is written back unchanged.
 
-use std::{
-    collections::BTreeSet,
-    os::unix::fs::{MetadataExt, PermissionsExt},
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::{collections::BTreeSet, os::unix::fs::PermissionsExt, sync::Arc};
 
 use base64::{
     Engine,
@@ -36,7 +32,7 @@ use crate::prelude::*;
 
 use super::{
     access::{AccessConfig, AccessMode},
-    store::{self, Extra, Header, Record, StoreLock, Tolerant},
+    store::{self, Cached, Extra, Header, Record, StoreLock, Tolerant},
 };
 
 const MAX_NAME: usize = 64;
@@ -403,14 +399,10 @@ pub enum ChangeError {
 pub struct LauncherStore {
     path: PathBuf,
     public_dir: PathBuf,
-    /// The entries last read, keyed by the file's inode, size and mtime:
-    /// `launcher.can_access` runs for every `forward_auth` request.
-    cache: Arc<Mutex<Option<CachedEntries>>>,
+    /// The entries last read: `launcher.can_access` runs for every
+    /// `forward_auth` request.
+    cache: Cached<[Entry]>,
 }
-
-/// `(inode, size, mtime, mtime_nsec)` of `launcher.json`.
-type FileStamp = (u64, u64, i64, i64);
-type CachedEntries = (FileStamp, Arc<[Entry]>);
 
 impl LauncherStore {
     #[must_use]
@@ -418,35 +410,13 @@ impl LauncherStore {
         Self {
             path,
             public_dir,
-            cache: Arc::new(Mutex::new(None)),
+            cache: Cached::new(),
         }
     }
 
-    /// The stored entries, parsed again only when the file changed (every
-    /// write renames a new file into place, so the inode changes).
+    /// The stored entries, parsed again only when the file changed.
     fn entries(&self) -> Result<Arc<[Entry]>> {
-        let stamp = match fs::metadata(&self.path) {
-            Ok(meta) => Some((meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec())),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to read `{}`", self.path.display()));
-            }
-        };
-        let cached = self
-            .cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let (Some(stamp), Some((cached_stamp, entries))) = (stamp, cached)
-            && stamp == cached_stamp
-        {
-            return Ok(entries);
-        }
-        let entries: Arc<[Entry]> = self.load()?.entries.into();
-        *self.cache.lock().unwrap_or_else(PoisonError::into_inner) =
-            stamp.map(|stamp| (stamp, Arc::clone(&entries)));
-        Ok(entries)
+        self.cache.get((), &self.path, || Ok(self.load()?.entries))
     }
 
     /// The public page's path.
@@ -579,7 +549,9 @@ impl LauncherStore {
             Ok(result) => result,
             Err(error) => return Ok(Err(error)),
         };
-        store::write(&self.path, &mut file)?;
+        let written = store::write(&self.path, &mut file);
+        self.cache.invalidate(&());
+        written?;
         self.write_public_page(&file, access)?;
         Ok(Ok(result))
     }

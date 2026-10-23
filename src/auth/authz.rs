@@ -32,14 +32,14 @@
 //! - Remote controllers (the outbound mTLS control plane) may run everything;
 //!   their actions are recorded in the audit log.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use serde_json::json;
 
 use crate::prelude::*;
 use crate::types::{EXPORTS_PATH, SAMBA_CONFIG_PATH};
 
-use super::store::{self, Extra, Header, Record, StoreLock, Tolerant};
+use super::store::{self, Cached, Extra, Header, Record, StoreLock, Tolerant};
 
 /// A dashboard page that permissions are grouped by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -504,12 +504,18 @@ impl Record for GrantsFile {
 #[derive(Debug, Clone)]
 pub struct GrantStore {
     path: PathBuf,
+    /// The grants last read: they are checked on every request of a user
+    /// who is not an administrator.
+    cache: Cached<BTreeMap<u32, Permissions>>,
 }
 
 impl GrantStore {
     #[must_use]
-    pub const fn new(path: PathBuf) -> Self {
-        Self { path }
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            cache: Cached::new(),
+        }
     }
 
     /// Grants for `uid` (without the defaults).
@@ -517,7 +523,7 @@ impl GrantStore {
     /// # Errors
     /// Fails when the file exists but cannot be read.
     pub fn get(&self, uid: u32) -> Result<Permissions> {
-        Ok(self.all()?.remove(&uid).unwrap_or_default())
+        Ok(self.grants()?.get(&uid).cloned().unwrap_or_default())
     }
 
     /// Every stored grant.
@@ -525,13 +531,20 @@ impl GrantStore {
     /// # Errors
     /// Fails when the file exists but cannot be read.
     pub fn all(&self) -> Result<BTreeMap<u32, Permissions>> {
-        Ok(store::read::<GrantsFile>(&self.path)?
-            .unwrap_or_default()
-            .grants
-            .iter()
-            .map(|(uid, stored)| (*uid, known_permissions(stored)))
-            .filter(|(_, permissions)| !permissions.is_empty())
-            .collect())
+        Ok(self.grants()?.as_ref().clone())
+    }
+
+    /// Every stored grant, from the cache while the file is unchanged.
+    fn grants(&self) -> Result<Arc<BTreeMap<u32, Permissions>>> {
+        self.cache.get((), &self.path, || {
+            Ok(store::read::<GrantsFile>(&self.path)?
+                .unwrap_or_default()
+                .grants
+                .iter()
+                .map(|(uid, stored)| (*uid, known_permissions(stored)))
+                .filter(|(_, permissions)| !permissions.is_empty())
+                .collect::<BTreeMap<_, _>>())
+        })
     }
 
     /// Default permissions merged with `uid`'s grants.
@@ -587,7 +600,9 @@ impl GrantStore {
         if grants.is_empty() {
             file.grants.remove(&uid);
         }
-        store::write(&self.path, &mut file)?;
+        let written = store::write(&self.path, &mut file);
+        self.cache.invalidate(&());
+        written?;
         Ok(result)
     }
 }
