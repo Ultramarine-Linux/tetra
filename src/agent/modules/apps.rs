@@ -207,6 +207,7 @@ actions!(Action [payload user] => {
         bundle.inject_dir(&mut values);
         let (recipe, resources) = source.render(&mut values)?;
         crate::catalog::verification::verify_images(&resources, payload.allow_unpinned_images, Some(&bundle.dir))?;
+        check_published_ports(&resources, payload.scope)?;
 
         let outcome = bundle.install(&resources, None, payload.dry_run)?;
         let now = epoch_secs();
@@ -291,6 +292,7 @@ actions!(Action [payload user] => {
         bundle.inject_dir(&mut manifest.values);
         let (recipe, resources) = manifest.recipe.render(&mut manifest.values)?;
         crate::catalog::verification::verify_images(&resources, manifest.allow_unpinned_images, Some(&bundle.dir))?;
+        check_published_ports(&resources, payload.scope)?;
         manifest.secret_keys.extend(recipe.secret_keys().map(str::to_owned));
         manifest.recipe_id = recipe.recipe_id;
         manifest.recipe_version = recipe.version;
@@ -752,6 +754,77 @@ fn remove_under(tree: &Tree, base: &Path, relative: &str, dry_run: bool) -> Resu
         tree.remove_file(&path)?;
     }
     Ok(path)
+}
+
+/// First port the apps account may bind without privileges: the host's
+/// `net.ipv4.ip_unprivileged_port_start` (which covers IPv6 too), 1024 when
+/// it cannot be read. Rootless port forwarders (pasta, rootlessport) bind
+/// in the host's network namespace as the account.
+fn unprivileged_port_start() -> u16 {
+    fs::read_to_string("/proc/sys/net/ipv4/ip_unprivileged_port_start")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(1024)
+}
+
+/// In apps scope, refuse a rendered `PublishPort=` whose host port the apps
+/// account cannot bind (see [`unprivileged_port_start`]), so the mistake is
+/// an error now rather than a service that fails to start. This checks the
+/// units Tetra installs, whatever recipe parameter (and its `min`) produced
+/// the port; system scope is rootful and binds anything. Best effort: ports
+/// published by kube YAML (`hostPort`) or raw `PodmanArgs` are not parsed.
+fn check_published_ports(resources: &[RenderedResource], scope: AppScope) -> Result<()> {
+    if scope != AppScope::Apps {
+        return Ok(());
+    }
+    let start = unprivileged_port_start();
+    for resource in resources {
+        if !matches!(resource.kind, ResourceKind::Container | ResourceKind::Pod) {
+            continue;
+        }
+        for line in resource.contents.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim() != "PublishPort" {
+                continue;
+            }
+            if let Some(port) = published_host_port(value.trim())
+                && port < start
+            {
+                bail!(
+                    "{}: `PublishPort={}` binds host port {port}, but rootless apps can only \
+                     bind ports from {start} up; pick a higher port or put a reverse proxy in \
+                     front",
+                    resource.filename,
+                    value.trim()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The (lowest) host port of a `PublishPort=` value, `[[ip:][host]:]container[/proto]`
+/// with an IPv6 `ip` in brackets and ports possibly ranges (`8000-8010`), or
+/// `None` when it leaves the host port to Podman or cannot be parsed.
+fn published_host_port(value: &str) -> Option<u16> {
+    let value = value.split_once('/').map_or(value, |(ports, _)| ports);
+    // Drop a bracketed IPv6 address; what is left is `:host:container`.
+    let value = match value.strip_prefix('[') {
+        Some(rest) => rest.split_once(']')?.1.strip_prefix(':')?,
+        None => value,
+    };
+    let parts: Vec<&str> = value.split(':').collect();
+    let host = match parts.as_slice() {
+        [_container] => return None,
+        [host, _container] => *host,
+        [_ip, host, _container] => *host,
+        // An unbracketed IPv6 address is not valid here; Podman rejects it.
+        _ => return None,
+    };
+    let low = host.split_once('-').map_or(host, |(low, _)| low);
+    low.trim().parse().ok()
 }
 
 /// Mode of `app.json`, which holds the app's values (secrets included).
@@ -1628,6 +1701,55 @@ resources:
         dispatch("remove", request).unwrap();
         assert!(!files.path().join("demo").exists());
         assert!(!base.path().join("demo-web.container").exists());
+    }
+
+    #[test]
+    fn reads_the_host_port_of_publish_port_values() {
+        for (value, port) in [
+            ("80", None),
+            ("8080:80", Some(8080)),
+            ("80:80/tcp", Some(80)),
+            ("127.0.0.1:443:443", Some(443)),
+            ("127.0.0.1::80", None),
+            ("[::1]:8443:443", Some(8443)),
+            ("[2001:db8::1]:53:53/udp", Some(53)),
+            ("[::]::80", None),
+            ("8000-8010:80-90", Some(8000)),
+            ("garbage:80", None),
+        ] {
+            assert_eq!(published_host_port(value), port, "{value}");
+        }
+    }
+
+    #[test]
+    fn apps_scope_refuses_privileged_host_ports() {
+        let unit = |port: &str| RenderedResource {
+            kind: ResourceKind::Container,
+            filename: "site.container".into(),
+            contents: format!("[Container]\nImage=x\nPublishPort = {port}\n"),
+        };
+        // Rootful system scope binds anything.
+        check_published_ports(&[unit("80:80")], AppScope::System).unwrap();
+        check_published_ports(&[unit("80")], AppScope::Apps).unwrap();
+        check_published_ports(&[unit("65535:80")], AppScope::Apps).unwrap();
+        let start = unprivileged_port_start();
+        if start > 80 {
+            let error = check_published_ports(&[unit("[::]:80:80")], AppScope::Apps).unwrap_err();
+            assert!(error.to_string().contains("rootless"), "{error}");
+            // `create` checks before writing anything.
+            let base = tempfile::tempdir().unwrap();
+            let files = tempfile::tempdir().unwrap();
+            let error = dispatch(
+                "create",
+                site_payload(base.path(), files.path(), &json!({ "http_port": 80 })),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("rootless"), "{error}");
+            assert!(fs::read_dir(files.path()).unwrap().next().is_none());
+            let mut system = site_payload(base.path(), files.path(), &json!({ "http_port": 80 }));
+            system["scope"] = json!("system");
+            dispatch("create", system).unwrap();
+        }
     }
 
     const KUBE_RECIPE: &str = "

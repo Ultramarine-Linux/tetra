@@ -1009,7 +1009,9 @@ skipping what is already there:
 
 The account must exist (`systemd-sysusers`); converging in apps scope fails
 otherwise. Rootless containers cannot publish ports below 1024 unless the
-host lowers `net.ipv4.ip_unprivileged_port_start`; put a reverse proxy in
+host lowers `net.ipv4.ip_unprivileged_port_start`, so in apps scope `create`
+and `update` refuse a `PublishPort=` host port below it (best effort: kube
+`hostPort` and raw `PodmanArgs` are not parsed); put a reverse proxy in
 front instead. Units must use `WantedBy=default.target` (as the shipped
 recipes do): the user manager has no `multi-user.target`.
 

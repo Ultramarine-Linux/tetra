@@ -379,5 +379,9 @@ rechecks the stored/replacement bundle and newly rendered images.
   files on every update and `,Z`'s per-container MCS categories would be
   relabeled recursively on every start without isolating anything (all apps
   share the account, and the content is public anyway).
+- In apps scope (rootless), `apps.create`/`update` refuse a `PublishPort=`
+  whose host port is below the host's `net.ipv4.ip_unprivileged_port_start`
+  (1024 by default), whatever the parameter's `min`; system scope binds any
+  port. Keep `min: 1` for recipes meant for both scopes.
 - `requires` is metadata for the dashboard/catalog; the renderer itself does
   not verify that Podman or Quadlets are installed.
