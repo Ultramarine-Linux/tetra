@@ -129,7 +129,7 @@ Dispatcher flow:
 2. If `module == "agent"` and `action == "capabilities"`, return the metadata for every registered module.
 3. Look up the module by name (`unknown module` otherwise).
 4. Ask `module.metadata(action, payload)`, which answers the shared `capabilities` and `plan` actions.
-5. Take `run_as` out of the payload (or use `module.default_run_as()`) to
+5. Take `run_as` out of the payload (or use `module.default_run_as(action, payload)`) to
    pick the user host commands run as: the signed-in user, the
    `ultramarine-apps` account, root, or both user and root.
 6. Call `module.handle(action, payload, user)`.
@@ -176,7 +176,7 @@ pub trait Mod: Send + Sync {
     fn metadata(&self, action: &str, payload: &Value) -> Option<Value> {
         self.info().metadata_response(action, payload)
     }
-    fn default_run_as(&self) -> RunAs { RunAs::User }
+    fn default_run_as(&self, action: &str, payload: &Value) -> RunAs { RunAs::User }
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value>;
 }
 ```
@@ -185,8 +185,9 @@ pub trait Mod: Send + Sync {
 always run as root. Unprivileged actions run as the `user` the dispatcher
 passes, through `runuser` (with `XDG_RUNTIME_DIR` set when that user's
 manager runs): the session's user, or whoever the payload's `run_as` names.
-A module whose host state belongs to the apps account (`podman`) overrides
-`default_run_as` to `RunAs::Apps`; modules never choose users on their own.
+A module whose host state belongs to the apps account (`podman`; `services`
+for `list`/`status` in apps scope) overrides `default_run_as` to
+`RunAs::Apps`; modules never choose users on their own.
 
 ### Adding a new module
 

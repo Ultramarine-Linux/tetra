@@ -145,7 +145,8 @@ impl Dispatcher {
         if let Some(response) = module.metadata(&command.action, &command.payload) {
             return Ok(response);
         }
-        let run_as = RunAs::take(&mut command.payload)?.unwrap_or_else(|| module.default_run_as());
+        let run_as = RunAs::take(&mut command.payload)?
+            .unwrap_or_else(|| module.default_run_as(&command.action, &command.payload));
         // The command is owned: hand the (possibly large) payload over
         // instead of copying it.
         let payload = std::mem::take(&mut command.payload);
@@ -310,7 +311,7 @@ mod tests {
             }
         }
 
-        fn default_run_as(&self) -> RunAs {
+        fn default_run_as(&self, _: &str, _: &Value) -> RunAs {
             RunAs::Apps
         }
 

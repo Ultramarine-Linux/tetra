@@ -16,6 +16,7 @@ use serde_json::json;
 
 use crate::actions;
 use crate::agent::apps_account::{APPS_USER, AppsAccount};
+use crate::agent::dispatcher::RunAs;
 use crate::agent::module_support::{ModuleInfo, ModuleStatus, positional, run_for};
 use crate::agent::modules::Mod;
 use crate::prelude::*;
@@ -61,6 +62,25 @@ const INFO: ModuleInfo = ModuleInfo {
 impl Mod for ServicesModule {
     fn info(&self) -> ModuleInfo {
         INFO
+    }
+
+    /// `list` and `status` in apps scope run as the apps account: a
+    /// signed-in user's own `runuser` cannot reach the account's manager
+    /// (`-M ultramarine-apps@` needs root), the account reaches it with
+    /// plain `--user`. `logs` keeps the default: the account's entries are
+    /// in the system journal (journald keeps no per-user journal for system
+    /// UIDs), which the account cannot read and root (or an administrator,
+    /// through the journal's ACLs) reads by `_UID`.
+    fn default_run_as(&self, action: &str, payload: &Value) -> RunAs {
+        let apps_scope = payload
+            .get("scope")
+            .and_then(|scope| ServiceScope::deserialize(scope).ok())
+            == Some(ServiceScope::Apps);
+        if apps_scope && matches!(action, "list" | "status") {
+            RunAs::Apps
+        } else {
+            RunAs::User
+        }
     }
 
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
@@ -247,6 +267,25 @@ mod tests {
         assert!(as_apps("status", Some(APPS_USER)));
         assert!(!as_apps("status", Some("alice")));
         assert!(!as_apps("restart", Some(APPS_USER)));
+    }
+
+    #[test]
+    fn apps_scope_reads_default_to_the_apps_account() {
+        let apps = json!({ "scope": "apps", "service": "site.service" });
+        assert_eq!(ServicesModule.default_run_as("list", &apps), RunAs::Apps);
+        assert_eq!(ServicesModule.default_run_as("status", &apps), RunAs::Apps);
+        // Its journal entries are root's to read, by UID.
+        assert_eq!(ServicesModule.default_run_as("logs", &apps), RunAs::User);
+        for payload in [
+            json!({}),
+            json!({ "scope": "system" }),
+            json!({ "scope": "user" }),
+            json!({ "scope": 7 }),
+        ] {
+            assert_eq!(ServicesModule.default_run_as("list", &payload), RunAs::User);
+        }
+        // Privileged actions run as root whatever the default.
+        assert_eq!(ServicesModule.default_run_as("start", &apps), RunAs::User);
     }
 
     #[test]

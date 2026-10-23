@@ -209,7 +209,8 @@ export function bundleSha256(recipe: string, templates: Record<string, string>):
   `account.passkey_register_begin` and `account.passkey_remove` need a login
   from the last 10 minutes. Send the user through login again, then retry.
 - **`run_as`** on module payloads: `"user"` (the default for most reads),
-  `"apps"` (the default for `podman`), `"root"` or `"both"`. `"root"` and
+  `"apps"` (the default for `podman` and for `services.list`/`status` with
+  `"scope": "apps"`), `"root"` or `"both"`. `"root"` and
   `"both"` are admin-only. `"both"` returns
   `{user: {ok, result|error}, root: {ok, result|error}}`.
 - **`podman.inspect`** hides container environment values unless an admin

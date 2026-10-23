@@ -55,7 +55,7 @@ impl Mod for PodmanModule {
 
     /// User apps' containers are the apps account's, so that is the view
     /// reads show unless the payload says otherwise.
-    fn default_run_as(&self) -> RunAs {
+    fn default_run_as(&self, _: &str, _: &Value) -> RunAs {
         RunAs::Apps
     }
 
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn reads_default_to_the_apps_account() {
-        assert_eq!(PodmanModule.default_run_as(), RunAs::Apps);
+        assert_eq!(PodmanModule.default_run_as("ps", &Value::Null), RunAs::Apps);
     }
 
     #[test]

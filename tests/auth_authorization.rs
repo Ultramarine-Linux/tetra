@@ -587,7 +587,7 @@ impl tetra::agent::modules::Mod for StubPodman {
         }
     }
 
-    fn default_run_as(&self) -> tetra::agent::dispatcher::RunAs {
+    fn default_run_as(&self, _: &str, _: &serde_json::Value) -> tetra::agent::dispatcher::RunAs {
         tetra::agent::dispatcher::RunAs::Apps
     }
 

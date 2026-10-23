@@ -111,9 +111,10 @@ pub trait Mod: Send + Sync {
     }
 
     /// Who unprivileged actions run as when the payload has no `run_as`
-    /// (see [`RunAs`]): the signed-in user, unless the module's host state
-    /// is the apps account's (`podman`).
-    fn default_run_as(&self) -> RunAs {
+    /// (see [`RunAs`]): the signed-in user, unless the host state `action`
+    /// reads is the apps account's (`podman`, `services` in apps scope).
+    /// `payload` still has every field but `run_as`.
+    fn default_run_as(&self, _action: &str, _payload: &Value) -> RunAs {
         RunAs::User
     }
 

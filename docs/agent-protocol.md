@@ -340,8 +340,10 @@ whose reads run as `ultramarine-apps`, the account every user app runs under
 Privileged actions always run as root. An unprivileged action's payload may
 add `"run_as"`:
 
-- `"user"`: as the signed-in user (the default, except in `podman`).
-- `"apps"`: as `ultramarine-apps` (the default in `podman`).
+- `"user"`: as the signed-in user (the default, except in `podman` and
+  `services.list`/`status` in apps scope).
+- `"apps"`: as `ultramarine-apps` (the default in `podman`, and for
+  `services.list`/`status` with `"scope": "apps"`).
 - `"root"`: as root, showing the host's view (rootful containers, every VM).
 - `"both"`: runs the action as the signed-in user and as root, and returns
   `{"user": {"ok": true, "result": ...}, "root": {"ok": false, "error": "..."}}`.
@@ -1170,7 +1172,11 @@ Every action takes an optional `scope`:
   ultramarine-apps@`, and `logs` reads `journalctl _UID=<uid>
   _SYSTEMD_USER_UNIT=<service>`; reads with `"run_as": "apps"` use plain
   `--user` as the account itself. A signed-in user's own `runuser` cannot
-  reach the account's manager, so reads in this scope need `run_as`.
+  reach the account's manager, so `list` and `status` in this scope default
+  to `run_as: apps`. `logs` does not: journald keeps a system UID's entries in
+  the system journal, which the account cannot read, so it runs as the
+  signed-in user (who reads them through the journal's ACLs, as an
+  administrator does) or as root.
 
 `list` payload:
 
