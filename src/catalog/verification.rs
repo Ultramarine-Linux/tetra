@@ -1,11 +1,12 @@
 //! Install-time recipe integrity and rendered image policy (no catalog I/O).
 use std::collections::BTreeMap;
+use std::path::{Component, Path};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::RenderedResource;
+use super::{RenderedResource, ResourceKind};
 
 /// Caller-supplied catalog classification; not proof of publisher identity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +109,20 @@ fn check_image(image: &str) -> Result<()> {
 ///
 /// Raw argument overrides and image mounts are deliberately unsupported by
 /// the pinned policy: they can hide extra image pulls from Quadlet's parser.
-pub fn verify_images(resources: &[RenderedResource], allow_unpinned: bool) -> Result<()> {
+/// So are `Exec*=` commands in a unit's `[Service]` section, which run
+/// anything (`ExecStartPre=podman pull ...`) outside the checked directives.
+///
+/// `bundle_dir` is where the bundle's companion files are installed (an
+/// app's bundle directory): a kube unit's `Yaml=` must be the absolute path
+/// of a bundled file there. Quadlet resolves a relative `Yaml=` against the
+/// unit's own directory (the scan directory), not the bundle, so a relative
+/// path would name a file that was never verified (or none at all). Without
+/// a `bundle_dir`, pinned kube units are refused.
+pub fn verify_images(
+    resources: &[RenderedResource],
+    allow_unpinned: bool,
+    bundle_dir: Option<&Path>,
+) -> Result<()> {
     if allow_unpinned {
         return Ok(());
     }
@@ -119,7 +133,7 @@ pub fn verify_images(resources: &[RenderedResource], allow_unpinned: bool) -> Re
             .map_or("", |(_, ext)| ext);
         if !matches!(
             extension,
-            "container" | "image" | "volume" | "pod" | "kube" | "build"
+            "container" | "image" | "volume" | "network" | "pod" | "kube" | "build"
         ) {
             continue;
         }
@@ -174,21 +188,15 @@ pub fn verify_images(resources: &[RenderedResource], allow_unpinned: bool) -> Re
                     bail!("image mounts are unsupported by the pinned image policy")
                 }
                 "Yaml" if section == "Kube" => {
-                    let path = std::path::Path::new(value);
-                    ensure!(
-                        !path.is_absolute()
-                            && path
-                                .components()
-                                .all(|part| matches!(part, std::path::Component::Normal(_))),
-                        "pinned kube Yaml must be a relative bundle path"
-                    );
+                    let yaml = bundled_yaml(resources, value, bundle_dir)?;
                     yaml_seen = true;
-                    let yaml = resources.iter().find(|r| r.filename == value)
-                        .context("pinned kube units require a bundled relative Yaml file (no external paths)")?;
                     for document in serde_norway::Deserializer::from_str(&yaml.contents) {
                         let value = serde_norway::Value::deserialize(document)?;
                         check_yaml(&value)?;
                     }
+                }
+                key if section == "Service" && key.starts_with("Exec") => {
+                    bail!("`{key}=` commands are unsupported by the pinned image policy")
                 }
                 _ => {}
             }
@@ -207,23 +215,80 @@ pub fn verify_images(resources: &[RenderedResource], allow_unpinned: bool) -> Re
     Ok(())
 }
 
+/// The bundled companion file a pinned kube unit's `Yaml=` names: `value`
+/// must be `<bundle_dir>/<filename>` of a `file` resource, spelled as a plain
+/// absolute path (no `..`, no `%` specifiers, no quotes).
+fn bundled_yaml<'a>(
+    resources: &'a [RenderedResource],
+    value: &str,
+    bundle_dir: Option<&Path>,
+) -> Result<&'a RenderedResource> {
+    let bundle_dir = bundle_dir.context(
+        "pinned kube units need the bundle directory (declare a `bundle_dir` parameter) for \
+         an absolute `Yaml=`",
+    )?;
+    let path = Path::new(value);
+    ensure!(
+        path.is_absolute()
+            && path
+                .components()
+                .all(|part| matches!(part, Component::RootDir | Component::Normal(_))),
+        "pinned kube `Yaml={value}` must be an absolute path in the bundle directory `{}` \
+         (Quadlet resolves a relative one against the unit's directory)",
+        bundle_dir.display()
+    );
+    resources
+        .iter()
+        .find(|resource| {
+            let filename = Path::new(&resource.filename);
+            // An absolute filename would replace `bundle_dir` in the join.
+            resource.kind == ResourceKind::File
+                && filename
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+                && bundle_dir.join(filename) == path
+        })
+        .with_context(|| {
+            format!(
+                "pinned kube `Yaml={value}` must name a bundled file in `{}`",
+                bundle_dir.display()
+            )
+        })
+}
+
 fn resource_section(line: &str) -> &'static str {
     match line {
         "[Container]" => "Container",
         "[Image]" => "Image",
         "[Volume]" => "Volume",
+        "[Network]" => "Network",
         "[Pod]" => "Pod",
         "[Kube]" => "Kube",
+        "[Service]" => "Service",
         _ => "",
     }
 }
 
+/// Check every `image` key in a kube YAML document. Podman decodes kube
+/// YAML with `sigs.k8s.io/yaml` (YAML to JSON, then `encoding/json`), which
+/// matches field names case-insensitively, so `Image:` and `IMAGE:` are
+/// image fields too.
 fn check_yaml(value: &serde_norway::Value) -> Result<()> {
     use serde_norway::Value;
     match value {
         Value::Mapping(map) => {
             for (key, value) in map {
-                if key.as_str() == Some("image") {
+                // A tag (`!custom image:`) does not change the key's name.
+                let key = match key {
+                    Value::Tagged(tagged) => &tagged.value,
+                    key => key,
+                };
+                // Only ASCII case matters: of the runes Go folds to ASCII
+                // letters (`K`, `ſ`), none is in `image`.
+                if key
+                    .as_str()
+                    .is_some_and(|key| key.eq_ignore_ascii_case("image"))
+                {
                     check_image(value.as_str().context("kube image must be a string")?)?;
                 } else {
                     check_yaml(value)?;

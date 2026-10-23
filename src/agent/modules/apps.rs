@@ -206,7 +206,7 @@ actions!(Action [payload user] => {
         values.extend(payload.values);
         bundle.inject_dir(&mut values);
         let (recipe, resources) = source.render(&mut values)?;
-        crate::catalog::verification::verify_images(&resources, payload.allow_unpinned_images)?;
+        crate::catalog::verification::verify_images(&resources, payload.allow_unpinned_images, Some(&bundle.dir))?;
 
         let outcome = bundle.install(&resources, None, payload.dry_run)?;
         let now = epoch_secs();
@@ -290,7 +290,7 @@ actions!(Action [payload user] => {
         manifest.values.extend(incoming);
         bundle.inject_dir(&mut manifest.values);
         let (recipe, resources) = manifest.recipe.render(&mut manifest.values)?;
-        crate::catalog::verification::verify_images(&resources, manifest.allow_unpinned_images)?;
+        crate::catalog::verification::verify_images(&resources, manifest.allow_unpinned_images, Some(&bundle.dir))?;
         manifest.secret_keys.extend(recipe.secret_keys().map(str::to_owned));
         manifest.recipe_id = recipe.recipe_id;
         manifest.recipe_version = recipe.version;
@@ -1628,6 +1628,72 @@ resources:
         dispatch("remove", request).unwrap();
         assert!(!files.path().join("demo").exists());
         assert!(!base.path().join("demo-web.container").exists());
+    }
+
+    const KUBE_RECIPE: &str = "
+recipe_id: kube-demo
+name: Kube demo
+version: 1.0.0
+parameters:
+  - key: bundle_dir
+    label: Bundle directory
+    type: string
+resources:
+  - type: kube
+    filename: demo.kube
+    template: demo.kube.tera
+  - type: file
+    filename: kube/pod.yaml
+    template: pod.yaml.tera
+";
+
+    fn kube_payload(base_dir: &Path, files_base_dir: &Path, yaml: &str) -> Value {
+        json!({
+            "name": "kube",
+            "base_dir": base_dir,
+            "files_base_dir": files_base_dir,
+            "recipe": KUBE_RECIPE,
+            "templates": {
+                "demo.kube.tera": format!("[Kube]\nYaml={yaml}\n"),
+                "pod.yaml.tera": "spec:\n  containers:\n    - Image: docker.io/library/nginx:alpine@sha256:a3554c0d0b48177b1413c26e01f695334428020d9df01243fbae3e11cfd17417\n",
+            },
+            "converge": false,
+        })
+    }
+
+    /// Quadlet resolves a relative `Yaml=` against the scan directory, not
+    /// the bundle: a pinned kube app must point at its bundle by absolute
+    /// path, which `create` checks against the real bundle directory.
+    #[test]
+    fn pinned_kube_apps_name_their_yaml_in_the_bundle() {
+        let base = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        for yaml in ["kube/pod.yaml", "/srv/elsewhere/kube/pod.yaml"] {
+            let error =
+                dispatch("create", kube_payload(base.path(), files.path(), yaml)).unwrap_err();
+            assert!(error.to_string().contains("Yaml="), "{error}");
+        }
+        // A caller-supplied `bundle_dir` is not where the bundle is.
+        let mut moved = kube_payload(base.path(), files.path(), "{{ bundle_dir }}/kube/pod.yaml");
+        moved["values"] = json!({ "bundle_dir": "/srv/elsewhere" });
+        dispatch("create", moved).unwrap_err();
+        assert!(fs::read_dir(base.path()).unwrap().next().is_none());
+
+        dispatch(
+            "create",
+            kube_payload(base.path(), files.path(), "{{ bundle_dir }}/kube/pod.yaml"),
+        )
+        .unwrap();
+        let unit = fs::read_to_string(base.path().join("demo.kube")).unwrap();
+        let yaml = files.path().join("kube/kube/pod.yaml");
+        assert_eq!(unit, format!("[Kube]\nYaml={}\n", yaml.display()));
+        assert!(yaml.exists());
+        // `update` checks the same way.
+        dispatch(
+            "update",
+            json!({ "name": "kube", "base_dir": base.path(), "files_base_dir": files.path(), "converge": false }),
+        )
+        .unwrap();
     }
 
     #[test]

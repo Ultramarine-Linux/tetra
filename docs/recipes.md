@@ -331,12 +331,23 @@ are not image pulls; consumers must still use a digest. References such as
 `Image=foo.image` or `foo.build` are refused; use registry digests directly.
 Container/image units must have an Image directive.
 
-Kube units require `Yaml=` naming a relative companion resource in the bundle.
-All YAML documents are parsed and every `image` key is checked, including
+Kube units require `Yaml=` naming a companion `file` resource by its absolute
+path in the app's bundle directory, spelled plainly (no `..`, `%` specifiers or
+quotes): declare a `bundle_dir` parameter and write
+`Yaml={{ bundle_dir }}/kube/pod.yaml`. Quadlet resolves a relative `Yaml=`
+against the unit's own directory (the Quadlet scan directory, see
+[`quadlet.go`](https://github.com/containers/podman/blob/v5.6.0/pkg/systemd/quadlet/quadlet.go)),
+not the bundle, so a relative path would name a file that was never checked.
+`apps.create`/`update` check against the real bundle directory (a
+caller-supplied `bundle_dir` elsewhere fails); `recipes.render`/`render_inline`
+against the `bundle_dir` the recipe renders with, and refuse pinned kube units
+without one. All YAML documents are parsed and every `image` key is checked,
+matched case-insensitively as Podman's decoder does (`Image:` counts), including
 containers, initContainers, and ephemeralContainers. External YAML paths/URLs
-are refused. Raw `PodmanArgs`/`GlobalArgs`, image mounts, build units, and pod
-units (implicit infra-image pulls) are unsupported by the pinned policy and
-require the explicit custom-only opt-out. This is an image policy, not a sandbox
+are refused. Raw `PodmanArgs`/`GlobalArgs`, image mounts, `Exec*=` commands in
+a unit's `[Service]` section (`ExecStartPre=podman pull ...` runs anything),
+build units, and pod units (implicit infra-image pulls) are unsupported by the
+pinned policy and require the explicit custom-only opt-out. This is an image policy, not a sandbox
 for arbitrary host configuration in administrator-supplied recipes.
 See [Quadlet documentation](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html).
 

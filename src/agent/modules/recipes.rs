@@ -87,8 +87,8 @@ actions!(Action [payload user] => {
         }.snapshot()?;
         let source = bundle.verify(payload.source.as_ref(), payload.allow_unpinned_images)?;
         let mut values = load_values(payload.values_path.as_ref())?;
-        let (_, resources) = bundle.render(&mut values)?;
-        verify_images(&resources, payload.allow_unpinned_images)?;
+        let (recipe, resources) = bundle.render(&mut values)?;
+        verify_images(&resources, payload.allow_unpinned_images, bundle_dir(&recipe, &values).as_deref())?;
         if let Some(output_dir) = payload.output_dir {
             for resource in &resources {
                 write_under(&output_dir, &resource.filename, resource.contents.as_bytes(),
@@ -112,7 +112,8 @@ actions!(Action [payload user] => {
         let recipe = AppRecipe::load_str(&payload.recipe)?;
         let resources =
             recipe.render_with_templates(&payload.values, &payload.templates)?;
-        verify_images(&resources, payload.allow_unpinned_images)?;
+        verify_images(&resources, payload.allow_unpinned_images,
+            bundle_dir(&recipe, &payload.values).as_deref())?;
         // Echo the parsed recipe alongside the rendered resources so
         // the dashboard can display normalized metadata (id, version,
         // parameters) without re-parsing the YAML it just sent.
@@ -137,3 +138,15 @@ actions!(Action [payload user] => {
         Ok(json!({ "recipe": recipe, "context": context }))
     },
 });
+
+/// The `bundle_dir` the recipe renders with (its value or default), which a
+/// pinned kube unit's `Yaml=` must point into: there is no installed bundle
+/// to check against when only rendering.
+fn bundle_dir(recipe: &AppRecipe, values: &BTreeMap<String, YamlValue>) -> Option<PathBuf> {
+    let parameter = recipe.parameters.iter().find(|p| p.key == "bundle_dir")?;
+    parameter
+        .json_value(values)
+        .ok()?
+        .as_str()
+        .map(PathBuf::from)
+}

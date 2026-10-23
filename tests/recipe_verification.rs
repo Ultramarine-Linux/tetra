@@ -32,7 +32,7 @@ fn catalog_integrity_and_opt_out_matrix() {
                 .unwrap();
             for allow in [false, true] {
                 let result = verify_source(RECIPE, &templates, Some(&source), allow)
-                    .and_then(|_| verify_images(&resources, allow));
+                    .and_then(|_| verify_images(&resources, allow, None));
                 assert_eq!(
                     result.is_ok(),
                     (image == PIN || allow) && (!allow || catalog == CatalogKind::Custom)
@@ -57,7 +57,7 @@ fn catalog_integrity_and_opt_out_matrix() {
         .unwrap()
         .render_with_templates(&BTreeMap::new(), &templates)
         .unwrap();
-    verify_images(&resources, false).unwrap_err();
+    verify_images(&resources, false, None).unwrap_err();
 }
 
 #[test]
@@ -94,6 +94,7 @@ fn covers_quadlet_images_continuations_and_kube_yaml() {
         verify_images(
             &[resource(filename, &format!("[{section}]\nImage={PIN}\n"))],
             false,
+            None,
         )
         .unwrap();
         for image in [
@@ -106,6 +107,7 @@ fn covers_quadlet_images_continuations_and_kube_yaml() {
             verify_images(
                 &[resource(filename, &format!("[{section}]\nImage={image}\n"))],
                 false,
+                None,
             )
             .unwrap_err();
         }
@@ -116,6 +118,7 @@ fn covers_quadlet_images_continuations_and_kube_yaml() {
             &format!("[Container]\nImage=\\\n{PIN}\n"),
         )],
         false,
+        None,
     )
     .unwrap();
     for directive in [
@@ -130,27 +133,151 @@ fn covers_quadlet_images_continuations_and_kube_yaml() {
                 &format!("[Container]\nImage={PIN}\n{directive}\n"),
             )],
             false,
+            None,
         )
         .unwrap_err();
     }
-    let kube = resource("a.kube", "[Kube]\nYaml=pod.yaml\n");
-    let yaml = resource(
-        "pod.yaml",
-        &format!(
-            "spec:\n  containers:\n    - image: {PIN}\n  initContainers:\n    - image: {PIN}\n"
-        ),
+    verify_images(&[resource("a.pod", "[Pod]\n")], false, None).unwrap_err();
+}
+
+#[test]
+fn refuses_service_exec_commands() {
+    // Exec commands in [Service] run outside the checked directives.
+    for unit in ["a.container", "a.kube", "a.volume", "a.network", "a.image"] {
+        let section = match unit {
+            "a.container" => "Container",
+            "a.kube" => "Kube",
+            "a.volume" => "Volume",
+            "a.network" => "Network",
+            _ => "Image",
+        };
+        for exec in [
+            "ExecStartPre=/usr/bin/podman pull nginx",
+            "ExecStartPost=/bin/true",
+            "ExecStop=/bin/true",
+            "ExecReload=/bin/true",
+            " ExecCondition = /bin/true",
+        ] {
+            let error = verify_images(
+                &[resource(
+                    unit,
+                    &format!("[{section}]\nImage={PIN}\n[Service]\n{exec}\n"),
+                )],
+                false,
+                None,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("unsupported"), "{unit}: {error}");
+        }
+    }
+    // Other [Service] keys, and Exec= of the container itself, are fine.
+    verify_images(
+        &[resource(
+            "a.container",
+            &format!(
+                "[Container]\nImage={PIN}\nExec=nginx -g 'daemon off;'\n[Service]\nRestart=always\n"
+            ),
+        )],
+        false,
+        None,
+    )
+    .unwrap();
+    // A custom recipe that opts out may keep them.
+    verify_images(
+        &[resource(
+            "a.container",
+            "[Container]\nImage=nginx\n[Service]\nExecStartPre=/bin/true\n",
+        )],
+        true,
+        None,
+    )
+    .unwrap();
+}
+
+#[test]
+fn kube_yaml_is_a_bundled_file_by_absolute_path() {
+    // Quadlet resolves a relative Yaml= against the unit's directory, so a
+    // pinned kube unit must name the bundled file by its absolute path in
+    // the bundle directory.
+    let bundle = std::path::Path::new("/srv/apps/site");
+    let kube = resource("a.kube", "[Kube]\nYaml=/srv/apps/site/kube/pod.yaml\n");
+    let pod = |spec: &str| resource("kube/pod.yaml", spec);
+    let pinned = format!(
+        "spec:\n  containers:\n    - image: {PIN}\n  initContainers:\n    - image: {PIN}\n"
     );
-    verify_images(&[kube.clone(), yaml], false).unwrap();
+    verify_images(&[kube.clone(), pod(&pinned)], false, Some(bundle)).unwrap();
     verify_images(
         &[
             kube.clone(),
-            resource("pod.yaml", "spec:\n  initContainers:\n    - image: nginx\n"),
+            pod("spec:\n  initContainers:\n    - image: nginx\n"),
         ],
         false,
+        Some(bundle),
     )
     .unwrap_err();
-    verify_images(&[kube], false).unwrap_err();
-    verify_images(&[resource("a.pod", "[Pod]\n")], false).unwrap_err();
+    // Podman's decoder matches field names case-insensitively.
+    for key in ["Image", "IMAGE", "iMaGe", "!custom image"] {
+        let error = verify_images(
+            &[
+                kube.clone(),
+                pod(&format!(
+                    "spec:\n  containers:\n    - image: {PIN}\n      {key}: nginx\n"
+                )),
+            ],
+            false,
+            Some(bundle),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("@sha256"), "{key}: {error}");
+    }
+    for yaml in [
+        // Relative: resolved against the scan directory.
+        "kube/pod.yaml",
+        // Another directory, a traversal, a specifier, quotes.
+        "/srv/apps/other/kube/pod.yaml",
+        "/srv/apps/site/../site/kube/pod.yaml",
+        "%h/.local/share/tetra/quadlets/site/kube/pod.yaml",
+        "\"/srv/apps/site/kube/pod.yaml\"",
+        // Not a bundled file.
+        "/srv/apps/site/kube/other.yaml",
+        "/etc/passwd",
+    ] {
+        verify_images(
+            &[
+                resource("a.kube", &format!("[Kube]\nYaml={yaml}\n")),
+                pod(&pinned),
+            ],
+            false,
+            Some(bundle),
+        )
+        .unwrap_err();
+    }
+    // A unit (not a companion) of the same name is not the bundled YAML.
+    verify_images(
+        &[
+            kube.clone(),
+            RenderedResource {
+                kind: ResourceKind::Container,
+                ..pod(&pinned)
+            },
+        ],
+        false,
+        Some(bundle),
+    )
+    .unwrap_err();
+    // An absolute companion filename is not in the bundle.
+    verify_images(
+        &[
+            resource("a.kube", "[Kube]\nYaml=/etc/pod.yaml\n"),
+            resource("/etc/pod.yaml", &pinned),
+        ],
+        false,
+        Some(bundle),
+    )
+    .unwrap_err();
+    // Without a bundle directory there is nothing to point Yaml= at.
+    verify_images(&[kube.clone(), pod(&pinned)], false, None).unwrap_err();
+    verify_images(&[kube], false, Some(bundle)).unwrap_err();
 }
 
 #[test]
@@ -178,7 +305,7 @@ fn disk_snapshot_and_bundled_templates_pass() {
             "cloud.example.test".into(),
         )]))
         .unwrap();
-    verify_images(&resources, false).unwrap();
+    verify_images(&resources, false, None).unwrap();
     assert_eq!(provenance.catalog, CatalogKind::Custom);
     for (filename, contents) in [
         (
@@ -198,7 +325,7 @@ fn disk_snapshot_and_bundled_templates_pass() {
             include_str!("../templates/containers/redis.container.tera"),
         ),
     ] {
-        verify_images(&[resource(filename, contents)], false).unwrap();
+        verify_images(&[resource(filename, contents)], false, None).unwrap();
     }
 }
 
