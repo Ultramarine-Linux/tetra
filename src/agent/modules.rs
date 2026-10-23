@@ -6,11 +6,48 @@ use crate::agent::module_support::ModuleInfo;
 use crate::prelude::*;
 pub use settings::SettingsModule;
 
+// Declared here rather than inside `modules!` so rustfmt (and `cargo fmt
+// --check` in CI) sees these files.
+#[cfg(feature = "apps")]
+pub mod apps;
+#[cfg(feature = "files")]
+pub mod files;
+#[cfg(feature = "network")]
+pub mod network;
+#[cfg(feature = "nfs")]
+pub mod nfs;
+#[cfg(feature = "podman")]
+pub mod podman;
+#[cfg(feature = "power")]
+pub mod power;
+#[cfg(feature = "quadlets")]
+pub mod quadlets;
+#[cfg(feature = "recipes")]
+pub mod recipes;
+#[cfg(feature = "remote-access")]
+pub mod remote_access;
+#[cfg(feature = "reverse-proxy")]
+pub mod reverse_proxy;
+#[cfg(feature = "samba")]
+pub mod samba;
+#[cfg(feature = "selinux")]
+pub mod selinux;
+#[cfg(feature = "services")]
+pub mod services;
+#[cfg(feature = "storage")]
+pub mod storage;
+#[cfg(feature = "updates")]
+pub mod updates;
+#[cfg(feature = "users")]
+pub mod users;
+#[cfg(feature = "virtual-machines")]
+pub mod virtual_machines;
+
+/// Re-export each module type and register them all: `file: "feature" =>
+/// Type`, one per `pub mod` above.
 macro_rules! modules {
     ($($m:ident: $feature:literal => $Module:ident),+ $(,)?) => {
         $(
-            #[cfg(feature = $feature)]
-            pub mod $m;
             #[cfg(feature = $feature)]
             pub use $m::$Module;
         )+
