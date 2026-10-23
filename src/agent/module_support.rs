@@ -358,10 +358,13 @@ pub(crate) fn output_with_timeout(
 /// Run a host command, optionally impersonating `default_user`.
 ///
 /// When `default_user` is `Some` (and Tetra runs as root), the command is
-/// wrapped in `runuser -u <user> -- <program> <args>`. This lets Tetra run as
-/// root while executing day-to-day operations (podman inspect, reading
-/// configs) with unprivileged credentials. Privileged actions bypass this
-/// wrapper by passing `default_user: None`.
+/// wrapped in `runuser -u <user> -- <program> <args>`, with
+/// `XDG_RUNTIME_DIR=/run/user/<uid>` when that directory exists (rootless
+/// Podman and `systemctl --user` need it; the lingering `ultramarine-apps`
+/// account always has one). This lets Tetra run as root while executing
+/// day-to-day operations (podman inspect, reading configs) with
+/// unprivileged credentials. Privileged actions bypass this wrapper by
+/// passing `default_user: None`.
 ///
 /// # Errors
 /// An error is returned if the command fails to start, times out, or exits
@@ -384,6 +387,12 @@ where
         Some(user) if DEFAULT_USER_SUPPORT && nix::unistd::geteuid().is_root() => {
             let mut command = Command::new("runuser");
             command.args(["-u", user, "--", program]);
+            // `runuser` keeps the environment, and Tetra's has no runtime
+            // directory: point rootless Podman and `systemctl --user` at
+            // the user's manager, when it runs.
+            if let Some(runtime_dir) = user_runtime_dir(user) {
+                command.env("XDG_RUNTIME_DIR", runtime_dir);
+            }
             command
         }
         _ => Command::new(program),
@@ -391,6 +400,12 @@ where
     let (output, _) = output_with_timeout(command.args(args), None)
         .with_context(|| format!("failed to run `{display}`"))?;
     CommandResult::finish(display, &output)
+}
+
+/// `/run/user/<uid>` of `user`, when it exists.
+fn user_runtime_dir(user: &str) -> Option<PathBuf> {
+    let uid = nix::unistd::User::from_name(user).ok().flatten()?.uid;
+    Some(super::apps_account::runtime_dir(uid.as_raw())).filter(|dir| dir.is_dir())
 }
 
 /// Run `program` with `input` on its stdin, as Tetra's own user.

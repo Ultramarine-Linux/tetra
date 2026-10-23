@@ -18,6 +18,7 @@
 //!   listener in production; [`transport`] holds the shared endpoint-parsing
 //!   config.
 
+pub mod apps_account;
 pub mod command;
 pub mod config;
 #[cfg(feature = "dev-listener")]

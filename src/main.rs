@@ -12,7 +12,7 @@ use tokio::sync::watch;
 
 use tetra::{
     agent::{
-        AgentCommand, Dispatcher,
+        AgentCommand, Dispatcher, apps_account,
         config::{self, RuntimeConfig},
         identity::{HostIdentity, public_key_fingerprint},
         local_protocol::LocalServer,
@@ -612,6 +612,7 @@ async fn agent_serve(cli: AgentServeCli) -> Result<()> {
     };
     let listener = local_socket::listener(&cli.socket)?;
     peer::check_socket_group();
+    apps_account::check_apps_account();
 
     let enrollment_dir = cli.enrollment_dir;
     let select = move |config: &RuntimeConfig| remote::connection_from(config, &enrollment_dir);
