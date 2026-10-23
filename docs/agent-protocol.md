@@ -79,8 +79,8 @@ tetra agent-connect --config /etc/tetra/agent-transport.json --host-id host-01
 3. `hello`: Immediately after WSS open, the agent sends a small hello frame with
    agent metadata. The dashboard uses this to mark the host online.
 4. `capabilities`: The dashboard sends `agent.capabilities` as its first
-   command or relies on a capabilities frame in the hello response. The
-   dashboard should cache the enabled module/action set per connection.
+   command (the hello frame carries no capabilities) and should cache the
+   enabled module/action set per connection.
 5. `dispatch`: The dashboard sends one `AgentCommand` per requested operation.
    The agent replies with the matching `AgentResponse.id`.
 6. `heartbeat`: The agent and dashboard exchange pings or heartbeat frames so

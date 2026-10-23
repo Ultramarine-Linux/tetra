@@ -13,7 +13,9 @@ a Unix socket at `/run/tetra/tetra.sock` (`agent-serve`). This is the only
 listener a production install runs; Tetra does not listen on the network.
 Tetra identifies the client from the socket's peer credentials and is the only
 authority for login and authorization: users log in with a password (PAM) plus
-TOTP, or a passkey, and every request carries a Tetra-issued session token. See
+TOTP, or a passkey, and every request after login carries a Tetra-issued
+session token (login, setup-code redemption, the app access check and
+`shell.open` take none; see the "no token" operations). See
 [docs/auth-protocol.md](docs/auth-protocol.md).
 
 An outbound mTLS WSS connection (`wss://` only) to a remote control plane also
@@ -176,7 +178,8 @@ sudo target/debug/tetra agent-ws-serve \
 `--client` accepts `dashboard` or `oobe` and defaults to `dashboard`. Since
 TCP has no peer credentials, the selected client is applied to every
 connection; any local process that reaches the port gets that client identity,
-but every request still needs a valid Tetra session. `--listen` rejects
+but every operation still needs what it needs on the socket (a valid Tetra
+session, except the "no token" ones such as login). `--listen` rejects
 non-loopback addresses. TLS is omitted because this
 loopback-only development endpoint is not a remote transport and cannot replace
 the process credentials of the Unix socket. Use the Unix socket in production.
@@ -355,7 +358,7 @@ The controller-side API is described in
 ## Authentication and Authorization
 
 Local clients authenticate users through Tetra and send a session token with
-every request; Tetra authorizes each action from the user's admin status
+every request after login (the "no token" operations aside); Tetra authorizes each action from the user's admin status
 (`ultramarine-admin` or `wheel`) and per-page grants. See
 [docs/auth-protocol.md](docs/auth-protocol.md). Outbound WSS uses mTLS for
 transport identity, with the client certificate issued by `tetra enroll`; its

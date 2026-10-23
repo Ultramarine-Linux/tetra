@@ -164,6 +164,11 @@ On an error Tetra sends a normal error response and closes the connection:
   (`Image=…@sha256:<64 hex>`). Only `"custom"` may send
   `"allow_unpinned_images": true`.
 - **`url`** is recorded for the audit trail only; Tetra never fetches it.
+- **`catalog` is a claim, not a verification.** Tetra checks that the bytes
+  match `sha256` and applies the pinning policy for the claimed catalog; it
+  cannot know who published them. Don't show an app as "verified" or
+  "official" in the UI because of the stored `source.catalog`; that is only
+  as trustworthy as the catalog index the dashboard took the digest from.
 - **Response:** the manifest records `source` (with the digest Tetra
   computed) and `allow_unpinned_images`.
 - **`apps.update`** with a new recipe and no `source` makes the app custom
@@ -221,5 +226,8 @@ export function bundleSha256(recipe: string, templates: Record<string, string>):
   - a user can have at most 32 sessions; the 33rd login ends the oldest.
   - `users.set_password` and `users.delete` end the target's other
     sessions.
-- **Ignored fields:** the local socket ignores `signature` and
-  controller-key login. Remote commands ignore `user` and run as root.
+- **No signatures:** commands are not signed. `module.dispatch` params take
+  only `module`, `action` and `payload`, and unknown fields such as
+  `signature` are refused (`bad_request`); controller-key login is gone. On
+  the remote path an empty `signature` string is refused and any other value
+  is ignored. Remote commands ignore `user` and run as root.
