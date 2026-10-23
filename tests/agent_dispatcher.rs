@@ -401,13 +401,16 @@ fn apps_create_dry_run_previews_systemd_commands() {
         .iter()
         .map(|op| op["command"].as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
+    // Apps run rootless under `ultramarine-apps` by default.
     assert_eq!(
         commands,
         [
-            "systemctl daemon-reload",
-            "systemctl start demo-web.service",
+            "systemctl --user -M ultramarine-apps@ daemon-reload",
+            "systemctl --user -M ultramarine-apps@ start demo-web.service",
         ]
     );
+    assert_eq!(payload["app"]["scope"], "apps");
+    assert!(payload["account"].as_array().is_some());
     assert!(!dir.path().join("demo-web.container").exists());
 }
 

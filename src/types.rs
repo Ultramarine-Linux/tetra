@@ -445,25 +445,73 @@ impl SambaWriteConfigRequest {
     }
 }
 
+/// Which service manager a `services` action talks to.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceScope {
+    /// The system manager.
     #[default]
     System,
+    /// The user manager of whoever the command runs as (`systemctl --user`).
     User,
+    /// The user manager of the `ultramarine-apps` account that user apps run
+    /// under (`systemctl --user -M ultramarine-apps@`).
+    Apps,
 }
 
 impl ServiceScope {
+    /// `args` for `systemctl` in this scope, run as root (or as anyone, for
+    /// `system` and `user`).
     #[must_use]
     pub fn command_args<const N: usize>(self, args: [&str; N]) -> Vec<&str> {
-        match self {
-            Self::System => args.to_vec(),
-            Self::User => {
-                let mut scoped = Vec::with_capacity(args.len().saturating_add(1));
-                scoped.push("--user");
-                scoped.extend(args);
-                scoped
-            }
+        self.command_args_as(args, false)
+    }
+
+    /// `args` for `systemctl` in this scope. In `apps` scope, a command run
+    /// as the apps account itself (`as_apps`) reaches its manager with
+    /// `--user`; root needs `-M ultramarine-apps@`.
+    #[must_use]
+    pub fn command_args_as<const N: usize>(self, args: [&str; N], as_apps: bool) -> Vec<&str> {
+        let prefix: &[&str] = match self {
+            Self::System => &[],
+            Self::User => &["--user"],
+            Self::Apps if as_apps => &["--user"],
+            Self::Apps => &[
+                "--user",
+                "-M",
+                crate::agent::apps_account::SYSTEMCTL_MACHINE,
+            ],
+        };
+        let mut scoped = Vec::with_capacity(args.len().saturating_add(prefix.len()));
+        scoped.extend_from_slice(prefix);
+        scoped.extend(args);
+        scoped
+    }
+}
+
+/// Where an app, or a Quadlet of the `quadlets` module, is installed.
+///
+/// There is no per-user scope: every user app is a rootless Quadlet of the
+/// one `ultramarine-apps` account, whoever installed it. A payload or stored
+/// manifest that still says `user` is refused.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppScope {
+    /// Rootless, under the `ultramarine-apps` account: units in its
+    /// `~/.config/containers/systemd`, companion files and manifests in its
+    /// `~/.local/share/tetra/quadlets`, services in its user manager.
+    #[default]
+    Apps,
+    /// Rootful, for real system services: `/etc/containers/systemd`,
+    /// `/var/lib/tetra/quadlets` and the system manager.
+    System,
+}
+
+impl From<AppScope> for ServiceScope {
+    fn from(scope: AppScope) -> Self {
+        match scope {
+            AppScope::Apps => Self::Apps,
+            AppScope::System => Self::System,
         }
     }
 }
@@ -500,7 +548,7 @@ pub(crate) const fn default_true() -> bool {
 pub struct AppRequest {
     pub name: String,
     #[serde(default)]
-    pub scope: ServiceScope,
+    pub scope: AppScope,
     pub base_dir: Option<PathBuf>,
     pub files_base_dir: Option<PathBuf>,
     #[serde(default = "default_true")]
@@ -564,7 +612,7 @@ impl AppRecipeSource {
 pub struct AppCreateRequest {
     pub name: String,
     #[serde(default)]
-    pub scope: ServiceScope,
+    pub scope: AppScope,
     pub base_dir: Option<PathBuf>,
     pub files_base_dir: Option<PathBuf>,
     pub recipe: Option<String>,
@@ -617,7 +665,7 @@ impl AppCreateRequest {
 pub struct AppUpdateRequest {
     pub name: String,
     #[serde(default)]
-    pub scope: ServiceScope,
+    pub scope: AppScope,
     pub base_dir: Option<PathBuf>,
     pub files_base_dir: Option<PathBuf>,
     pub recipe: Option<String>,
@@ -664,7 +712,7 @@ impl AppUpdateRequest {
 pub struct AppGetRequest {
     pub name: String,
     #[serde(default)]
-    pub scope: ServiceScope,
+    pub scope: AppScope,
     pub base_dir: Option<PathBuf>,
     pub files_base_dir: Option<PathBuf>,
 }
@@ -674,28 +722,29 @@ pub struct AppGetRequest {
 #[derive(Debug, Deserialize)]
 pub struct AppListRequest {
     #[serde(default)]
-    pub scope: ServiceScope,
+    pub scope: AppScope,
     pub base_dir: Option<PathBuf>,
     pub files_base_dir: Option<PathBuf>,
 }
 
 /// The on-disk record of one installed app.
 ///
-/// Serialized as `<bundle>/app.json` under the companion data root (e.g.
-/// `/var/lib/tetra/quadlets/<name>/app.json` in system scope), tying the app
-/// to the recipe and values it was cooked from.
+/// Serialized as `<bundle>/app.json` under the companion data root
+/// (`~ultramarine-apps/.local/share/tetra/quadlets/<name>/app.json` in apps
+/// scope, `/var/lib/tetra/quadlets/<name>/app.json` in system scope), tying
+/// the app to the recipe and values it was cooked from.
 ///
 /// The manifest is what makes the bundle self-contained: `update` re-renders
 /// from the stored recipe source and merged values, `remove` derives the
 /// units/services to tear down, and config backups can snapshot one directory
-/// per app. `values` may contain secrets, so the manifest is root-owned data
-/// and is excluded from secret-free backups.
+/// per app. `values` may contain secrets, so the manifest is private (`0600`,
+/// root's or the apps account's) and is excluded from secret-free backups.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppManifest {
     /// Manifest schema version; currently 1.
     pub version: u32,
     pub name: String,
-    pub scope: ServiceScope,
+    pub scope: AppScope,
     pub recipe_id: String,
     pub recipe_version: String,
     pub recipe: AppRecipeSource,
@@ -895,6 +944,28 @@ mod tests {
             ServiceScope::User.command_args(["status", "sshd"]),
             ["--user", "status", "sshd"]
         );
+        assert_eq!(
+            ServiceScope::Apps.command_args(["start", "app.service"]),
+            ["--user", "-M", "ultramarine-apps@", "start", "app.service"]
+        );
+        assert_eq!(
+            ServiceScope::Apps.command_args_as(["status", "app.service"], true),
+            ["--user", "status", "app.service"]
+        );
+    }
+
+    #[test]
+    fn apps_default_to_the_apps_account_and_user_scope_is_gone() {
+        let list: AppListRequest = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(list.scope, AppScope::Apps);
+        let system: AppListRequest = serde_json::from_value(json!({ "scope": "system" })).unwrap();
+        assert_eq!(system.scope, AppScope::System);
+        let error = serde_json::from_value::<AppListRequest>(json!({ "scope": "user" }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown variant `user`"), "{error}");
+        assert_eq!(ServiceScope::from(AppScope::Apps), ServiceScope::Apps);
+        assert_eq!(ServiceScope::from(AppScope::System), ServiceScope::System);
     }
 
     #[test]
@@ -918,7 +989,7 @@ mod tests {
         let manifest = AppManifest {
             version: 1,
             name: "demo".into(),
-            scope: ServiceScope::System,
+            scope: AppScope::System,
             recipe_id: "demo-web".into(),
             recipe_version: "0.1.0".into(),
             recipe: AppRecipeSource::Inline {
