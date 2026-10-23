@@ -98,6 +98,7 @@ without an `id`.
 | `conflict` | Already enrolled or already registered. |
 | `action_failed` | The module action ran and failed; `message` has its error. |
 | `queue_full` | Tetra's command queue is full; retry after backoff. |
+| `reauth_required` | The operation adds or removes a way to log in and the session is more than 10 minutes old; log in again and retry. |
 | `internal` | Tetra failed; details are in the journal only. |
 
 ## Who can log in
@@ -112,7 +113,9 @@ An account can log in when all of these hold, checked on every login
 - PAM's account stack (`/etc/pam.d/ultramarine-dashboard`) accepts it.
 
 Locking, deleting or renaming an account ends its sessions on the next
-request.
+request. A successful `users.set_password` or `users.delete` through
+`module.dispatch` (not a dry run) also ends every session of the named
+account right away, except the caller's own.
 
 ## Sessions
 
@@ -123,8 +126,10 @@ A token (`tts_` + 43 characters) is issued only after full authentication:
 - the setup code (setup session, OOBE only).
 
 Tokens are bound to the client they were issued to. User sessions last 12
-hours and expire after 1 hour without use; setup sessions last 2 hours. Tetra
-stores only token hashes; sessions survive a Tetra restart.
+hours and expire after 1 hour without use; setup sessions last 2 hours. A
+user may have at most 32 sessions: a new login beyond that ends the user's
+least recently used session. Tetra stores only token hashes; sessions survive
+a Tetra restart.
 
 ## Operations
 
@@ -276,6 +281,12 @@ so the answer does not reveal whether an entry exists.
 | `account.passkey_list` | | `{passkeys: [{id, name, created_at, last_used_at}]}` |
 | `account.passkey_remove` | `id` | `{removed}` |
 
+`account.totp_begin`, `account.passkey_register_begin` and
+`account.passkey_remove` need a session from the last 10 minutes
+(`reauth_required` otherwise), so a stolen session cannot plant a credential
+that outlives it. `totp_disable` and `recovery_regenerate` already need the
+second factor itself.
+
 ### Authorization
 
 | Op | Params | Result |
@@ -287,6 +298,15 @@ so the answer does not reveal whether an entry exists.
 | `admin.actions` | `limit?` (100), `origin?` (`local`, `setup`, `remote`) | `{actions: [...]}`, newest first |
 
 `admin.*` operations need an administrator.
+
+The action log (`admin.actions`) records every module action run through
+`module.dispatch` or by a remote controller, and the operations
+`access.set`, `setup.complete`, `admin.grants_set`, `admin.sessions_revoke`,
+`launcher.set`, `launcher.remove` and `launcher.public_set` (as `module`
+and `action`, such as `admin` and `grants_set`). An entry is `{at, origin,
+client?, uid?, username?, host_id?, command_id, module, action, ok, error?}`.
+Requests refused before anything ran (`forbidden`, or `bad_request` for
+operations) are not recorded.
 
 ### Launcher
 
@@ -389,9 +409,12 @@ administrator.
   `bad_request`: Caddy listens on every address, so it would collide with
   those listeners. The same goes for a `dashboard_upstream` on 443 when
   `port` is omitted.
-- `dashboard_upstream` defaults to `127.0.0.1:3972`. Its port may not be
-  0, 80, 2019, 6623 or 6624 either (`bad_request`), since Caddy or the OOBE
-  listens there.
+- `dashboard_upstream` defaults to `127.0.0.1:3972` (`tetra agent-serve
+  --dashboard-upstream`). It must be `host:port` and nothing else: an IPv4
+  address, a bracketed IPv6 address or a DNS name, and a decimal port, without
+  a scheme or path (`bad_request` otherwise). Its port may not be 0, 80,
+  2019, 6623 or 6624 either (`bad_request`), since Caddy or the OOBE listens
+  there.
 - Changing the hostname invalidates passkeys registered under the old one.
 - `dashboard_url` is `https://hostname[:port]`, IPv6 addresses bracketed.
 - Every `access.set` writes `ORIGIN=<dashboard_url>` to
@@ -474,9 +497,12 @@ while starting shows up in `systemctl status ultramarine-dashboard`, not here.
 **`module.dispatch`** `{module, action, payload?}`
 
 Runs a module action (see [agent-protocol.md](agent-protocol.md)). The result
-is the action's payload; a failed action is `action_failed`. Unprivileged
-actions run as the session's user through `runuser`; privileged ones as root.
-Every dispatched action is recorded in the action log.
+is the action's payload; a failed action is `action_failed`, and a full
+command queue `queue_full`. Unprivileged actions run as the session's user
+through `runuser`; privileged ones, and every action of the setup session, as
+root. Module actions run one at a time on the host; a host command that takes
+longer than 15 minutes is killed and the action fails. Every dispatched
+action that passes authorization is recorded in the action log.
 
 ## Authorization
 
@@ -488,7 +514,7 @@ Every dispatched action is recorded in the action log.
   named individually (list in `src/auth/authz.rs`, `SETUP_ALLOWED`):
   `agent.capabilities`; `settings.set_hostname/set_keymap/set_locale/set_timezone`;
   `users.create/set_password/set_authorized_keys/add_admin`;
-  `power.reboot/poweroff`; `network.interfaces/status/scan_wifi/connect_wifi/configure/confirm`;
+  `power.reboot/poweroff`; `network.interfaces/status/scan_wifi/connect_wifi/configure/confirm/pending`;
   `updates.set_policy`; and
   `remote_access.status/tailscale_up/tailscale_disable/cloudflared_set_token/cloudflared_disable`.
   No `services.*`, no raw network configuration (`network.get_config/set_config`),
@@ -513,21 +539,25 @@ Every dispatched action is recorded in the action log.
 | --- | --- | --- | --- |
 | `launcher` (default) | `launcher.list/get` | — | `launcher.set/remove/public_get/public_set` |
 | `system_services` | `services.list/status/logs` (systemd units and their journal; not a default, grant it explicitly) | — | start, stop, restart, enable, disable, daemon_reload |
-| `apps` | `apps.list/get`, `quadlets.list/read/validate/list_files`, `recipes.render_inline/context_inline` | — | apps create/update/remove, quadlets write/delete/install, `recipes.render/context` (read paths as root) |
+| `apps` | `apps.list/get` (`get` shows secret values as `********`), `quadlets.list/validate/list_files`, `recipes.context_inline` | — | apps create/update/remove, quadlets read (unit files hold app secrets)/write/delete/install, `recipes.render/context` (read paths as root), `recipes.render_inline` (templates can loop for a very long time) |
 | `containers` | `podman.containers/inspect/images/volumes/networks/logs` | — | podman start/stop/restart/remove |
 | `storage` | `storage.list/status/zfs` | — | `storage.mount/unmount/configure` |
-| `sharing` | `samba.list_shares/get_config`, `nfs.list_exports/get_config` | `samba/nfs.set_config/reload` | samba/nfs enable, disable |
-| `network` | `network.interfaces/status/dns/routes`, `reverse_proxy.list/render` | `reverse_proxy.write/delete/reload` | `network.get_config/set_config/reload/configure/confirm/scan_wifi/connect_wifi`, `remote_access.*` |
+| `sharing` | `samba.list_shares/get_config`, `nfs.list_exports/get_config` (default config path only) | `samba/nfs.reload` | samba/nfs `set_config` (the files can run commands as root), enable, disable |
+| `network` | `network.interfaces/status/dns/routes`, `reverse_proxy.list/render` | `reverse_proxy.write/delete/reload` | `network.get_config/set_config/reload/configure/confirm/pending/scan_wifi/connect_wifi`, `remote_access.*` |
 | `virtual_machines` | `virtual_machines.list/status/logs` | — | start, stop, restart, create, delete |
 | `settings` | `selinux.status/booleans/file_contexts`, `updates.get_policy` | — | `settings.set_hostname/set_keymap/set_locale/set_timezone`, `updates.set_policy`, `power.reboot/poweroff`, SELinux changes |
 | `users` | `users.list/status/groups` | — | create, update, delete, set_password, set_authorized_keys, add_admin |
 | `files` | — | — | `files.read/write` |
 
 Payload fields that point an action at arbitrary host paths are
-administrator-only: `config_dir` on `reverse_proxy` actions,
-`base_dir`/`files_base_dir` on `quadlets` and `apps` actions, and `home` on
-`users` actions. The setup session
-and granted users always get the default directories. Stored grants that are
+administrator-only (`ADMIN_ONLY_FIELDS`): `config_dir` on `reverse_proxy`
+actions, `base_dir`/`files_base_dir` on `quadlets` and `apps` actions, `home`
+on `users` actions, and `path` on `samba` and `nfs` actions, which may only
+be left out or set to the default (`/etc/samba/smb.conf`, `/etc/exports`).
+So is `run_as` on any module's action, unless it is `"user"`: running a
+read as root shows the host's view (rootful containers and their
+environment, every VM). Otherwise the request is `forbidden`. The setup session and granted users
+always get the default directories; remote controllers may set them. Stored grants that are
 no longer grantable (such as `files: view` from an earlier release) are
 ignored. Grants stored under the page's earlier name, `services`, are read as
 `system_services`.
@@ -552,7 +582,7 @@ is recorded with `origin: "remote"`.
   generates the code once (`XXXX-XXXX`, sealed in
   `/var/lib/tetra/auth/setup-code.json`) and writes it to
   `/run/tetra/setup-code` (root-only, for the console screen) and
-  `/run/issue.d/50-tetra-setup.issue` (getty login banner). It is never shown
+  `/run/issue.d/50-tetra-setup.issue` (getty login banner, mode `0600`, read by agetty as root). It is never shown
   over SSH.
 - The code stays the same across reboots until setup completes or the
   wrong-code limit replaces it. Tetra republishes a replaced code itself.

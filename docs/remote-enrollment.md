@@ -21,10 +21,11 @@ on the controller side yet.
 | Controller identity on host | Ed25519 controller key written into the local-socket key file | Server CA bundle stored in the enrollment directory                   |
 
 The old flow also wrote the controller's Ed25519 public key into
-`/var/lib/tetra/identity/controller-ed25519-public.key`. That is the file the
-local Unix socket uses to authenticate the local dashboard, so remote
-enrollment was overwriting the local dashboard's key. The new flow does not
-touch that file, and the controller should stop returning
+`/var/lib/tetra/identity/controller-ed25519-public.key`. That was the file the
+local Unix socket then used to authenticate the local dashboard, so remote
+enrollment was overwriting the local dashboard's key. (The local socket now
+uses session tokens, and only the development TCP listener reads that file.)
+The new flow does not touch it, and the controller should stop returning
 `controller_public_key`. Tetra ignores it if present.
 
 ## Endpoints
@@ -133,7 +134,10 @@ The endpoint at `control_plane_url` must:
 
 The frame protocol after the handshake is described in
 [agent-protocol.md](agent-protocol.md). Hosts that renew certificates send
-`protocol_version` `2026-10-18` or later in `hello`.
+`protocol_version` `2026-10-18` or later in `hello`. The host runs every
+module action the controller sends, as root (a command's `user` field is
+ignored), and records it in its action log with the host id. Commands are not
+signed; the mTLS session is what authenticates them.
 
 ## Certificate renewal
 

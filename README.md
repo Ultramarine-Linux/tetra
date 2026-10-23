@@ -3,8 +3,10 @@
 Tetra is a modular host agent and recipe renderer for the [Ultramarine Server Dashboard](https://github.com/Ultramarine-Linux/dashboard).
 It is organized around a single dispatcher with independent,
 feature-gated modules for apps, files, recipes, SELinux, services, Quadlets,
-reverse-proxy, Podman, Samba, NFS, users, and virtual machines. The `settings`
-module is always compiled so the control plane can discover basic host facts.
+reverse proxy (Caddy), Podman, Samba, NFS, users, storage, network, power,
+updates, remote access (Tailscale, Cloudflare Tunnel), and virtual machines.
+The `settings` module is always compiled so the control plane can discover
+basic host facts.
 
 Local clients (the dashboard container and the server OOBE) talk to Tetra over
 a Unix socket at `/run/tetra/tetra.sock` (`agent-serve`). This is the only
@@ -14,13 +16,14 @@ authority for login and authorization: users log in with a password (PAM) plus
 TOTP, or a passkey, and every request carries a Tetra-issued session token. See
 [docs/auth-protocol.md](docs/auth-protocol.md).
 
-An outbound mTLS WSS connection to a remote control plane also exists. It is
-off unless `remote.enabled` is set in `/etc/tetra/tetra.json`. When the agent runs inside a VM, the same JSON frame protocol can
-be carried over a virtio-vsock stream.
+An outbound mTLS WSS connection (`wss://` only) to a remote control plane also
+exists. It is off unless `remote.enabled` is set in `/etc/tetra/tetra.json`.
 
 For development, `agent-ws-serve` runs the older controller-key WebSocket
-protocol (Ed25519-signed command frames) on a TCP listener. It is only compiled with the `dev-listener`
-feature, so release builds cannot listen on the network.
+protocol (Ed25519-signed command frames) on a TCP listener, and
+`agent-vsock-serve` is an unauthenticated virtio-vsock smoke test for VM
+guests. Both are only compiled with the `dev-listener` feature, so release
+builds cannot listen on the network.
 
 The local `agent-dispatch` command accepts the same command envelope shape for
 one-shot debugging. See [docs/agent-protocol.md](docs/agent-protocol.md) for
@@ -57,12 +60,17 @@ Default build features:
 - `users`
 - `storage`
 - `network`
+- `power`
+- `updates`
+- `remote-access`
 
 Additional optional features:
 
 - `virtual-machines`
-- `dev-listener`: the development TCP listener (`agent-ws-serve`). Leave it
-  off in release builds.
+- `dev-listener`: the development listeners (`agent-ws-serve` on TCP and
+  `agent-vsock-serve` on vsock). Leave it off in release builds.
+- `testing`: exposes `tetra::auth::testing` (fake PAM, accounts, sealer and
+  host) for integration tests.
 
 Build with every module:
 
@@ -118,11 +126,14 @@ The one-shot CLI accepts the same JSON command envelope used by transports:
 }
 ```
 
-Run it:
+Run it (without a file it reads the command from stdin):
 
 ```sh
 cargo run -- agent-dispatch examples/settings.command.json
 ```
+
+`agent-dispatch` calls the modules directly, with no login, authorization or
+action log, so use it only for local debugging.
 
 `examples/apps.command.json` shows a dry-run `apps.create` that cooks an
 inline recipe into an installed app bundle.
@@ -219,10 +230,10 @@ cargo run -- agent-connect --config examples/transport.json --host-id myhost \
 ### Vsock smoke test
 
 For a VM guest with virtio-vsock enabled, run Tetra as a small test listener
-inside the guest:
+inside the guest. It is only built with the `dev-listener` feature:
 
 ```sh
-cargo run --all-features -- agent-vsock-serve --port 2048
+cargo run --features dev-listener -- agent-vsock-serve --port 2048
 ```
 
 From the VM host, connect to the guest CID and send one command JSON object.
@@ -234,8 +245,9 @@ printf '%s' '{"id":"cmd-1","module":"settings","action":"get_system","payload":{
 ```
 
 The listener reads one command per connection and writes one `AgentResponse`
-JSON object. This is a development smoke test for host-to-guest command
-dispatch over vsock.
+JSON object. It does no authentication or authorization, so it is a
+development smoke test for host-to-guest command dispatch over vsock, not a
+production transport.
 
 ## Systemd
 
@@ -322,7 +334,8 @@ every request; Tetra authorizes each action from the user's admin status
 (`ultramarine-admin` or `wheel`) and per-page grants. See
 [docs/auth-protocol.md](docs/auth-protocol.md). Outbound WSS uses mTLS for
 transport identity, with the client certificate issued by `tetra enroll`; its
-commands run with full rights and are recorded as remote actions. The
+commands run with full rights, always as root, and are recorded as remote
+actions. Commands are not signed on either production transport. The
 development TCP listener still uses Ed25519 controller-key authentication.
 
 Console recovery: `sudo tetra auth reset-2fa <user>` removes a user's TOTP and

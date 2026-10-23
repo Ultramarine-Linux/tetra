@@ -55,7 +55,7 @@ must be unique within the recipe.
 | YAML `type` | Rust type | Dashboard behavior |
 |-------------|-----------|-------------------|
 | `string` | `String` | Free-form text input. |
-| `secret` | `String` | Masked input; value is not logged. |
+| `secret` | `String` | Masked input; value is not logged, and `apps.get` shows it as `********`. |
 | `integer` | `i64` | Numeric input with optional `min`/`max`. |
 | `boolean` | `bool` | Toggle/checkbox. |
 | `choice` | `String` | Dropdown; requires `options` list. |
@@ -108,7 +108,7 @@ parameters:
 - `placeholder` — Optional hint text for empty inputs.
 - `default` — Value used when the operator does not supply one.
 - `min` / `max` — Inclusive bounds for `integer` parameters.
-- `generate` — Auto-generation strategy when no value and no default exist. Only `random_32` is supported today (useful for passwords/keys).
+- `generate` — Auto-generation strategy when no value and no default exist. Only `random_32` is supported today (useful for passwords/keys). When an app is installed with `apps.create`, the generated value is stored in the app's manifest, so `apps.update` reuses it instead of generating a new one.
 - `options` — Required for `choice`; list of allowed strings.
 
 ### Value resolution order
@@ -274,10 +274,12 @@ Tetra validates recipes before rendering. Common issues:
 ## Inline recipes (agent protocol)
 
 The dashboard can ship recipes without installing them on the host first. The
-agent `recipes.render_inline` and `recipes.context_inline` actions accept:
+agent `recipes.render_inline` and `recipes.context_inline` actions (and
+`apps.create`) accept:
 
 - `recipe` — the full recipe YAML as a string.
-- `templates` — a map of template name → template body.
+- `templates` — a map of template name → template body (not used by
+  `context_inline`).
 - `values` — the parameter value map.
 
 This lets a remote catalog publish new recipes without updating Tetra, as long

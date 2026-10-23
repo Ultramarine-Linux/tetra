@@ -47,6 +47,8 @@ is trusted:
 ```
 
 Common causes:
+- `control_plane_url` is not `wss://`. Tetra refuses `ws://` and any other
+  scheme, and also refuses a config without all three TLS paths.
 - Files are missing or have incorrect permissions.
 - The `server_ca_path` does not match the CA that signed the server certificate.
 - The hostname in `control_plane_url` does not match the certificate SAN.
@@ -96,16 +98,23 @@ cargo run --features dev-listener -- agent-ws-serve \
 ### Host identity is not generated
 
 The host Ed25519 identity is auto-generated on first start and persisted under
-`/var/lib/tetra/identity` by default. Ensure the directory is writable:
+`/var/lib/tetra/identity` by default. Tetra runs as root and keeps
+`/var/lib/tetra` root-only (`0700`); ensure the directory is writable by root:
 
 ```sh
 sudo mkdir -p /var/lib/tetra/identity
-sudo chown -R tetra:tetra /var/lib/tetra
+sudo chown -R root:root /var/lib/tetra
+sudo chmod 0700 /var/lib/tetra
 ```
 
-The `TETRA_IDENTITY_DIR` environment variable overrides the default path.
+`--identity-dir` (on `agent-serve` and `agent-ws-serve`) overrides the default
+path. The `TETRA_IDENTITY_DIR` environment variable is not read.
 
-## WebSocket authentication
+## WebSocket authentication (development listener)
+
+These only apply to `agent-ws-serve` (`dev-listener` feature). The local socket
+uses session tokens ([auth-protocol.md](auth-protocol.md)) and the outbound
+session uses mTLS.
 
 ### Inbound connections fail with "missing controller public key"
 
@@ -129,10 +138,10 @@ across VMs, check that guest time is correct.
 
 ### Elevation grant expires too quickly
 
-The default elevation TTL is 30 minutes. It can be configured; if it feels too
-short or too long, check the dashboard/agent configuration for the TTL field.
-Elevation is intentionally cleared on Tetra restart and session disconnect where
-appropriate.
+Password elevation only exists on `agent-ws-serve`. A grant lasts 30 minutes;
+the duration is fixed. It is cleared when the session disconnects or Tetra
+restarts. On the local socket there is no elevation: privileged actions are
+authorized per request from the user's admin status and grants.
 
 ## Recipe rendering
 
@@ -207,19 +216,25 @@ sudo dnf install policycoreutils-python-utils
 
 ## Queue and backpressure
 
-### Dashboard receives "queue full" or `429 Too Many Requests`
+### Dashboard receives `queue_full`
 
-The bounded dispatch queue has a default capacity of 64 commands. If the host is
-processing a slow mutation (e.g. large storage operation), new commands are
-rejected until space frees up.
+The bounded dispatch queue has a default capacity of 64 commands, and runs
+them one at a time. If the host is processing a slow mutation (e.g. an image
+pull during `systemctl start`), new commands are rejected until space frees
+up. The local socket answers `queue_full`; the outbound WSS session sends an
+`error` frame (`Tetra command queue is full; retry after backoff`).
 
 Recommended responses:
 - Retry with exponential backoff.
 - Avoid flooding the agent with parallel mutating requests; the queue
   intentionally serializes host mutations.
 
-You can inspect queue depth programmatically via `DispatchQueue::metrics()` if
-you are building a custom transport.
+### An action fails after 15 minutes with "failed to run"
+
+Every host command a module runs is killed, with its process group, after 15
+minutes (`COMMAND_TIMEOUT`), so a hung `systemctl`, `podman` or `virsh` cannot
+block the queue forever. Check the unit or tool on the host
+(`systemctl status`, `journalctl -u`) and retry.
 
 ### Commands time out but still execute
 
@@ -245,18 +260,62 @@ printf '%s' '{"id":"cmd-1","module":"settings","action":"get_system","payload":{
 ```
 
 The vsock listener reads one command per connection and writes one JSON response.
-It is a development smoke-test, not a production transport.
+It is a development smoke-test, not a production transport, and only exists in
+builds with the `dev-listener` feature (`cargo run --features dev-listener --
+agent-vsock-serve`).
+
+## Network changes
+
+### A network change was rolled back, or `network.confirm` fails
+
+A `network.configure` or `network.connect_wifi` change that cut the host off
+needs `network.confirm` within 60 seconds (see `network` in
+[agent-protocol.md](agent-protocol.md)). Tetra arms that rollback as a
+NetworkManager checkpoint, so NetworkManager rolls back even if Tetra is
+stopped or restarting. `confirm` fails with "already rolled back" when it
+arrives after that; `network.pending` (which survives Tetra restarts) shows
+the token and the seconds left. To see checkpoints and the record Tetra
+keeps:
+
+```sh
+busctl --json=short get-property org.freedesktop.NetworkManager \
+  /org/freedesktop/NetworkManager org.freedesktop.NetworkManager Checkpoints
+sudo cat /var/lib/tetra/network/pending.json
+journalctl -u NetworkManager | grep -i checkpoint
+```
+
+To keep a change by hand (for instance with Tetra down), destroy the
+checkpoint and remove the record, or Tetra rolls the change back when it
+starts:
+
+```sh
+sudo busctl call org.freedesktop.NetworkManager /org/freedesktop/NetworkManager \
+  org.freedesktop.NetworkManager CheckpointDestroy o /org/freedesktop/NetworkManager/Checkpoint/N
+sudo rm /var/lib/tetra/network/pending.json
+```
+
+### "no NetworkManager checkpoint" in the journal
+
+Tetra could not create a checkpoint: NetworkManager's D-Bus API is
+unreachable (`busctl` missing, D-Bus down) or too old, or another checkpoint
+(Cockpit's, or a stale one) already covers the device, which NetworkManager
+refuses. Tetra then rolls back by itself, which a Tetra restart inside the
+window delays until Tetra is back. List checkpoints as above; one left by
+another tool rolls back or expires on its own.
 
 ## Logging and debugging
 
-### Enable verbose logging
+### Where Tetra logs
 
-Set `RUST_LOG` before running Tetra:
+Tetra writes its messages to stderr, which systemd sends to the journal:
 
 ```sh
-RUST_LOG=debug cargo run -- agent-connect --config examples/transport.json --host-id myhost
-RUST_LOG=trace cargo run --features dev-listener -- agent-ws-serve --listen 127.0.0.1:7780 ...
+journalctl -u tetra.service
 ```
+
+There is no log level to raise; `RUST_LOG` is not read. Module actions,
+access changes and grant changes are also in the action log
+(`admin.actions`, or `/var/lib/tetra/audit/actions.jsonl`).
 
 ### Dry-run before applying mutations
 
@@ -284,7 +343,7 @@ The `agent-dispatch` CLI is the fastest way to test a module in isolation:
 
 ```sh
 echo '{"id":"cmd-1","module":"settings","action":"get_system","payload":{}}' \
-  | cargo run -- agent-dispatch /dev/stdin
+  | cargo run -- agent-dispatch
 ```
 
 Or write the command to a file:

@@ -59,7 +59,10 @@ browser only gets an opaque cookie.
   admin status on every request anyway.
 - On `unauthenticated`, clear the cookie and send the user to the login page.
   This happens on expiry (1 hour idle, 12 hours total), logout, revocation,
-  a second-factor reset from the console, or when the account is locked.
+  a second-factor reset from the console, when the account is locked, when
+  an administrator sets its password or deletes it (`users.set_password`,
+  `users.delete`), or when the user's 33rd session pushes out the least
+  recently used one (32 sessions per user).
 - On logout, call `session.logout` before clearing the cookie.
 
 ## 4. Password login
@@ -145,6 +148,10 @@ password form.
 
 **Registration** (logged-in user, for example under account settings)
 
+Adding or removing a passkey, and starting TOTP enrollment, needs a login
+from the last 10 minutes. On `reauth_required`, send the user through the
+login form again (same username), then retry the step with the new token.
+
 1. `account.passkey_register_begin {name}` → `{ceremony, options}`. The
    options ask for a discoverable credential (`residentKey: "preferred"`);
    pass them through unchanged.
@@ -196,7 +203,9 @@ The grant editor (administrators only):
 
 Other administrator tools: `session.list {uid}`,
 `admin.sessions_revoke {uid}` (log a user out everywhere) and
-`admin.actions {origin: "remote"}` (remote action log).
+`admin.actions {origin: "remote"}` (remote action log). The action log also
+records grant changes, session revocations, `access.set`, `setup.complete`
+and launcher changes, next to module actions.
 
 ## 8. The Services page (launcher)
 
@@ -237,7 +246,15 @@ Send `module.dispatch {module, action, payload}` with the user's token. Keep
 the existing `dry_run` preview flow from [agent-protocol.md](agent-protocol.md).
 The result is the action's payload. A failed action returns `action_failed`
 with the module's error text, and a full queue returns `queue_full` (retry
-with backoff).
+with backoff). Module actions run one at a time, so a slow one (an image pull
+in `systemctl start`, say) delays the others; host commands are killed after
+15 minutes.
+
+Some payload fields are administrator-only (`base_dir`, `files_base_dir`,
+`config_dir`, `users.home`, and a non-default `path` on `samba`/`nfs`); a user
+who sends one gets `forbidden`, so leave them out of forms for everyone else.
+`apps.get` shows secret parameter values as `"********"`; sending that value
+back in `apps.update` keeps the stored secret.
 
 The old flow is gone:
 
@@ -286,8 +303,13 @@ with the setup session.
      client_cert?, private_key?, private_key_password?, domain_suffix_match?,
      phase2?}`, certificates and keys as PEM contents or paths; Wi-Fi
      Enterprise takes the same fields) and
-     `network.confirm` once the new settings work. The `keyfile` in the
-     response has 802.1X passwords redacted;
+     `network.confirm` once the new settings work. A change often drops the
+     OOBE's connection; after reconnecting, `network.pending` returns the
+     change still awaiting confirmation (with its `confirmation_token`), if
+     any, also after a Tetra restart. An unconfirmed change is rolled back
+     after 60 seconds by NetworkManager itself (a checkpoint), so the old
+     network comes back even if Tetra restarted meanwhile. The `keyfile` in
+     the response has 802.1X passwords redacted;
    - updates: `updates.set_policy {policy: "automatic" | "notify"}`. Tetra
      knows whether the host is bootc or package-based and picks the timer;
    - remote access, if wanted: `remote_access.tailscale_up {auth_key, serve,
