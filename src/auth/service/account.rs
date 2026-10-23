@@ -1,6 +1,7 @@
 //! The caller's own sessions and account: `session.*` and `account.*`
 //! (TOTP, recovery codes, passkey registration).
 
+use serde_json::json;
 use webauthn_rs::prelude::{RegisterPublicKeyCredential, Uuid};
 
 use crate::{
@@ -37,31 +38,31 @@ impl AuthService {
                 username,
                 admin,
                 ..
-            } => jsonf! { uid, username, admin },
+            } => json!({ "uid": uid, "username": username, "admin": admin }),
             _ => Value::Null,
         };
         let permissions = match &caller.principal {
-            Principal::User { admin: true, .. } => jsonf! { "all": true },
+            Principal::User { admin: true, .. } => json!({ "all": true }),
             Principal::User { permissions, .. } => json_value(permissions),
             Principal::Setup => {
-                jsonf! {
+                json!({
                     "setup": authz::SETUP_ALLOWED.iter().map(|(m, a)| format!("{m}.{a}")).collect::<Vec<_>>(),
                     "operations": authz::SETUP_OPERATIONS,
-                }
+                })
             }
             Principal::RemoteController => Value::Null,
         };
-        jsonf! {
+        json!({
             "session": session_json(&caller.session, Some(&caller.session)),
-            user,
-            permissions,
-        }
+            "user": user,
+            "permissions": permissions,
+        })
     }
 
     pub(super) fn session_logout(&self, caller: &Caller) -> ApiResult {
         let id = caller.session.id.clone();
         self.inner.sessions.revoke(|session| session.id == id)?;
-        Ok(jsonf! { "revoked": 1 })
+        Ok(json!({ "revoked": 1 }))
     }
 
     pub(super) fn session_list(&self, caller: &Caller, p: UidParams) -> ApiResult {
@@ -77,7 +78,7 @@ impl AuthService {
             .iter()
             .map(|session| session_json(session, Some(&caller.session)))
             .collect();
-        Ok(jsonf! { sessions })
+        Ok(json!({ "sessions": sessions }))
     }
 
     pub(super) fn session_revoke(&self, caller: &Caller, p: &SessionIdParams) -> ApiResult {
@@ -91,7 +92,7 @@ impl AuthService {
         if revoked == 0 {
             return Err(ApiError::new(ErrorCode::NotFound, "no such session"));
         }
-        Ok(jsonf! { revoked })
+        Ok(json!({ "revoked": revoked }))
     }
 
     // --- Second factor ---------------------------------------------------
@@ -99,12 +100,12 @@ impl AuthService {
     pub(super) fn account_status(&self, caller: &Caller) -> ApiResult {
         let (uid, username) = caller.user()?;
         let record = self.record(uid, username)?;
-        Ok(jsonf! {
+        Ok(json!({
             "totp_enrolled": record.as_ref().is_some_and(|r| r.totp.is_some()),
             "recovery_codes_left": record.as_ref().map_or(0, UserRecord::recovery_codes_left),
             "passkeys": record.as_ref().map_or(0, |r| r.passkeys.len()),
             "passkeys_available": self.webauthn().is_ok(),
-        })
+        }))
     }
 
     pub(super) fn totp_begin(&self, caller: &Caller) -> ApiResult {
@@ -140,7 +141,9 @@ impl AuthService {
                 now,
             )
             .ok_or_else(|| ApiError::rate_limited(ENROLLMENT_TTL))?;
-        Ok(jsonf! { enrollment, "secret": secret_base32, otpauth_uri, expires_at })
+        Ok(
+            json!({ "enrollment": enrollment, "secret": secret_base32, "otpauth_uri": otpauth_uri, "expires_at": expires_at }),
+        )
     }
 
     pub(super) fn totp_confirm(&self, caller: &Caller, p: TotpConfirmParams) -> ApiResult {
@@ -189,7 +192,7 @@ impl AuthService {
             })
             .map_err(second_factor_error)?;
         eprintln!("`{username}` enrolled TOTP");
-        Ok(jsonf! { "recovery_codes": codes })
+        Ok(json!({ "recovery_codes": codes }))
     }
 
     /// Verify the caller's current second factor and apply `change` to the
@@ -224,13 +227,13 @@ impl AuthService {
             record.totp = None;
             record.recovery_codes.clear();
         })?;
-        Ok(jsonf! { "totp_enrolled": false })
+        Ok(json!({ "totp_enrolled": false }))
     }
 
     pub(super) fn recovery_regenerate(&self, caller: &Caller, p: &CodeParams) -> ApiResult {
         let (codes, stored) = recovery::generate();
         self.with_second_factor(caller, p, |record| record.recovery_codes = stored)?;
-        Ok(jsonf! { "recovery_codes": codes })
+        Ok(json!({ "recovery_codes": codes }))
     }
 
     // --- Passkey registration -------------------------------------------
@@ -284,7 +287,7 @@ impl AuthService {
                 now,
             )
             .ok_or_else(|| ApiError::rate_limited(CEREMONY_TTL))?;
-        Ok(jsonf! { ceremony, options, expires_at })
+        Ok(json!({ "ceremony": ceremony, "options": options, "expires_at": expires_at }))
     }
 
     pub(super) fn passkey_register_finish(
@@ -344,7 +347,7 @@ impl AuthService {
             ));
         }
         eprintln!("`{username}` registered a passkey");
-        Ok(jsonf! { id, name, "created_at": now })
+        Ok(json!({ "id": id, "name": name, "created_at": now }))
     }
 
     pub(super) fn passkey_list(&self, caller: &Caller) -> ApiResult {
@@ -354,9 +357,9 @@ impl AuthService {
             .map(|record| record.passkeys)
             .unwrap_or_default()
             .iter()
-            .map(|stored| jsonf! { stored.id, stored.name, stored.created_at, stored.last_used_at })
+            .map(|stored| json!({ "id": stored.id, "name": stored.name, "created_at": stored.created_at, "last_used_at": stored.last_used_at }))
             .collect();
-        Ok(jsonf! { passkeys })
+        Ok(json!({ "passkeys": passkeys }))
     }
 
     pub(super) fn passkey_remove(&self, caller: &Caller, p: &PasskeyIdParams) -> ApiResult {
@@ -370,7 +373,7 @@ impl AuthService {
         if !removed {
             return Err(ApiError::new(ErrorCode::NotFound, "no such passkey"));
         }
-        Ok(jsonf! { "removed": p.id })
+        Ok(json!({ "removed": p.id }))
     }
 }
 
@@ -404,13 +407,13 @@ pub fn reset_second_factor(
             0
         };
         record.session_epoch = record.session_epoch.saturating_add(1);
-        Ok(jsonf! {
+        Ok(json!({
             "username": account.name,
             "totp_removed": had_totp,
             "recovery_codes_removed": recovery_codes,
             "passkeys_removed": removed_passkeys,
             "sessions_invalidated": true,
-        })
+        }))
     })
 }
 

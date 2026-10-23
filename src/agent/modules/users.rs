@@ -38,6 +38,7 @@ use nix::{
     sys::stat::{Mode, fchmod, mkdirat},
     unistd::{Gid, Uid, UnlinkatFlags, fchown, fsync, unlinkat},
 };
+use serde_json::json;
 
 use crate::agent::module_support::option_arg;
 use crate::prelude::*;
@@ -96,8 +97,8 @@ impl Mod for UsersModule {
 }
 
 actions!(Action [payload user] => {
-    List => Ok(jsonf! { "users": parse_passwd(&read_file("/etc/passwd")?) }),
-    Groups => Ok(jsonf! { "groups": parse_group(&read_file("/etc/group")?) }),
+    List => Ok(json!({ "users": parse_passwd(&read_file("/etc/passwd")?) })),
+    Groups => Ok(json!({ "groups": parse_group(&read_file("/etc/group")?) })),
     Status { name: String } => {
         validate_name(&payload.name)?;
         crate::cmd!({ &INFO, "status", user } "id" [&payload.name] json)
@@ -191,12 +192,12 @@ actions!(Action [payload user] => {
             &["-R"],
             payload.dry_run,
         )?;
-        Ok(jsonf! {
-            payload.name, path,
+        Ok(json!({
+            "name": payload.name, "path": path,
             "keys": payload.keys.len(),
             "written": !payload.dry_run,
-            payload.dry_run, selinux,
-        })
+            "dry_run": payload.dry_run, "selinux": selinux,
+        }))
     },
     AddAdmin {
         name: String,
@@ -340,14 +341,14 @@ fn parse_passwd(contents: &str) -> Vec<Value> {
         .filter_map(|line| {
             let fields: Vec<_> = line.split(':').collect();
             (fields.len() >= 7).then(|| {
-                jsonf! {
+                json!({
                     "name": fields[0],
                     "uid": fields[2],
                     "gid": fields[3],
                     "gecos": fields[4],
                     "home": fields[5],
                     "shell": fields[6],
-                }
+                })
             })
         })
         .collect()
@@ -365,11 +366,11 @@ fn parse_group(contents: &str) -> Vec<Value> {
         .filter_map(|line| {
             let fields: Vec<_> = line.split(':').collect();
             (fields.len() >= 4).then(|| {
-                jsonf! {
+                json!({
                     "name": fields[0],
                     "gid": fields[2],
                     "members": fields[3].split(',').filter(|member| !member.is_empty()).collect::<Vec<_>>(),
-                }
+                })
             })
         })
         .collect()

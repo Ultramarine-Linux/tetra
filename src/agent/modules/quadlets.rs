@@ -39,6 +39,8 @@
 //! `systemctl daemon-reload`; the caller does that through the separate
 //! `services` module's `daemon_reload` action once writes are confirmed.
 
+use serde_json::json;
+
 use crate::agent::apps_account::{
     APPS_USER, AppsAccount, Owner, check_no_symlinks, create_dir_owned, write_owned,
 };
@@ -134,7 +136,7 @@ actions!(Action [payload user] => {
         scope: AppScope,
     } => {
         let base_dir = quadlet_base_dir(payload.base_dir, payload.scope)?;
-        Ok(jsonf! { base_dir, "files": QuadletFile::list(&base_dir)? })
+        Ok(json!({ "base_dir": base_dir, "files": QuadletFile::list(&base_dir)? }))
     },
     ListFiles {
         base_dir: Option<PathBuf>,
@@ -153,7 +155,7 @@ actions!(Action [payload user] => {
                 .reverse()
                 .then_with(|| left.filename.cmp(&right.filename))
         });
-        Ok(jsonf! { base_dir, files_base_dir, files })
+        Ok(json!({ "base_dir": base_dir, "files_base_dir": files_base_dir, "files": files }))
     },
     Read {
         base_dir: Option<PathBuf>,
@@ -175,7 +177,7 @@ actions!(Action [payload user] => {
         )?;
         let contents = fs::read_to_string(&path)
             .with_context(|| format!("failed to read `{}`", path.display()))?;
-        Ok(jsonf! { base_dir, payload.filename, contents, payload.dry_run })
+        Ok(json!({ "base_dir": base_dir, "filename": payload.filename, "contents": contents, "dry_run": payload.dry_run }))
     },
     Write {
         base_dir: Option<PathBuf>,
@@ -201,12 +203,12 @@ actions!(Action [payload user] => {
         )?;
         let selinux =
             apply_selinux(payload.selinux.as_ref(), Some(&path), payload.dry_run)?;
-        Ok(jsonf! {
-            base_dir, payload.filename, path,
+        Ok(json!({
+            "base_dir": base_dir, "filename": payload.filename, "path": path,
             "owner": owner_name(payload.scope),
             "written": !payload.dry_run,
-            payload.dry_run, selinux,
-        })
+            "dry_run": payload.dry_run, "selinux": selinux,
+        }))
     },
     Delete {
         base_dir: Option<PathBuf>,
@@ -230,18 +232,18 @@ actions!(Action [payload user] => {
             fs::remove_file(&path)
                 .with_context(|| format!("failed to delete `{}`", path.display()))?;
         }
-        Ok(jsonf! {
-            base_dir, payload.filename, path,
+        Ok(json!({
+            "base_dir": base_dir, "filename": payload.filename, "path": path,
             "deleted": !payload.dry_run,
-            payload.dry_run,
-        })
+            "dry_run": payload.dry_run,
+        }))
     },
     Validate {
         filename: String,
         contents: String,
     } => {
         validate_quadlet(&payload.filename, &payload.contents)?;
-        Ok(jsonf! { payload.filename, "valid": true })
+        Ok(json!({ "filename": payload.filename, "valid": true }))
     },
     Install {
         base_dir: Option<PathBuf>,
@@ -318,12 +320,12 @@ actions!(Action [payload user] => {
             payload.dry_run,
         )?);
 
-        Ok(jsonf! {
-            base_dir, files_base_dir, installed, files,
+        Ok(json!({
+            "base_dir": base_dir, "files_base_dir": files_base_dir, "installed": installed, "files": files,
             "owner": owner_name(payload.scope),
             "written": !payload.dry_run,
-            payload.dry_run, "selinux": selinux_ops,
-        })
+            "dry_run": payload.dry_run, "selinux": selinux_ops,
+        }))
     },
 });
 

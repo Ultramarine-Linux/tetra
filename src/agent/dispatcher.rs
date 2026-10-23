@@ -1,3 +1,5 @@
+use serde_json::json;
+
 use crate::prelude::*;
 
 use std::collections::BTreeMap;
@@ -72,7 +74,7 @@ impl Dispatcher {
         // living in a fake `agent` module, so it always reports the *actually
         // registered* module set even if a custom dispatcher was built.
         if command.requests_capabilities() {
-            return Ok(jsonf! { "modules": self.capabilities() });
+            return Ok(json!({ "modules": self.capabilities() }));
         }
 
         let Some(module) = self.modules.get(&command.module) else {
@@ -101,13 +103,13 @@ impl Dispatcher {
                     command.module
                 );
                 let outcome = |result: Result<Value>| match result {
-                    Ok(result) => jsonf! { "ok": true, result },
-                    Err(error) => jsonf! { "ok": false, "error": format!("{error:#}") },
+                    Ok(result) => json!({ "ok": true, "result": result }),
+                    Err(error) => json!({ "ok": false, "error": format!("{error:#}") }),
                 };
-                Ok(jsonf! {
+                Ok(json!({
                     "user": outcome(module.handle(action, payload.clone(), Some(user))),
                     "root": outcome(module.handle(action, payload, None)),
-                })
+                }))
             }
         }
     }

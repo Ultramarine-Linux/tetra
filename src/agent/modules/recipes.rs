@@ -15,7 +15,9 @@
 //!   remote catalog publish new recipes without bumping the installed Tetra
 //!   version, as long as the recipe schema is one the agent understands.
 
+use serde_json::json;
 use serde_norway::Value as YamlValue;
+
 use crate::agent::module_support::write_under;
 
 use crate::{
@@ -86,7 +88,7 @@ actions!(Action [payload user] => {
                     resource.kind.mode(), payload.dry_run)?;
             }
         }
-        Ok(jsonf! { resources, source })
+        Ok(json!({ "resources": resources, "source": source }))
     },
     RenderInline {
         recipe: String,
@@ -107,7 +109,7 @@ actions!(Action [payload user] => {
         // Echo the parsed recipe alongside the rendered resources so
         // the dashboard can display normalized metadata (id, version,
         // parameters) without re-parsing the YAML it just sent.
-        Ok(jsonf! { recipe, resources, source })
+        Ok(json!({ "recipe": recipe, "resources": resources, "source": source }))
     },
     Context {
         recipe_path: PathBuf,
@@ -116,7 +118,7 @@ actions!(Action [payload user] => {
     } => {
         let recipe = AppRecipe::load(payload.recipe_path)?;
         let context = recipe.context_for_agent(&payload.values)?;
-        Ok(jsonf! { context })
+        Ok(json!({ "context": context }))
     },
     ContextInline {
         recipe: String,
@@ -125,6 +127,6 @@ actions!(Action [payload user] => {
     } => {
         let recipe = AppRecipe::load_str(&payload.recipe)?;
         let context = recipe.context_for_agent(&payload.values)?;
-        Ok(jsonf! { recipe, context })
+        Ok(json!({ "recipe": recipe, "context": context }))
     },
 });

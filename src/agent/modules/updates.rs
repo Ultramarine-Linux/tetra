@@ -21,6 +21,8 @@
 //! here. Full update management (status, history, manual runs) is a later
 //! module.
 
+use serde_json::json;
+
 use crate::prelude::*;
 
 use crate::agent::module_support::{
@@ -229,14 +231,14 @@ fn get_policy(paths: &Paths, variant: Variant, timer_enabled: bool) -> Result<Va
     let policy = store::read::<PolicyFile>(&paths.policy)?.map(|file| file.policy);
     let effective = effective_policy(paths, variant, timer_enabled);
     let mismatch = policy.is_some() && policy != effective;
-    Ok(jsonf! {
-        policy,
-        variant,
+    Ok(json!({
+        "policy": policy,
+        "variant": variant,
         "timer": variant.timer(),
-        timer_enabled,
-        effective,
-        mismatch,
-    })
+        "timer_enabled": timer_enabled,
+        "effective": effective,
+        "mismatch": mismatch,
+    }))
 }
 
 /// Enable or disable the variant's timer (and on mutable hosts install or
@@ -301,7 +303,14 @@ fn set_policy(
         );
         store::write(&paths.policy, &mut file)?;
     }
-    Ok(jsonf! { policy, variant, timer, "stored": !dry_run, dry_run, "commands": commands.done })
+    Ok(json!({
+        "policy": policy,
+        "variant": variant,
+        "timer": timer,
+        "stored": !dry_run,
+        "dry_run": dry_run,
+        "commands": commands.done,
+    }))
 }
 
 #[cfg(test)]

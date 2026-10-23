@@ -29,6 +29,7 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
+use serde_json::json;
 use webauthn_rs::prelude::Url;
 
 use crate::prelude::*;
@@ -230,9 +231,9 @@ impl Entry {
     /// and where it came from; everyone else only what they need to open it.
     #[must_use]
     pub fn to_json(&self, admin: bool, access: Option<&AccessConfig>) -> Value {
-        let mut entry = jsonf! {
-            self.id, self.name, self.icon, "url": self.resolved_url(access),
-        };
+        let mut entry = json!({
+            "id": self.id, "name": self.name, "icon": self.icon, "url": self.resolved_url(access),
+        });
         if admin {
             entry["visibility"] = serde_json::to_value(&self.visibility).unwrap_or(Value::Null);
             entry["public"] = Value::Bool(self.public);

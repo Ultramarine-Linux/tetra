@@ -63,6 +63,7 @@
 //! committing.
 
 use serde_norway::Value as YamlValue;
+use serde_json::json;
 
 use crate::agent::apps_account::{
     AppsAccount, HostPaths, Owner, create_dir_owned, write_owned,
@@ -162,7 +163,7 @@ actions!(Action [payload user] => {
         }
         apps.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
         invalid.sort();
-        Ok(jsonf! { "files_base_dir": dirs.files_root, apps, invalid })
+        Ok(json!({ "files_base_dir": dirs.files_root, "apps": apps, "invalid": invalid }))
     },
     Get: AppGetRequest => {
         validate_app_name(&payload.name)?;
@@ -181,7 +182,7 @@ actions!(Action [payload user] => {
             .iter()
             .map(|filename| {
                 let path = dirs.base_dir.join(filename);
-                jsonf! { filename, path, "exists": path.exists() }
+                json!({ "filename": filename, "path": path, "exists": path.exists() })
             })
             .collect::<Vec<_>>();
         let files = list_companion_files(&bundle.dir)?
@@ -192,12 +193,12 @@ actions!(Action [payload user] => {
         // `get` is open to the Apps page; secrets stay with administrators.
         let mut manifest = manifest;
         redact_secrets(&mut manifest);
-        Ok(jsonf! {
+        Ok(json!({
             "app": manifest,
             "base_dir": dirs.base_dir,
             "bundle_dir": bundle.dir,
-            units, files, services,
-        })
+            "units": units, "files": files, "services": services,
+        }))
     },
     Create: AppCreateRequest => {
         validate_app_name(&payload.name)?;
@@ -249,17 +250,17 @@ actions!(Action [payload user] => {
         } else {
             (Vec::new(), Vec::new())
         };
-        Ok(jsonf! {
+        Ok(json!({
             "app": manifest,
             "base_dir": dirs.base_dir,
             "bundle_dir": bundle.dir,
             "owner": owner_name(payload.scope),
-            manifest_path,
-            outcome.units, outcome.files,
-            services, account, systemd, selinux,
+            "manifest_path": manifest_path,
+            "units": outcome.units, "files": outcome.files,
+            "services": services, "account": account, "systemd": systemd, "selinux": selinux,
             "written": !payload.dry_run,
-            payload.dry_run,
-        })
+            "dry_run": payload.dry_run,
+        }))
     },
     Update: AppUpdateRequest => {
         validate_app_name(&payload.name)?;
@@ -321,18 +322,18 @@ actions!(Action [payload user] => {
         } else {
             (Vec::new(), Vec::new())
         };
-        Ok(jsonf! {
+        Ok(json!({
             "app": manifest,
             "base_dir": dirs.base_dir,
             "bundle_dir": bundle.dir,
             "owner": owner_name(payload.scope),
-            manifest_path,
-            outcome.units, outcome.files,
-            outcome.removed_units, outcome.removed_files,
-            services, account, systemd, selinux,
+            "manifest_path": manifest_path,
+            "units": outcome.units, "files": outcome.files,
+            "removed_units": outcome.removed_units, "removed_files": outcome.removed_files,
+            "services": services, "account": account, "systemd": systemd, "selinux": selinux,
             "written": !payload.dry_run,
-            payload.dry_run,
-        })
+            "dry_run": payload.dry_run,
+        }))
     },
     Remove: AppRequest => {
         validate_app_name(&payload.name)?;
@@ -359,13 +360,13 @@ actions!(Action [payload user] => {
             systemd.push(phase.daemon_reload()?);
         }
         bundle.remove(payload.dry_run)?;
-        Ok(jsonf! {
-            payload.name,
+        Ok(json!({
+            "name": payload.name,
             "bundle_dir": bundle.dir,
-            deleted_units, services, systemd,
+            "deleted_units": deleted_units, "services": services, "systemd": systemd,
             "bundle_removed": !payload.dry_run,
-            payload.dry_run,
-        })
+            "dry_run": payload.dry_run,
+        }))
     },
 });
 
@@ -697,12 +698,12 @@ impl AppBundle {
             updated_at,
             ..
         } = manifest;
-        jsonf! {
-            name, recipe_id, recipe_version, scope, units,
+        json!({
+            "name": name, "recipe_id": recipe_id, "recipe_version": recipe_version, "scope": scope, "units": units,
             "services": manifest.services(),
-            created_at, updated_at,
+            "created_at": created_at, "updated_at": updated_at,
             "bundle_dir": self.dir,
-        }
+        })
     }
 }
 
@@ -774,7 +775,7 @@ impl<'a> Systemd<'a> {
     fn daemon_reload(self) -> Result<Value> {
         ServicesModule.handle(
             "daemon_reload",
-            jsonf! { "scope": self.scope, "dry_run": self.dry_run },
+            json!({ "scope": self.scope, "dry_run": self.dry_run }),
             self.user,
         )
     }
@@ -784,11 +785,11 @@ impl<'a> Systemd<'a> {
     fn service_action(self, action: &str, service: &str) -> Result<Value> {
         ServicesModule.handle(
             action,
-            jsonf! {
+            json!({
                 "service": service,
                 "scope": self.scope,
                 "dry_run": self.dry_run,
-            },
+            }),
             self.user,
         )
     }
@@ -814,7 +815,7 @@ impl<'a> Systemd<'a> {
             .iter()
             .map(|service| {
                 self.service_action("stop", service).unwrap_or_else(|error| {
-                    jsonf! { "action": "stop", service, "error": error.to_string() }
+                    json!({ "action": "stop", "service": service, "error": error.to_string() })
                 })
             })
             .collect()

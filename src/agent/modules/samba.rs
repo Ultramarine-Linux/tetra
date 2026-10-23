@@ -7,6 +7,8 @@
 //! `samba_share_t` in the same request that defines the share — otherwise
 //! SELinux will deny smbd access to the path on enforcing hosts.
 
+use serde_json::json;
+
 use crate::{
     agent::module_support::apply_selinux,
     prelude::*,
@@ -51,11 +53,11 @@ impl Mod for SambaModule {
 actions!(Action [payload user] => {
     ListShares: SambaConfigRequest => {
         let contents = payload.read()?;
-        Ok(jsonf!{ payload.path, "shares": parse_samba_shares(&contents) })
+        Ok(json!({ "path": payload.path, "shares": parse_samba_shares(&contents) }))
     },
     GetConfig: SambaConfigRequest => {
         let contents = payload.read()?;
-        Ok(jsonf!{ payload.path, contents })
+        Ok(json!({ "path": payload.path, "contents": contents }))
     },
     SetConfig: SambaWriteConfigRequest => {
         // The whole file is replaced; callers are expected to build the
@@ -70,12 +72,12 @@ actions!(Action [payload user] => {
             Some(&payload.path),
             payload.dry_run,
         )?;
-        Ok(jsonf! {
-            payload.path,
+        Ok(json!({
+            "path": payload.path,
             "written": !payload.dry_run,
-            payload.dry_run,
-            selinux,
-        })
+            "dry_run": payload.dry_run,
+            "selinux": selinux,
+        }))
     },
     Reload: DryRunRequest => crate::cmd!((payload.dry_run) { &INFO, "reload", user } "systemctl" ["reload-or-restart", "smb.service"] json),
     Enable: DryRunRequest => crate::cmd!((payload.dry_run) { &INFO, "enable", user } "systemctl" ["enable", "--now", "smb.service"] json),

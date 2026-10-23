@@ -34,6 +34,8 @@
 
 use std::collections::BTreeMap;
 
+use serde_json::json;
+
 use crate::prelude::*;
 use crate::types::{EXPORTS_PATH, SAMBA_CONFIG_PATH};
 
@@ -596,15 +598,19 @@ pub fn catalog() -> Value {
     let pages: Vec<Value> = Page::ALL
         .iter()
         .map(|page| {
-            jsonf! {
+            let levels: Vec<_> = [View, Manage]
+                .into_iter()
+                .filter(|level| grantable(*page, *level))
+                .collect();
+            json!({
                 "page": page,
                 "label": page.label(),
-                "grantable": [View, Manage].into_iter().filter(|level| grantable(*page, *level)).collect::<Vec<_>>(),
+                "grantable": levels,
                 "default": default_permissions().get(page),
-            }
+            })
         })
         .collect();
-    jsonf! { pages }
+    json!({ "pages": pages })
 }
 
 #[cfg(test)]

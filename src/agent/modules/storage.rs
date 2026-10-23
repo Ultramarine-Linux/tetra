@@ -7,6 +7,8 @@
 //! on SELinux-enabled hosts where an unlabeled mount point would be denied
 //! access to its intended service.
 
+use serde_json::json;
+
 use crate::prelude::*;
 
 use crate::agent::module_support::{SelinuxOptions, apply_selinux, option_arg, positional};
@@ -46,20 +48,20 @@ impl Mod for StorageModule {
 }
 
 actions!(Action [payload user] => {
-    List => Ok(jsonf! {
+    List => Ok(json!({
         // unwrap_or_default swallows read/parse errors and yields an
         // empty list — `list` is best-effort inventory, not a health
         // probe, so a missing `/proc/*` file should not fail the call.
         "mounts": read_mounts("/proc/mounts").unwrap_or_default(),
         "partitions": read_partitions("/proc/partitions").unwrap_or_default(),
-    }),
+    })),
     Status {
         path: PathBuf,
         #[serde(default)]
         dry_run: bool,
     } => {
         let result = crate::cmd!({ &INFO, "status", user } "df" ["-h", positional("path", &payload.path.to_string_lossy())?] json)?;
-        Ok(jsonf! { result, payload.dry_run, "zfs": discover_zfs() })
+        Ok(json!({ "result": result, "dry_run": payload.dry_run, "zfs": discover_zfs() }))
     },
     Zfs => Ok(discover_zfs()),
     Mount {
@@ -81,7 +83,7 @@ actions!(Action [payload user] => {
         args.extend([payload.source, payload.target]);
         let mount = crate::cmd!((payload.dry_run) { &INFO, "mount", user } "mount" => &args ; json)?;
         let selinux = apply_selinux(payload.selinux.as_ref(), Some(&target), payload.dry_run)?;
-        Ok(jsonf! { mount, selinux })
+        Ok(json!({ "mount": mount, "selinux": selinux }))
     },
     Unmount {
         path: PathBuf,
@@ -106,12 +108,12 @@ actions!(Action [payload user] => {
             Some(&payload.fstab_path),
             payload.dry_run,
         )?;
-        Ok(jsonf! {
-            payload.fstab_path,
+        Ok(json!({
+            "fstab_path": payload.fstab_path,
             "configured": !payload.dry_run,
-            payload.dry_run,
-            selinux,
-        })
+            "dry_run": payload.dry_run,
+            "selinux": selinux,
+        }))
     },
 });
 
@@ -154,13 +156,13 @@ fn discover_zfs() -> Value {
         ],
         &["name", "used", "available", "referenced", "mountpoint"],
     );
-    jsonf! {
+    json!({
         "available": kernel_module || tooling || zfs_tooling,
-        kernel_module,
+        "kernel_module": kernel_module,
         "tools": tooling || zfs_tooling,
-        pools,
-        datasets,
-    }
+        "pools": pools,
+        "datasets": datasets,
+    })
 }
 
 fn run_zfs_list(program: &str, args: &[&str], fields: &[&str]) -> (bool, Vec<Value>) {
@@ -208,12 +210,12 @@ fn read_mounts(path: impl Into<PathBuf>) -> Result<Vec<Value>> {
         .filter_map(|line| {
             let fields: Vec<_> = line.split_whitespace().collect();
             (fields.len() >= 4).then(|| {
-                jsonf! {
+                json!({
                     "source": fields[0],
                     "target": fields[1],
                     "filesystem": fields[2],
                     "options": fields[3],
-                }
+                })
             })
         })
         .collect())
@@ -233,12 +235,12 @@ fn read_partitions(path: impl Into<PathBuf>) -> Result<Vec<Value>> {
         .filter_map(|line| {
             let fields: Vec<_> = line.split_whitespace().collect();
             (fields.len() == 4).then(|| {
-                jsonf! {
+                json!({
                     "major": fields[0],
                     "minor": fields[1],
                     "blocks": fields[2],
                     "name": fields[3],
-                }
+                })
             })
         })
         .collect())

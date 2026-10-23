@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use serde_json::json;
 use tokio::sync::Semaphore;
 use webauthn_rs::prelude::Webauthn;
 
@@ -255,11 +256,11 @@ fn passkeys_unavailable() -> ApiError {
 }
 
 fn session_json(session: &Session, current: Option<&Session>) -> Value {
-    jsonf! {
-        session.id, session.client, session.kind, session.method, session.uid,
-        session.username, session.created_at, session.expires_at, session.last_seen,
+    json!({
+        "id": session.id, "client": session.client, "kind": session.kind, "method": session.method, "uid": session.uid,
+        "username": session.username, "created_at": session.created_at, "expires_at": session.expires_at, "last_seen": session.last_seen,
         "current": current.is_some_and(|current| current.id == session.id),
-    }
+    })
 }
 
 impl AuthService {
@@ -353,10 +354,10 @@ impl AuthService {
     /// Facts for the `hello` frame.
     #[must_use]
     pub fn hello(&self) -> Value {
-        jsonf! {
+        json!({
             "setup_required": !self.inner.setup.is_complete(),
             "passkeys_available": self.webauthn().is_ok(),
-        }
+        })
     }
 
     /// Write session `last_seen` updates every `interval`, forever.
@@ -529,12 +530,12 @@ impl AuthService {
             client_name(client),
             account.name
         );
-        Ok(jsonf! {
+        Ok(json!({
             "status": "authenticated",
-            token,
+            "token": token,
             "session": session_json(&session, None),
             "user": { "uid": account.uid, "username": account.name, "admin": account.is_admin() },
-        })
+        }))
     }
 
     fn authenticate(&self, client: ClientKind, token: Option<&str>) -> Result<Caller, ApiError> {

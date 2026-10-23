@@ -32,6 +32,8 @@ use std::{
     os::unix::fs::OpenOptionsExt as _,
 };
 
+use serde_json::json;
+
 use crate::prelude::*;
 
 use crate::agent::module_support::{
@@ -296,15 +298,15 @@ fn tailscale_up(
     }
     // The name the OOBE should give `access.set`.
     let hostname = if dry_run { None } else { current_tailnet_hostname() };
-    Ok(jsonf! {
+    Ok(json!({
         "enabled": true,
         "serve": serve || funnel,
-        funnel,
+        "funnel": funnel,
         "target": forward_target(port),
-        hostname,
-        dry_run,
+        "hostname": hostname,
+        "dry_run": dry_run,
         "commands": commands.done,
-    })
+    }))
 }
 
 /// Where Tailscale forwards `port`: Caddy on the same port.
@@ -426,7 +428,7 @@ fn tailscale_disable(paths: &Paths, dry_run: bool) -> Result<Value> {
         commands.run("systemctl", &["daemon-reload"])?;
     }
     let enabled = !disabled && unit_enabled(TAILSCALED);
-    Ok(jsonf! { enabled, dry_run, "commands": commands.done })
+    Ok(json!({ "enabled": enabled, "dry_run": dry_run, "commands": commands.done }))
 }
 
 /// The `cloudflared.service` drop-in that hands it the sealed token.
@@ -469,7 +471,12 @@ fn cloudflared_set_token(
     commands.run("systemctl", &["enable", CLOUDFLARED])?;
     // Restart, so a new token replaces a running tunnel.
     commands.run("systemctl", &["restart", CLOUDFLARED])?;
-    Ok(jsonf! { "enabled": true, drop_in, dry_run, "commands": commands.done })
+    Ok(json!({
+        "enabled": true,
+        "drop_in": drop_in,
+        "dry_run": dry_run,
+        "commands": commands.done,
+    }))
 }
 
 fn cloudflared_disable(paths: &Paths, dry_run: bool) -> Result<Value> {
@@ -488,7 +495,7 @@ fn cloudflared_disable(paths: &Paths, dry_run: bool) -> Result<Value> {
         commands.run("systemctl", &["daemon-reload"])?;
     }
     let enabled = !disabled && unit_enabled(CLOUDFLARED);
-    Ok(jsonf! { enabled, dry_run, "commands": commands.done })
+    Ok(json!({ "enabled": enabled, "dry_run": dry_run, "commands": commands.done }))
 }
 
 fn unit_active(unit: &str) -> bool {
@@ -496,7 +503,7 @@ fn unit_active(unit: &str) -> bool {
 }
 
 fn status() -> Value {
-    let mut tailscale = jsonf! { "enabled": unit_enabled(TAILSCALED), "serve": false, "funnel": false };
+    let mut tailscale = json!({ "enabled": unit_enabled(TAILSCALED), "serve": false, "funnel": false });
     if unit_active(TAILSCALED) {
         if let Some(serve) = crate::cmd!("tailscale" ["serve", "status", "--json"])
             .ok()
@@ -510,10 +517,10 @@ fn status() -> Value {
             tailscale["hostname"] = hostname.into();
         }
     }
-    jsonf! {
-        tailscale,
+    json!({
+        "tailscale": tailscale,
         "cloudflared": { "enabled": unit_enabled(CLOUDFLARED) },
-    }
+    })
 }
 
 /// Whether `tailscale serve status --json` shows anything served, and

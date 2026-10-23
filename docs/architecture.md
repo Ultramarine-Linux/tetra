@@ -193,6 +193,8 @@ A module whose host state belongs to the apps account (`podman`) overrides
 2. Implement `Mod` and declare the actions with `actions!`:
 
 ```rust
+use serde_json::json;
+
 use crate::prelude::*;
 
 #[derive(Clone, Copy, Debug)]
@@ -217,7 +219,7 @@ impl Mod for MyModule {
 
 actions!(Action [payload user] => {
     // No payload: accepts any object, or `null`.
-    Status => Ok(jsonf! { "ok": true }),
+    Status => Ok(json!({ "ok": true })),
     // Inline payload struct; `payload` and `user` are in scope.
     DoSomething {
         name: String,

@@ -209,7 +209,7 @@ mod tests {
                 ],
             },
         }]);
-        let mut result = jsonf! { "stdout": data.to_string(), data };
+        let mut result = serde_json::json!({ "stdout": data.to_string(), "data": data });
         redact_env(&mut result);
         let shown = result.to_string();
         assert!(!shown.contains("hunter2") && !shown.contains("s3cret"), "{shown}");

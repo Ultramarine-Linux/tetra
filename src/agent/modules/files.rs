@@ -7,6 +7,8 @@
 //! pattern but scope writes to their own managed paths; this module is the
 //! general-purpose escape hatch.
 
+use serde_json::json;
+
 use crate::agent::module_support::apply_selinux;
 use crate::prelude::*;
 
@@ -38,7 +40,7 @@ impl Mod for FilesModule {
 
 actions!(Action [payload user] => {
     Read: FileReadRequest => {
-        Ok(jsonf! { payload.path, "contents": payload.read()? })
+        Ok(json!({ "path": payload.path, "contents": payload.read()? }))
     },
     Write: FileWriteRequest => {
         // Skip the actual write in dry-run; the SELinux plan below is
@@ -52,7 +54,7 @@ actions!(Action [payload user] => {
             Some(&payload.path),
             payload.dry_run,
         )?;
-        Ok(jsonf! { payload.path, "written": !payload.dry_run, payload.dry_run, selinux })
+        Ok(json!({ "path": payload.path, "written": !payload.dry_run, "dry_run": payload.dry_run, "selinux": selinux }))
     }
 });
 

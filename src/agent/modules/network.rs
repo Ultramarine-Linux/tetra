@@ -41,6 +41,8 @@ use std::{
     time::Duration,
 };
 
+use serde_json::json;
+
 use crate::prelude::*;
 
 use crate::agent::module_support::{CommandResult, SelinuxOptions, restorecon};
@@ -121,7 +123,7 @@ actions!(Action [payload user] => {
             .and_then(|result: CommandResult| serde_json::from_str(&result.stdout).ok())
             .map(|data: Value| parse_ip_addr_json(&data))
             .unwrap_or_default();
-        Ok(jsonf! { "interfaces": read_interfaces(Path::new(SYSFS_NET), &addresses).unwrap_or_default() })
+        Ok(json!({ "interfaces": read_interfaces(Path::new(SYSFS_NET), &addresses).unwrap_or_default() }))
     },
     Status: NetworkInterfaceRequest => {
         // `ip -json addr show` returns structured JSON we pass through
@@ -135,7 +137,7 @@ actions!(Action [payload user] => {
         response["addresses"] = serde_json::to_value(parse_ip_addr_json(&response["data"]))?;
         Ok(response)
     },
-    Dns => Ok(jsonf! { "resolv_conf": read_optional("/etc/resolv.conf") }),
+    Dns => Ok(json!({ "resolv_conf": read_optional("/etc/resolv.conf") })),
     Routes => crate::cmd!({ &INFO, "routes", user } "ip" ["-json", "route", "show"] JSON),
     Configure: NetworkConfigureRequest => {
         configure(
@@ -158,7 +160,7 @@ actions!(Action [payload user] => {
         crate::cmd!((payload.dry_run) { &INFO, "reload", user } "systemctl" ["reload-or-restart", "NetworkManager.service"] json)
     },
     ScanWifi: NetworkScanWifiRequest => {
-        Ok(jsonf! { "networks": scan_wifi(&payload.interface, payload.rescan)? })
+        Ok(json!({ "networks": scan_wifi(&payload.interface, payload.rescan)? }))
     },
     ConnectWifi: NetworkConnectWifiRequest => {
         connect_wifi(
@@ -336,7 +338,7 @@ impl Profile {
     /// passwords redacted, what it would hold. PEM contents would be
     /// stored as files, which `keyfile` already points at.
     fn dry_run(self, keyfile: &str) -> Value {
-        jsonf! { "path": self.path, "uuid": self.uuid, keyfile, "applied": false, "dry_run": true }
+        json!({ "path": self.path, "uuid": self.uuid, "keyfile": keyfile, "applied": false, "dry_run": true })
     }
 
     /// Completes [`SafeApply`]'s response with the profile's UUID and
@@ -355,7 +357,7 @@ fn get_config(payload: &NetworkConfigRequest, dir: &Path) -> Result<Value> {
         .with_context(|| format!("`{}` does not exist", path.display()))?;
     let contents = String::from_utf8(contents)
         .with_context(|| format!("`{}` is not valid UTF-8", path.display()))?;
-    Ok(jsonf! { "path": path, contents })
+    Ok(json!({ "path": path, "contents": contents }))
 }
 
 fn set_config(payload: &NetworkWriteConfigRequest, dir: &Path) -> Result<Value> {
@@ -377,12 +379,12 @@ fn set_config(payload: &NetworkWriteConfigRequest, dir: &Path) -> Result<Value> 
         write_keyfile(&path, payload.contents.as_bytes())?;
     }
     let selinux = restorecon(&path, &["-v"], payload.dry_run)?;
-    Ok(jsonf! {
+    Ok(json!({
         "path": path,
         "written": !payload.dry_run,
-        payload.dry_run,
-        selinux,
-    })
+        "dry_run": payload.dry_run,
+        "selinux": selinux,
+    }))
 }
 
 
@@ -576,7 +578,7 @@ fn read_interfaces(sysfs_root: &Path, addresses: &[InterfaceAddress]) -> Result<
             .filter(|address| address.interface == name)
             .collect();
         let kind = interface_kind(&entry.path());
-        interfaces.push(jsonf! { name, "type": kind, operstate, "mac": address, addresses });
+        interfaces.push(json!({ "name": name, "type": kind, "operstate": operstate, "mac": address, "addresses": addresses }));
     }
     interfaces.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
     Ok(interfaces)

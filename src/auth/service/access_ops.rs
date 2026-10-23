@@ -3,6 +3,8 @@
 
 use std::sync::{Arc, PoisonError};
 
+use serde_json::json;
+
 use crate::{
     auth::{
         access::{AccessConfig, AccessRequest, AcmeChallenge},
@@ -30,7 +32,7 @@ impl AuthService {
 
     pub(super) fn access_get(&self) -> ApiResult {
         let access = AccessConfig::load(&self.inner.config.access_path())?;
-        Ok(jsonf! { access, "passkeys_available": self.webauthn().is_ok() })
+        Ok(json!({ "access": access, "passkeys_available": self.webauthn().is_ok() }))
     }
 
     pub(super) async fn access_set(&self, caller: &Caller, request: AccessRequest) -> ApiResult {
@@ -39,14 +41,14 @@ impl AuthService {
             .map_err(ApiError::bad_request)?;
         let this = self.clone();
         let applied = blocking(move || this.set_access(config, request.dns_credentials)).await??;
-        Ok(jsonf! {
+        Ok(json!({
             "access": applied.config,
             "passkeys_available": self.webauthn().is_ok(),
             "dashboard_url": applied.origin,
             "dashboard_site": applied.dashboard_site,
             "caddy": applied.caddy,
             "dashboard_env": applied.dashboard_env,
-        })
+        }))
     }
 
     /// Apply a validated `access.set`, one at a time.
@@ -255,7 +257,7 @@ impl AuthService {
             eprintln!("access.set: Caddy did not take the new configuration: {error}");
             Some(error)
         };
-        jsonf! { "restarted": restart, "reloaded": !restart, error }
+        json!({ "restarted": restart, "reloaded": !restart, "error": error })
     }
 
     /// The dashboard's environment file with `ORIGIN` set to `origin` and
@@ -317,7 +319,7 @@ impl AuthService {
         } else {
             None
         };
-        jsonf! { path, "origin": env.origin, changed, error, restart_error }
+        json!({ "path": path, "origin": env.origin, "changed": changed, "error": error, "restart_error": restart_error })
     }
 }
 

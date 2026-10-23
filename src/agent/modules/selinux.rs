@@ -12,6 +12,8 @@
 //! code; they share the `SelinuxOptions` payload via `apply_selinux()` in
 //! `module_support.rs`.
 
+use serde_json::json;
+
 use crate::agent::module_support::positional;
 use crate::prelude::*;
 
@@ -62,24 +64,24 @@ impl Mod for SelinuxModule {
 actions!(Action [payload user] => {
     Status => {
         let result = crate::cmd!({&INFO, "status", user} "sestatus")?;
-        Ok(jsonf! {
-            result.command, result.status, result.stdout, result.stderr, result.dry_run,
+        Ok(json!({
+            "command": result.command, "status": result.status, "stdout": result.stdout, "stderr": result.stderr, "dry_run": result.dry_run,
             "selinux": parse_sestatus(&result.stdout),
-        })
+        }))
     },
     Enforce => {
         let result = crate::cmd!({&INFO, "enforce", user} "getenforce")?;
-        Ok(jsonf! {
-            result.command, result.status, result.stdout, result.stderr, result.dry_run,
+        Ok(json!({
+            "command": result.command, "status": result.status, "stdout": result.stdout, "stderr": result.stderr, "dry_run": result.dry_run,
             "mode": result.stdout.trim(),
-        })
+        }))
     },
     Booleans => {
         let result = crate::cmd!({&INFO, "booleans", user} "getsebool" ["-a"])?;
-        Ok(jsonf! {
-            result.command, result.status, result.stdout, result.stderr, result.dry_run,
+        Ok(json!({
+            "command": result.command, "status": result.status, "stdout": result.stdout, "stderr": result.stderr, "dry_run": result.dry_run,
             "booleans": parse_getsebool(&result.stdout),
-        })
+        }))
     },
     SetBoolean {
         name: String,
@@ -100,10 +102,10 @@ actions!(Action [payload user] => {
     },
     FileContexts => {
         let result = crate::cmd!({&INFO, "file_contexts", user} "semanage" ["fcontext", "-l"])?;
-        Ok(jsonf! {
-            result.command, result.status, result.stdout, result.stderr, result.dry_run,
+        Ok(json!({
+            "command": result.command, "status": result.status, "stdout": result.stdout, "stderr": result.stderr, "dry_run": result.dry_run,
             "file_contexts": parse_semanage_fcontext(&result.stdout),
-        })
+        }))
     },
     AddFileContext {
         path_pattern: String,
@@ -162,11 +164,11 @@ fn parse_sestatus(stdout: &str) -> Value {
 fn parse_getsebool(stdout: &str) -> Vec<Value> {
     (stdout.lines().filter_map(|line| line.split_once("-->")))
         .map(|(name, value)| {
-            jsonf! {
+            json!({
                 "name": name.trim(),
                 "enabled": matches!(value.trim(), "on" | "1" | "true"),
                 "value": value.trim(),
-            }
+            })
         })
         .collect()
 }
@@ -190,12 +192,12 @@ fn parse_semanage_fcontext(stdout: &str) -> Vec<Value> {
             let [path_pattern, file_type @ .., context] = &fields[..] else {
                 return None;
             };
-            Some(jsonf! {
-                path_pattern,
+            Some(json!({
+                "path_pattern": path_pattern,
                 "file_type": file_type.join(" "),
-                context,
+                "context": context,
                 "context_type": extract_context_type(context),
-            })
+            }))
         })
         .collect()
 }

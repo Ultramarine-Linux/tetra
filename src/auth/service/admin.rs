@@ -1,5 +1,7 @@
 //! Administration: `admin.*` (grants, sessions, the action log).
 
+use serde_json::json;
+
 use crate::{
     auth::{
         api::{ApiError, ApiResult, ErrorCode},
@@ -19,13 +21,13 @@ impl AuthService {
     pub(super) fn grants_get(&self, caller: &Caller, p: UidParams) -> ApiResult {
         caller.require_admin()?;
         if let Some(uid) = p.uid {
-            return Ok(jsonf! {
-                uid,
+            return Ok(json!({
+                "uid": uid,
                 "grants": self.inner.grants.get(uid)?,
                 "effective": self.inner.grants.effective(uid)?,
-            });
+            }));
         }
-        Ok(jsonf! { "grants": self.inner.grants.all()? })
+        Ok(json!({ "grants": self.inner.grants.all()? }))
     }
 
     pub(super) fn grants_set(&self, caller: &Caller, p: &GrantsSetParams) -> ApiResult {
@@ -42,7 +44,7 @@ impl AuthService {
             .map_err(ApiError::bad_request)?;
         eprintln!("updated grants for `{}`", account.name);
         Ok(
-            jsonf! { "uid": account.uid, grants, "effective": self.inner.grants.effective(account.uid)? },
+            json!({ "uid": account.uid, "grants": grants, "effective": self.inner.grants.effective(account.uid)? }),
         )
     }
 
@@ -63,7 +65,7 @@ impl AuthService {
             .inner
             .sessions
             .revoke(|session| session.uid == Some(p.uid))?;
-        Ok(jsonf! { revoked })
+        Ok(json!({ "revoked": revoked }))
     }
 
     pub(super) fn admin_actions(&self, caller: &Caller, p: ActionsParams) -> ApiResult {
@@ -72,7 +74,7 @@ impl AuthService {
             .inner
             .audit
             .recent(p.limit.unwrap_or(DEFAULT_ACTION_LOG_LIMIT), p.origin)?;
-        Ok(jsonf! { actions })
+        Ok(json!({ "actions": actions }))
     }
 }
 

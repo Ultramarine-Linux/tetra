@@ -7,6 +7,8 @@
 //! `public_content_rw_t`) in the same request — otherwise SELinux denies nfsd
 //! access to the path on enforcing hosts.
 
+use serde_json::json;
+
 use crate::prelude::*;
 
 use crate::agent::module_support::apply_selinux;
@@ -50,10 +52,10 @@ impl Mod for NfsModule {
 
 actions!(Action [payload user] => {
     ListExports: NfsConfigRequest => {
-        Ok(jsonf! { payload.path, "exports": parse_exports(&payload.read()?) })
+        Ok(json!({ "path": payload.path, "exports": parse_exports(&payload.read()?) }))
     },
     GetConfig: NfsConfigRequest => {
-        Ok(jsonf! { payload.path, "contents": payload.read()? })
+        Ok(json!({ "path": payload.path, "contents": payload.read()? }))
     },
     SetConfig: NfsWriteConfigRequest => {
         // The whole file is replaced; callers build the complete
@@ -67,12 +69,12 @@ actions!(Action [payload user] => {
             Some(&payload.path),
             payload.dry_run,
         )?;
-        Ok(jsonf! {
-            payload.path,
+        Ok(json!({
+            "path": payload.path,
             "written": !payload.dry_run,
-            payload.dry_run,
-            selinux,
-        })
+            "dry_run": payload.dry_run,
+            "selinux": selinux,
+        }))
     },
     Reload: DryRunRequest => {
         cmd!((payload.dry_run) { &INFO, "reload", user } "exportfs" ["-ra"] json)
@@ -98,10 +100,10 @@ fn parse_exports(contents: &str) -> Vec<Value> {
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let path = fields.next()?;
-            Some(jsonf! {
-                path,
+            Some(json!({
+                "path": path,
                 "clients": fields.collect::<Vec<_>>(),
-            })
+            }))
         })
         .collect()
 }

@@ -15,6 +15,8 @@
 //! `list` and `status` additionally parse virsh's text output into stable
 //! `domains` / `domain` JSON fields so callers do not have to.
 
+use serde_json::json;
+
 use crate::agent::module_support::{
     ModuleInfo, ModuleStatus, NamedPayload, positional,
 };
@@ -62,28 +64,28 @@ actions!(Action [payload user] => {
     List => {
         let result = crate::cmd!({ &INFO, "list", user } "virsh" ["list", "--all"])?;
         let domains = parse_virsh_list(&result.stdout);
-        Ok(jsonf! {
+        Ok(json!({
             "command": result.command,
             "status": result.status,
             "stdout": result.stdout,
             "stderr": result.stderr,
             "dry_run": result.dry_run,
-            domains,
-        })
+            "domains": domains,
+        }))
     },
     // `list --all` includes powered-off domains, not just running ones.
     // `list` is a read and therefore never dry-run.
     Status: NamedPayload => {
         let result = crate::cmd!({ &INFO, "status", user } "virsh" ["dominfo", positional("name", &payload.name)?])?;
         let info = parse_virsh_dominfo(&result.stdout);
-        Ok(jsonf! {
-            result.command,
-            result.status,
-            result.stdout,
-            result.stderr,
-            result.dry_run,
+        Ok(json!({
+            "command": result.command,
+            "status": result.status,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "dry_run": result.dry_run,
             "domain": info,
-        })
+        }))
     },
     // Logs come from the libvirtd unit journal, not `virsh`, since
     // virsh itself does not expose host-side daemon logs.
@@ -132,11 +134,11 @@ fn parse_virsh_list(stdout: &str) -> Vec<Value> {
             let mut fields = line.split_whitespace();
             let id = fields.next()?;
             let name = fields.next()?;
-            Some(jsonf! {
+            Some(json!({
                 "id": (id != "-").then_some(id),
                 "name": name,
                 "state": fields.collect::<Vec<_>>().join(" "),
-            })
+            }))
         })
         .collect()
 }

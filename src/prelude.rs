@@ -2,7 +2,7 @@ pub use crate::agent::dispatcher::RunAs;
 pub use crate::agent::module_support::{ModuleInfo, ModuleStatus};
 pub use crate::agent::modules::{Act, Mod};
 pub use crate::agent::{AgentCommand, AgentResponse};
-pub use crate::{actions, cmd, jsonf};
+pub use crate::{actions, cmd};
 pub use anyhow::{Context, Result, bail, ensure};
 pub use itertools::Itertools;
 

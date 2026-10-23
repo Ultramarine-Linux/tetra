@@ -12,6 +12,8 @@
 //! command runs as that account). `list` additionally parses the raw
 //! `list-units` table into a stable `services` array.
 
+use serde_json::json;
+
 use crate::agent::apps_account::{APPS_USER, AppsAccount};
 use crate::agent::module_support::positional;
 use crate::prelude::*;
@@ -81,14 +83,14 @@ actions!(Action [payload user] => {
             "--all",
         ], as_apps("list", user));
         let result = crate::cmd!({ &INFO, "list", user } "systemctl" => &args)?;
-        Ok(jsonf! {
+        Ok(json!({
             "command": result.command,
             "status": result.status,
             "stdout": result.stdout,
             "stderr": result.stderr,
             "dry_run": result.dry_run,
             "services": ServiceStatus::parse_all(&result.stdout),
-        })
+        }))
     },
     Status: ServiceRequest => {
         let args = payload.scope.command_args_as([
@@ -167,11 +169,11 @@ mod tests {
         let response = ServicesModule
             .handle(
                 "start",
-                jsonf! {
+                json!({
                     "service": "sshd.service",
                     "scope": ServiceScope::System,
                     "dry_run": true,
-                },
+                }),
                 None,
             )
             .unwrap();
@@ -200,11 +202,11 @@ mod tests {
         let response = ServicesModule
             .handle(
                 "start",
-                jsonf! {
+                json!({
                     "service": "tetra-demo.service",
                     "scope": ServiceScope::User,
                     "dry_run": true,
-                },
+                }),
                 None,
             )
             .unwrap();

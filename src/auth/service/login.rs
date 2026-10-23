@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use serde_json::json;
 use webauthn_rs::prelude::{DiscoverableKey, Passkey, PublicKeyCredential};
 
 use crate::{
@@ -94,12 +95,12 @@ impl AuthService {
                 now,
             )
             .ok_or_else(|| ApiError::rate_limited(LOGIN_TTL))?;
-        Ok(jsonf! {
+        Ok(json!({
             "status": "second_factor_required",
-            pending,
+            "pending": pending,
             "methods": ["totp", "recovery_code"],
-            expires_at,
-        })
+            "expires_at": expires_at,
+        }))
     }
 
     /// Run a PAM transaction on the blocking pool, at most
@@ -300,7 +301,7 @@ impl AuthService {
                 now,
             )
             .ok_or_else(|| ApiError::rate_limited(CEREMONY_TTL))?;
-        Ok(jsonf! { ceremony, options, expires_at })
+        Ok(json!({ "ceremony": ceremony, "options": options, "expires_at": expires_at }))
     }
 
     pub(super) async fn auth_passkey_finish(

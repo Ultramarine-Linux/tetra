@@ -2,6 +2,8 @@
 //! ([`crate::agent::shell`]) asks for when it opens a shell and while the
 //! shell runs. See [`crate::auth::shell`].
 
+use serde_json::json;
+
 use crate::{
     auth::{
         accounts::Account,
@@ -38,7 +40,7 @@ impl AuthService {
                 now,
             )
             .ok_or_else(|| ApiError::rate_limited(TICKET_TTL))?;
-        Ok(jsonf! { ticket, expires_at })
+        Ok(json!({ "ticket": ticket, "expires_at": expires_at }))
     }
 
     /// Redeem a `shell.ticket` for `shell.open` on a connection from

@@ -114,7 +114,7 @@ fn files_module_reads_and_writes_files() {
     let write = dispatch(
         "files",
         "write",
-        tetra::jsonf! { path, "contents": "enabled=true\n" },
+        json!({ "path": path, "contents": "enabled=true\n" }),
     );
     assert!(write.ok, "{write:?}");
 
@@ -134,8 +134,8 @@ fn quadlets_module_installs_lists_reads_and_deletes_files() {
     let install = dispatch(
         "quadlets",
         "install",
-        tetra::jsonf! {
-            base_dir, files_base_dir,
+        json!({
+            "base_dir": base_dir, "files_base_dir": files_base_dir,
             "resources": [
                 {
                     "filename": "app.container",
@@ -152,7 +152,7 @@ fn quadlets_module_installs_lists_reads_and_deletes_files() {
                     "contents": "<h1>Hello</h1>\n",
                 },
             ],
-        },
+        }),
     );
     assert!(install.ok, "{install:?}");
     assert_eq!(

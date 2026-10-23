@@ -49,6 +49,8 @@ use super::{
     certs,
     paths::{read_keyfile, remove_keyfile, write_keyfile},
 };
+use serde_json::json;
+
 use crate::auth::store::{self, Extra, Header, Record};
 use crate::prelude::*;
 
@@ -151,14 +153,14 @@ impl Pending {
     }
 
     fn shown(&self) -> Value {
-        jsonf! {
+        json!({
             "confirmation_token": self.token,
             "interface": self.interface,
             "path": self.path,
             "rollback_in_seconds": self.rollback_at.saturating_duration_since(Instant::now()).as_secs(),
             "rollback_by": self.rollback_by(),
             "checkpoint": self.checkpoint,
-        }
+        })
     }
 }
 
@@ -476,7 +478,7 @@ impl SafeApply {
         if !cut_off && self.commit(&undo, created)? {
             self.shared.forget();
             prune_certs(change.path, change.certs);
-            return Ok(jsonf! {
+            return Ok(json!({
                 "path": change.path,
                 "applied": true,
                 "activation_error": activation_error,
@@ -485,7 +487,7 @@ impl SafeApply {
                 "addresses_after": after_change.addresses,
                 "gateways_before": before.gateways,
                 "gateways_after": after_change.gateways,
-            });
+            }));
         }
 
         // Give the caller the full time to confirm, counted from now.
@@ -497,7 +499,7 @@ impl SafeApply {
             undo.rollback_at = created.checked_add(self.rollback_after).unwrap_or(undo.rollback_at);
         }
         self.shared.save(&undo);
-        let response = jsonf! {
+        let response = json!({
             "path": change.path,
             "applied": true,
             "activation_error": activation_error,
@@ -510,7 +512,7 @@ impl SafeApply {
             "addresses_after": after_change.addresses,
             "gateways_before": before.gateways,
             "gateways_after": after_change.gateways,
-        };
+        });
         self.arm_rollback(undo.token.clone(), self.timer_delay(&undo));
         *pending = Some(undo);
         drop(pending);
@@ -599,7 +601,7 @@ impl SafeApply {
     /// the connection it was sent on.
     #[must_use]
     pub fn pending(&self) -> Value {
-        jsonf! { "pending": self.lock_pending().as_ref().map(Pending::shown) }
+        json!({ "pending": self.lock_pending().as_ref().map(Pending::shown) })
     }
 
     /// Write `change`'s certificates and keyfile, with their default
@@ -667,7 +669,7 @@ impl SafeApply {
         self.shared.forget();
         prune_certs(&change.path, change.certs.as_deref());
         drop(pending);
-        Ok(jsonf! { "confirmed": true, "path": change.path })
+        Ok(json!({ "confirmed": true, "path": change.path }))
     }
 
     /// Poll until `interface` is reachable as in `before` again

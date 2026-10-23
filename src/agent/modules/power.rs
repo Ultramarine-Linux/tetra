@@ -4,6 +4,8 @@
 //! timer rather than run directly, so the response reaches the caller (the
 //! OOBE shows a "rebooting" screen) before the shutdown begins.
 
+use serde_json::json;
+
 use crate::prelude::*;
 
 /// Marker type for the power module.
@@ -57,7 +59,12 @@ fn schedule(verb: &str, dry_run: bool) -> Result<Value> {
         "systemctl",
         verb,
     ] json)?;
-    Ok(jsonf! { "action": verb, "in_seconds": DELAY_SECONDS, dry_run, "command": result })
+    Ok(json!({
+        "action": verb,
+        "in_seconds": DELAY_SECONDS,
+        "dry_run": dry_run,
+        "command": result,
+    }))
 }
 
 #[cfg(test)]

@@ -10,6 +10,8 @@
 //! the virtual console keymap), `set_locale` (`localectl set-locale`) and
 //! `set_timezone` (`timedatectl set-timezone`).
 
+use serde_json::json;
+
 use crate::prelude::*;
 
 /// Marker type for the always-on settings module. It carries no state: all
@@ -51,11 +53,11 @@ actions!(Action [payload user] => {
     // `std::env::consts` are compile-time constants derived from the
     // target triple, so `get_system` performs no host probe and is safe
     // to call in any context.
-    GetSystem => Ok(jsonf! {
+    GetSystem => Ok(json!({
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "family": std::env::consts::FAMILY,
-    }),
+    })),
     SetHostname {
         hostname: String,
         #[serde(default)]

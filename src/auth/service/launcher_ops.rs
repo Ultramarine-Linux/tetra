@@ -1,5 +1,7 @@
 //! The launcher: `launcher.*`.
 
+use serde_json::json;
+
 use crate::{
     auth::{
         api::{ApiError, ApiResult, ErrorCode},
@@ -24,7 +26,7 @@ impl AuthService {
             .iter()
             .map(|entry| entry.to_json(viewer.admin, access.as_ref()))
             .collect();
-        Ok(jsonf! { entries })
+        Ok(json!({ "entries": entries }))
     }
 
     pub(super) fn launcher_get(&self, caller: &Caller, p: &LauncherIdParams) -> ApiResult {
@@ -36,7 +38,7 @@ impl AuthService {
             .launcher
             .get(&p.id, &viewer)?
             .ok_or_else(launcher_not_found)?;
-        Ok(jsonf! { "entry": entry.to_json(viewer.admin, self.access().as_ref()) })
+        Ok(json!({ "entry": entry.to_json(viewer.admin, self.access().as_ref()) }))
     }
 
     pub(super) fn launcher_set(&self, caller: &Caller, p: LauncherSetParams) -> ApiResult {
@@ -47,7 +49,7 @@ impl AuthService {
             .launcher
             .set(p.id.as_deref(), p.entry, access.as_ref())?
             .map_err(launcher_change_error)?;
-        Ok(jsonf! { "entry": entry.to_json(true, access.as_ref()) })
+        Ok(json!({ "entry": entry.to_json(true, access.as_ref()) }))
     }
 
     pub(super) fn launcher_remove(&self, caller: &Caller, p: &LauncherIdParams) -> ApiResult {
@@ -56,14 +58,14 @@ impl AuthService {
             .launcher
             .remove(&p.id, self.access().as_ref())?
             .map_err(launcher_change_error)?;
-        Ok(jsonf! { "removed": p.id })
+        Ok(json!({ "removed": p.id }))
     }
 
     fn launcher_public_json(&self) -> ApiResult {
-        Ok(jsonf! {
+        Ok(json!({
             "enabled": self.inner.launcher.load()?.public_page,
             "path": self.inner.launcher.public_page_path(),
-        })
+        }))
     }
 
     pub(super) fn launcher_public_get(&self, caller: &Caller) -> ApiResult {
@@ -101,7 +103,7 @@ impl AuthService {
             Some(viewer) => self.inner.launcher.get(&p.id, &viewer)?.is_some(),
             None => false,
         };
-        Ok(jsonf! { allowed })
+        Ok(json!({ "allowed": allowed }))
     }
 }
 

@@ -19,6 +19,8 @@
 //! (`write`, `delete`) accept `dry_run` and an optional `reload` flag that
 //! triggers `systemctl reload caddy.service` after the change.
 
+use serde_json::json;
+
 use crate::prelude::*;
 
 use crate::agent::module_support::safe_join;
@@ -119,7 +121,7 @@ actions!(Action [payload user] => {
     List {
         #[serde(default = "default_config_dir")]
         config_dir: PathBuf,
-    } => Ok(jsonf! { payload.config_dir, "sites": list_sites(&payload.config_dir)? }),
+    } => Ok(json!({ "config_dir": payload.config_dir, "sites": list_sites(&payload.config_dir)? })),
     Render {
         #[serde(default = "default_config_dir")]
         config_dir: PathBuf,
@@ -133,14 +135,14 @@ actions!(Action [payload user] => {
         reload: bool,
     } => {
         let site = SiteMetadata::new(&payload.domain, &payload.upstream, payload.tls)?;
-        Ok(jsonf! {
-            payload.config_dir,
+        Ok(json!({
+            "config_dir": payload.config_dir,
             "filename": site_filename(&site.domain)?,
             "contents": site.render()?,
-            site,
-            payload.dry_run,
-            payload.reload,
-        })
+            "site": site,
+            "dry_run": payload.dry_run,
+            "reload": payload.reload,
+        }))
     },
     Write {
         #[serde(default = "default_config_dir")]
@@ -168,11 +170,11 @@ actions!(Action [payload user] => {
         }
         let (reload, reload_error) = optional_reload(payload.reload, "write", payload.dry_run, user);
 
-        Ok(jsonf! {
-            config_dir, filename, path, contents, site,
+        Ok(json!({
+            "config_dir": config_dir, "filename": filename, "path": path, "contents": contents, "site": site,
             "written": !payload.dry_run,
-            payload.dry_run, reload, reload_error,
-        })
+            "dry_run": payload.dry_run, "reload": reload, "reload_error": reload_error,
+        }))
     },
     Delete {
         #[serde(default = "default_config_dir")]
@@ -194,11 +196,11 @@ actions!(Action [payload user] => {
         }
         let (reload, reload_error) = optional_reload(payload.reload, "delete", payload.dry_run, user);
 
-        Ok(jsonf! {
-            config_dir, filename, path,
+        Ok(json!({
+            "config_dir": config_dir, "filename": filename, "path": path,
             "deleted": !payload.dry_run,
-            payload.dry_run, reload, reload_error,
-        })
+            "dry_run": payload.dry_run, "reload": reload, "reload_error": reload_error,
+        }))
     },
     Reload {
         #[serde(default)]
@@ -354,10 +356,10 @@ fn list_sites(config_dir: &Path) -> Result<Vec<Value>> {
             .find_map(|line| line.strip_prefix("# tetra: "))
             .and_then(|raw| serde_json::from_str::<SiteMetadata>(raw).ok());
         if let Some(site) = metadata {
-            sites.push(jsonf! {
+            sites.push(json!({
                 "filename": path.file_name().and_then(|name| name.to_str()).unwrap_or_default(),
-                path, site.domain, site.upstream, site.tls,
-            });
+                "path": path, "domain": site.domain, "upstream": site.upstream, "tls": site.tls,
+            }));
         }
     }
 
@@ -563,7 +565,7 @@ impl DashboardSite {
 pub fn write_dashboard_site(config_dir: &Path, contents: &str) -> Result<Value> {
     let path = safe_join(config_dir, DASHBOARD_SITE_FILE)?;
     let changed = crate::auth::store::replace_if_changed(&path, contents.as_bytes(), SITE_MODE)?;
-    Ok(jsonf! { path, contents, changed })
+    Ok(json!({ "path": path, "contents": contents, "changed": changed }))
 }
 
 /// Mode of the sites Tetra writes itself: Caddy runs as `caddy` and only

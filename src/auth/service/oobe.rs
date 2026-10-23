@@ -1,5 +1,7 @@
 //! Setup and the handoff to the dashboard: `setup.*`.
 
+use serde_json::json;
+
 use crate::{
     auth::{
         api::{ApiError, ApiResult, ErrorCode},
@@ -128,12 +130,12 @@ impl AuthService {
             self.now(),
         )?;
         eprintln!("issued a setup session");
-        Ok(jsonf! {
+        Ok(json!({
             "status": "authenticated",
-            token,
+            "token": token,
             "session": session_json(&session, None),
             "admin_exists": self.admin_exists()?,
-        })
+        }))
     }
 
     /// Write the setup marker, then hand over to the dashboard: start it,
@@ -156,12 +158,12 @@ impl AuthService {
         }
         let this = self.clone();
         let handoff = blocking(move || this.start_handoff(true)).await?;
-        Ok(jsonf! {
+        Ok(json!({
             "complete": true,
             "dashboard_url": self.dashboard_url(),
             "handoff_in_seconds": HANDOFF_SECONDS,
-            handoff,
-        })
+            "handoff": handoff,
+        }))
     }
 
     /// The dashboard's URL from the access configuration, if there is one.
@@ -260,7 +262,7 @@ impl AuthService {
         #[cfg(not(feature = "reverse-proxy"))]
         let site_removed = false;
         ensure!(errors.is_empty(), "{}", errors.join("; "));
-        Ok(jsonf! { "oobe_stopped": true, "setup_site_removed": site_removed })
+        Ok(json!({ "oobe_stopped": true, "setup_site_removed": site_removed }))
     }
 
     /// Run at startup: finish a handoff that setup completed but its timer

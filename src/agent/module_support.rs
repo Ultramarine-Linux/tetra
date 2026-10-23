@@ -49,12 +49,12 @@ impl ModuleInfo {
     pub fn metadata_response(&self, action: &str, payload: &Value) -> Option<Value> {
         match action {
             "capabilities" => Some(json!(self)),
-            "plan" => Some(jsonf! {
+            "plan" => Some(json!({
                 "module": self.name,
-                self.feature,
-                self.status,
+                "feature": self.feature,
+                "status": self.status,
                 "requested": payload,
-            }),
+            })),
             _ => None,
         }
     }
@@ -226,7 +226,7 @@ macro_rules! __cmd_inner {
     (@{JSON}$final:expr) => { $final.and_then(|result| {
         let data: ::serde_json::Value =
             ::serde_json::from_str(&result.stdout).context("failed to parse command stdout as JSON")?;
-        Ok($crate::jsonf! { result.command, result.status, result.stdout, result.stderr, result.dry_run, data })
+        Ok(::serde_json::json!({ "command": result.command, "status": result.status, "stdout": result.stdout, "stderr": result.stderr, "dry_run": result.dry_run, "data": data }))
     }) };
 }
 
