@@ -133,7 +133,9 @@ impl Tree {
                 home: true,
                 owner,
             },
-            _ => Self::trusted(dir).with_owner(owner),
+            // Files are only ever handed to the account inside its home;
+            // anywhere else (an administrator's override) root keeps them.
+            _ => Self::trusted(dir),
         }
     }
 
@@ -145,10 +147,6 @@ impl Tree {
             home: false,
             owner: None,
         }
-    }
-
-    fn with_owner(self, owner: Option<Owner>) -> Self {
-        Self { owner, ..self }
     }
 
     /// Create `dir` and its parents up to the anchor, each handed to the
@@ -981,5 +979,20 @@ mod tests {
             None,
         );
         assert!(!tree.home);
+    }
+
+    #[test]
+    #[cfg(feature = "quadlets")]
+    fn nothing_outside_the_home_is_given_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("apps");
+        let (owner, chowned) = crate::agent::apps_account::tests::recording_owner(&home);
+        let elsewhere = dir.path().join("override");
+        let tree = Tree::new(&elsewhere, Some(&home), Some(owner));
+        assert!(!tree.home);
+        tree.create_dir(&elsewhere).unwrap();
+        tree.write(&elsewhere.join("x.container"), b"[Container]\n", 0o600)
+            .unwrap();
+        assert!(chowned.lock().unwrap().is_empty());
     }
 }

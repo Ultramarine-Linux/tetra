@@ -198,7 +198,7 @@ actions!(Action [payload user] => {
     } => {
         validate_quadlet(&payload.filename, &payload.contents)?;
         let base_dir = quadlet_base_dir(payload.base_dir, payload.scope);
-        let owner = scope_owner(payload.scope, payload.dry_run)?;
+        let owner = scope_owner(payload.scope, payload.dry_run, &[&base_dir])?;
         let path = safe_join(&base_dir, &payload.filename)?;
         if !payload.dry_run {
             scope_tree(&base_dir, payload.scope, owner).write(
@@ -265,7 +265,6 @@ actions!(Action [payload user] => {
         selinux: Option<SelinuxOptions>,
     } => {
         let base_dir = quadlet_base_dir(payload.base_dir, payload.scope);
-        let owner = scope_owner(payload.scope, payload.dry_run)?;
         // The companion bundle is named after the first Quadlet
         // resource's stem (`site.container` -> `site`). Callers are
         // expected to put the primary unit first; with no Quadlets,
@@ -280,6 +279,7 @@ actions!(Action [payload user] => {
             payload.scope,
             bundle_name.as_deref(),
         )?;
+        let owner = scope_owner(payload.scope, payload.dry_run, &[&base_dir, &files_base_dir])?;
         // Create both roots up front so a permission or disk failure
         // surfaces before any file is written, rather than midway
         // through the bundle.
@@ -427,13 +427,20 @@ pub(crate) fn scope_tree(dir: &Path, scope: AppScope, owner: Option<Owner>) -> T
     Tree::new(dir, home.as_deref(), owner)
 }
 
-/// Who files written in `scope` are handed to: the apps account in apps
-/// scope (see [`Owner::for_apps`]), nobody (root keeps them) in system scope.
-pub(crate) fn scope_owner(scope: AppScope, dry_run: bool) -> Result<Option<Owner>> {
-    match scope {
-        AppScope::Apps => Owner::for_apps(dry_run),
-        AppScope::System => Ok(None),
+/// Who files written in `scope` into `dirs` are handed to: the apps account
+/// in apps scope (see [`Owner::for_apps`]) when every directory is inside its
+/// home, nobody (root keeps them) otherwise. An administrator's
+/// `base_dir`/`files_base_dir` override elsewhere neither gives files away
+/// nor needs the account to exist.
+pub(crate) fn scope_owner(scope: AppScope, dry_run: bool, dirs: &[&Path]) -> Result<Option<Owner>> {
+    if scope != AppScope::Apps {
+        return Ok(None);
     }
+    let home = AppsAccount::resolve().home;
+    if !dirs.iter().all(|dir| dir.starts_with(&home)) {
+        return Ok(None);
+    }
+    Owner::for_apps(dry_run)
 }
 
 /// The account files written in `scope` belong to, for responses.
@@ -608,9 +615,24 @@ mod tests {
         );
         assert_eq!(owner_name(AppScope::Apps), "ultramarine-apps");
         assert_eq!(owner_name(AppScope::System), "root");
-        // Nothing is given away on a dry run, or in system scope.
-        assert!(scope_owner(AppScope::Apps, true).unwrap().is_none());
-        assert!(scope_owner(AppScope::System, false).unwrap().is_none());
+        // Nothing is given away on a dry run, in system scope, or outside
+        // the account's home (an override); none of these needs the account.
+        let apps_home = home.join(".config/containers/systemd");
+        assert!(
+            scope_owner(AppScope::Apps, true, &[&apps_home])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            scope_owner(AppScope::System, false, &[&apps_home])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            scope_owner(AppScope::Apps, false, &[Path::new("/srv/q")])
+                .unwrap()
+                .is_none()
+        );
         serde_json::from_value::<List>(serde_json::json!({ "scope": "user" })).unwrap_err();
     }
 
@@ -653,7 +675,11 @@ mod tests {
         assert_eq!(mode(&files.join("nginx/default.conf")), 0o644);
 
         // A dry run gives nothing away.
-        assert!(scope_owner(AppScope::Apps, true).unwrap().is_none());
+        assert!(
+            scope_owner(AppScope::Apps, true, &[&base])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

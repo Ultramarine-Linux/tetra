@@ -406,7 +406,7 @@ impl AppDirs {
     /// The same roots, for writes: files go to the scope's owner (see
     /// [`Owner::for_apps`](crate::agent::apps_account::Owner::for_apps)).
     fn owned(self, scope: AppScope, dry_run: bool) -> Result<Self> {
-        let owner = scope_owner(scope, dry_run)?;
+        let owner = scope_owner(scope, dry_run, &[&self.base_dir, &self.files_root])?;
         Ok(Self {
             units: scope_tree(&self.base_dir, scope, owner.clone()),
             files: scope_tree(&self.files_root, scope, owner),

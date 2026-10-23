@@ -216,8 +216,16 @@ impl AuthService {
         )?;
         let changes = if let Some(dns) = &files.dns {
             secrets.put(self.inner.sealer.as_ref(), DNS_CREDENTIALS, &dns.sealed)?;
-            let env = store::replace_if_changed(&paths.caddy_env_file, dns.env.as_bytes(), 0o640)?;
-            share_with_caddy(&paths.caddy_env_file)?;
+            // Written with its final mode, so an unchanged file is not seen
+            // as drifted (and Caddy restarted) on every `access.set`.
+            let caddy = caddy_group()?;
+            let mode = if caddy.is_some() || !nix::unistd::geteuid().is_root() {
+                0o640
+            } else {
+                0o600
+            };
+            let env = store::replace_if_changed(&paths.caddy_env_file, dns.env.as_bytes(), mode)?;
+            share_with_caddy(&paths.caddy_env_file, caddy)?;
             CaddyChanges {
                 env,
                 drop_in: store::replace_if_changed(&drop_in, dns.drop_in.as_bytes(), 0o644)?,
@@ -392,23 +400,23 @@ fn replace_keeping_owner(
     Ok(changed)
 }
 
-/// Make a root-owned file readable by the `caddy` group (`root:caddy`), when
-/// running as root and the group exists. systemd reads `EnvironmentFile=` as
-/// root either way.
+/// The `caddy` group, when running as root and it exists.
 #[cfg(feature = "reverse-proxy")]
-fn share_with_caddy(path: &Path) -> Result<()> {
+fn caddy_group() -> Result<Option<nix::unistd::Gid>> {
     if !nix::unistd::geteuid().is_root() {
+        return Ok(None);
+    }
+    Ok(nix::unistd::Group::from_name("caddy")?.map(|group| group.gid))
+}
+
+/// Make a root-owned file readable by the `caddy` group (`root:caddy`). The
+/// caller writes it `0640` when the group exists and `0600` (root-only)
+/// otherwise; systemd reads `EnvironmentFile=` as root either way.
+#[cfg(feature = "reverse-proxy")]
+fn share_with_caddy(path: &Path, caddy: Option<nix::unistd::Gid>) -> Result<()> {
+    let Some(gid) = caddy else {
         return Ok(());
-    }
-    match nix::unistd::Group::from_name("caddy")? {
-        Some(group) => {
-            nix::unistd::chown(path, Some(nix::unistd::Uid::from_raw(0)), Some(group.gid))
-                .with_context(|| format!("failed to chown `{}`", path.display()))
-        }
-        None => {
-            // Without the group, keep it root-only.
-            fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-                .with_context(|| format!("failed to chmod `{}`", path.display()))
-        }
-    }
+    };
+    nix::unistd::chown(path, Some(nix::unistd::Uid::from_raw(0)), Some(gid))
+        .with_context(|| format!("failed to chown `{}`", path.display()))
 }
