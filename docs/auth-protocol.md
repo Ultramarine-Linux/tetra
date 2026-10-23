@@ -726,7 +726,11 @@ is recorded with `origin: "remote"`.
   generates the code once (`XXXX-XXXX`, sealed in
   `/var/lib/tetra/auth/setup-code.json`) and writes it to
   `/run/tetra/setup-code` (root-only, for the console screen) and
-  `/run/issue.d/50-tetra-setup.issue` (getty login banner, mode `0600`, read by agetty as root). It is never shown
+  `/run/issue.d/50-tetra-setup.issue` (getty login banner, mode `0600`, read by agetty as root). The banner lists
+  `https://\4:6623` and `https://[\6]:6623`, using agetty’s IPv4/IPv6
+  issue escapes; use the address family available on your network. These
+  escapes select a configured interface and fall back to hostname resolution
+  ([agetty(8)](https://man7.org/linux/man-pages/man8/agetty.8.html)). It is never shown
   over SSH.
 - The code stays the same across reboots until setup completes or the
   wrong-code limit replaces it. Tetra republishes a replaced code itself.

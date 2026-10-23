@@ -23,6 +23,8 @@ async fn the_oobe_redeems_the_published_code_for_a_limited_session() {
     let banner =
         std::fs::read_to_string(host.config.issue_dir.join("50-tetra-setup.issue")).unwrap();
     assert!(banner.contains(&code));
+    assert!(banner.contains(r"https://\4:6623"));
+    assert!(banner.contains(r"https://[\6]:6623"));
     let mode = std::os::unix::fs::PermissionsExt::mode(
         &std::fs::metadata(host.config.issue_dir.join("50-tetra-setup.issue"))
             .unwrap()

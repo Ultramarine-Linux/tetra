@@ -220,7 +220,10 @@ impl Setup {
             .with_context(|| format!("failed to create `{}`", self.paths.issue_dir.display()))?;
         let banner = format!(
             "Ultramarine Server setup code: {code}\n\
-             Open this server's address (\\4) in a web browser and enter the code to finish setup.\n\n"
+             Open one of these addresses in a web browser to finish setup:\n\
+             IPv4: https://\\4:6623\n\
+             IPv6: https://[\\6]:6623\n\
+             Use the address available on your network and enter the code above.\n\n"
         );
         let issue = self.paths.issue_dir.join(ISSUE_FILE);
         // Root-only like the code file: agetty reads it as root, and any
@@ -479,6 +482,8 @@ mod tests {
         );
         let banner = fs::read_to_string(f.paths.issue_dir.join(ISSUE_FILE)).unwrap();
         assert!(banner.contains(&code));
+        assert!(banner.contains(r"https://\4:6623"));
+        assert!(banner.contains(r"https://[\6]:6623"));
         let run = f.paths.run_dir.join(RUN_CODE_FILE);
         assert_eq!(fs::read_to_string(&run).unwrap().trim(), code);
         assert_eq!(
