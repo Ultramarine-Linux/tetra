@@ -292,7 +292,6 @@ impl ShellServer {
             process.terminate().await;
             End::because(ExitReason::ClientClosed)
         };
-        drop(slot);
         let status = end
             .status
             .map(|status| format!("; status {status}"))
@@ -304,6 +303,9 @@ impl ShellServer {
         })
         .await
         .ok();
+        // Only now does the shell stop counting: once a caller sees it gone,
+        // its close is in the action log.
+        drop(slot);
         Ok(())
     }
 
