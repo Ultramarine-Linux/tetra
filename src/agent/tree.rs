@@ -84,6 +84,10 @@ const HOME_MODE: u32 = 0o700;
 /// Mode of directories Tetra creates below an anchor.
 const DIR_MODE: u32 = 0o755;
 
+/// Largest file [`Tree::read`] reads: manifests, companions and templates
+/// are small, and the WebSocket frame cap is the same 16 MiB.
+pub const MAX_READ: u64 = 16 << 20;
+
 /// A directory tree Tetra reads and writes as root: every operation takes an
 /// absolute path below the tree's anchor and resolves it from the anchor's
 /// descriptor (see the [module docs](self)).
@@ -173,11 +177,11 @@ impl Tree {
             .with_context(|| format!("failed to write `{}`", path.display()))
     }
 
-    /// The contents of the regular file `path`.
+    /// The contents of the regular file `path`, at most [`MAX_READ`] bytes.
     ///
     /// # Errors
-    /// Fails when the path is refused or missing, or is not a regular file
-    /// with one link.
+    /// Fails when the path is refused or missing, is not a regular file with
+    /// one link, or is larger than [`MAX_READ`].
     pub fn read(&self, path: &Path) -> Result<Vec<u8>> {
         let relative = self.relative(path)?;
         let missing = || {
@@ -208,10 +212,19 @@ impl Tree {
             "`{}` has other hard links; refusing to read it",
             path.display()
         );
+        // The apps home belongs to the account that runs third-party
+        // containers: a planted multi-gigabyte file must not exhaust memory.
+        // Take one byte past the cap to tell "at the cap" from "over it".
         let mut contents = Vec::new();
         File::from(fd)
+            .take(MAX_READ.saturating_add(1))
             .read_to_end(&mut contents)
             .with_context(|| format!("failed to read `{}`", path.display()))?;
+        ensure!(
+            u64::try_from(contents.len()).is_ok_and(|len| len <= MAX_READ),
+            "`{}` is larger than {MAX_READ} bytes",
+            path.display()
+        );
         Ok(contents)
     }
 
@@ -642,6 +655,22 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn reads_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_READ.saturating_add(1)).unwrap();
+        let tree = Tree::trusted(dir.path());
+        let error = tree.read(&path).unwrap_err();
+        assert!(error.to_string().contains("larger than"), "{error:#}");
+        fs::File::create(&path).unwrap().set_len(MAX_READ).unwrap();
+        assert_eq!(
+            tree.read(&path).unwrap().len(),
+            usize::try_from(MAX_READ).unwrap()
+        );
+    }
     use crate::agent::apps_account::AppsAccount;
 
     /// What the fake chown was handed: the path, relative to the home, and
