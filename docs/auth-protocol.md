@@ -540,7 +540,7 @@ action that passes authorization is recorded in the action log.
 | `launcher` (default) | `launcher.list/get` | — | `launcher.set/remove/public_get/public_set` |
 | `system_services` | `services.list/status/logs` (systemd units and their journal; not a default, grant it explicitly) | — | start, stop, restart, enable, disable, daemon_reload |
 | `apps` | `apps.list/get` (`get` shows secret values as `********`), `quadlets.list/validate/list_files`, `recipes.context_inline` | — | apps create/update/remove, quadlets read (unit files hold app secrets)/write/delete/install, `recipes.render/context` (read paths as root), `recipes.render_inline` (templates can loop for a very long time) |
-| `containers` | `podman.containers/inspect/images/volumes/networks/logs` | — | podman start/stop/restart/remove |
+| `containers` | `podman.containers/inspect/images/volumes/networks/logs` (as `ultramarine-apps` by default; `inspect` hides environment values) | — | podman start/stop/restart/remove, `inspect` with `show_env` |
 | `storage` | `storage.list/status/zfs` | — | `storage.mount/unmount/configure` |
 | `sharing` | `samba.list_shares/get_config`, `nfs.list_exports/get_config` (default config path only) | `samba/nfs.reload` | samba/nfs `set_config` (the files can run commands as root), enable, disable |
 | `network` | `network.interfaces/status/dns/routes`, `reverse_proxy.list/render` | `reverse_proxy.write/delete/reload` | `network.get_config/set_config/reload/configure/confirm/pending/scan_wifi/connect_wifi`, `remote_access.*` |
@@ -554,9 +554,12 @@ administrator-only (`ADMIN_ONLY_FIELDS`): `config_dir` on `reverse_proxy`
 actions, `base_dir`/`files_base_dir` on `quadlets` and `apps` actions, `home`
 on `users` actions, and `path` on `samba` and `nfs` actions, which may only
 be left out or set to the default (`/etc/samba/smb.conf`, `/etc/exports`).
-So is `run_as` on any module's action, unless it is `"user"`: running a
-read as root shows the host's view (rootful containers and their
-environment, every VM). Otherwise the request is `forbidden`. The setup session and granted users
+So is `run_as` on any module's action, unless it is `"user"` or `"apps"`
+(the signed-in user's own view, or that of the `ultramarine-apps` account
+user apps run under): running a read as root shows the host's view (rootful
+containers and their environment, every VM). So is `show_env: true` on
+`podman.inspect`, which would show the apps' secrets. Otherwise the request
+is `forbidden`. The setup session and granted users
 always get the default directories; remote controllers may set them. Stored grants that are
 no longer grantable (such as `files: view` from an earlier release) are
 ignored. Grants stored under the page's earlier name, `services`, are read as
@@ -565,9 +568,12 @@ ignored. Grants stored under the page's earlier name, `services`, are read as
 Managing users, reading or writing files (the files module runs as root on
 any path), settings or storage (mounting is root-equivalent), and
 anything that manages rootful systemd units, containers or VMs, is never
-grantable. Apps are currently installed as
-system-scope units, so app management is administrator-only until apps run
-rootless under `ultramarine-apps`.
+grantable. App management (`apps.create/update/remove`,
+`quadlets.write/delete/install`) stays administrator-only even though apps
+now run rootless under `ultramarine-apps` by default: its payloads can read
+recipes from host paths and relabel paths as root (`selinux`), system scope
+is still rootful, and every app shares the one account, so one app's units
+could read another's secrets.
 
 Remote controllers (the outbound mTLS connection) are authorized as a
 `RemoteController` principal that may run everything. Each of their actions

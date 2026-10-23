@@ -270,6 +270,48 @@ does not change existing groups, and falls back to a dynamic GID if 241 is
 taken); `agent-serve` logs a warning in that case, and the group has to be
 fixed with `groupmod -g 241 tetra`.
 
+### The apps account
+
+User apps run rootless under one system account, `ultramarine-apps`, which
+`systemd/tetra.sysusers.conf` also creates, with the fixed UID and GID
+**242** (same range and reasoning as the `tetra` group) and the home
+`/var/lib/ultramarine-apps`. It cannot log in: no password, `nologin` shell,
+and Tetra refuses it as a dashboard user. Packaging:
+
+- Install `systemd/tetra.sysusers.conf` as
+  `/usr/lib/sysusers.d/tetra.conf` and `systemd/tetra.tmpfiles.conf` as
+  `/usr/lib/tmpfiles.d/tetra.conf` (`%sysusers_create_compat` and
+  `%tmpfiles_create` in the spec; bootc images apply both at boot).
+  `systemd-sysusers` only records the home, so the tmpfiles snippet creates
+  it (`0700`, owned by the account).
+- **Linger.** The tmpfiles snippet also creates
+  `/var/lib/systemd/linger/ultramarine-apps`, which is what
+  `loginctl enable-linger` records: logind starts the account's user manager
+  at boot, so app services run without a login. Tetra runs
+  `loginctl enable-linger` itself if the flag is missing.
+- **Subordinate IDs.** Rootless Podman needs `/etc/subuid` and `/etc/subgid`
+  ranges, which `systemd-sysusers` does not allocate (and `useradd -r` only
+  does with `-F`). Tetra adds them on the first `apps.create`/`update` that
+  converges: the first free 65536 IDs from 524288 (Fedora's
+  `SUB_UID_MIN`/`SUB_UID_COUNT`), with `usermod --add-subuids FIRST-LAST
+  --add-subgids FIRST-LAST ultramarine-apps`, skipped when the account (by
+  name or UID) already has a range. Doing it at runtime rather than in a
+  scriptlet keeps it right on bootc, where `/etc` is per machine and the
+  account only exists after the first boot.
+- **SELinux.** A home under `/var/lib` gets none of the `HOME_DIR` rules that
+  label rootless storage in `/home`, so Tetra adds `semanage fcontext -a -e
+  /var/lib/containers/storage
+  /var/lib/ultramarine-apps/.local/share/containers/storage` (and
+  `restorecon -R`) unless `file_contexts.subs` already has it. Images may
+  apply the same rule at build time instead.
+- `agent-serve` logs a warning when the account is missing or its UID/GID is
+  not 242 (`usermod -u 242 -g 242` fixes it; files in the home must then be
+  re-owned).
+
+Apps installed by earlier releases are system-scope (rootful) and keep
+working with `"scope": "system"`; Tetra does not migrate them. See the
+`apps` section of [docs/agent-protocol.md](docs/agent-protocol.md).
+
 ## Host enrollment
 
 Remote control is outbound only: the host dials the controller over WSS and

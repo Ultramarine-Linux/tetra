@@ -212,8 +212,11 @@ Use mTLS for transport identity:
 On the host, an mTLS session is authorized as the remote controller, which may
 run every module action, including payload fields that are administrator-only
 on the local socket. Tetra records each remote action in its action log with
-`origin: "remote"` and the host id. Remote commands always run as root: the
-`user` field of a command from the control plane is ignored.
+`origin: "remote"` and the host id. The `user` field of a command from the
+control plane is ignored, so remote commands run as root, except reads of a
+module whose default is the apps account (`podman`, see
+[Run As](#run-as)), which run as `ultramarine-apps` unless the payload says
+`"run_as": "root"`.
 
 Use command authorization separately from transport authentication:
 
@@ -343,19 +346,30 @@ module's `actions` lists them.
 
 Unprivileged actions (reads such as `podman.containers`,
 `virtual_machines.list` or `selinux.booleans`) run their host commands as the
-signed-in user, so a user sees their own rootless containers and session
-VMs. Privileged actions always run as root. An unprivileged action's payload
-may add `"run_as"`:
+signed-in user, so a user sees their own session VMs, except in `podman`,
+whose reads run as `ultramarine-apps`, the account every user app runs under
+(see [apps](#apps)), so the Containers page shows the apps' containers.
+Privileged actions always run as root. An unprivileged action's payload may
+add `"run_as"`:
 
-- `"user"` (default): as the signed-in user.
-- `"root"`: as root, showing the host's view.
-- `"both"`: runs the action twice and returns
+- `"user"`: as the signed-in user (the default, except in `podman`).
+- `"apps"`: as `ultramarine-apps` (the default in `podman`).
+- `"root"`: as root, showing the host's view (rootful containers, every VM).
+- `"both"`: runs the action as the signed-in user and as root, and returns
   `{"user": {"ok": true, "result": ...}, "root": {"ok": false, "error": "..."}}`.
   Refused for privileged actions and when there is no signed-in user.
 
-`run_as` is removed from the payload before the module sees it. Anything but
-`"user"` is administrator-only. Commands from the remote controller, the
-setup session and the `agent-dispatch` CLI have no user and run as root.
+Tetra switches users with `runuser -u <user> --`, setting `XDG_RUNTIME_DIR`
+to `/run/user/<uid>` when that user's manager runs (so rootless Podman and
+`systemctl --user` find it; the apps account's lingers). Which `run_as` a
+module uses without one is its `Mod::default_run_as`; the dispatcher applies
+it, so modules never pick users themselves.
+
+`run_as` is removed from the payload before the module sees it. `"root"` and
+`"both"` are administrator-only; `"user"` and `"apps"` are open to anyone
+who may run the action. Commands from the remote controller, the setup
+session and the `agent-dispatch` CLI have no user and run as root (as
+`ultramarine-apps` in `podman`).
 
 ### Dry Run
 
@@ -457,7 +471,9 @@ The enabled module set depends on build features. Default features are
 
 Actions listed as privileged (`privileged_actions` in `capabilities`) always
 run as root. The others run as the session's user (through `runuser`) on the
-local socket, and as root for remote controllers and the setup session.
+local socket, and as root for remote controllers and the setup session,
+unless `run_as` or the module's default says otherwise (see
+[Run As](#run-as)).
 
 Payload values that become positional arguments of a host command (service,
 container, VM and account names, paths given to `df`, `umount`, `mount`,
@@ -466,8 +482,8 @@ so they can never be read as an option. Unknown payload fields are ignored
 unless a section says otherwise.
 
 Request payloads are plain JSON objects. Payload types shared across modules —
-such as `SelinuxOptions`, `ServiceScope`, and the `apps` module's `App*`
-requests — are defined in `src/types.rs` and deserialized with `serde`.
+such as `SelinuxOptions`, `ServiceScope`, `AppScope`, and the `apps` module's
+`App*` requests — are defined in `src/types.rs` and deserialized with `serde`.
 
 ### settings
 
@@ -685,27 +701,41 @@ Actions:
 
 Shared payload fields:
 
-- `scope`: `"user"` or `"system"`. Defaults to `"system"`, matching `apps`.
-  User scope resolves against the signed-in user's home directory (from
-  the account database); with no user (the `agent-dispatch` CLI, the remote
-  controller) it uses `$HOME`, which `tetra.service` does not have, so pass
-  `base_dir`/`files_base_dir` there.
+- `scope`: `"apps"` (the default) or `"system"`, as in `apps`. Apps scope is
+  the rootless Quadlets of the `ultramarine-apps` account, whoever is signed
+  in; system scope is rootful, for real system services. The `"user"` scope
+  of earlier releases (the signed-in user's home) is gone and refused: user
+  apps belong to the shared apps account, not to whoever installed them.
 - `base_dir`: Optional override. Useful for tests and custom deployments.
 - `files_base_dir`: Optional override for companion files.
 
 Default Quadlet unit directories:
 
-- User scope: `$HOME/.config/containers/systemd`
+- Apps scope: `~ultramarine-apps/.config/containers/systemd`
+  (`/var/lib/ultramarine-apps/...`; the home comes from the account database)
 - System scope: `/etc/containers/systemd`
 
 Default companion file directories:
 
-- User scope: `$XDG_DATA_HOME/tetra/quadlets` or `$HOME/.local/share/tetra/quadlets`
+- Apps scope: `~ultramarine-apps/.local/share/tetra/quadlets`
 - System scope: `/var/lib/tetra/quadlets`
 
 During `install`, companion files are written under a per-Quadlet bundle directory
 derived from the first Quadlet resource name. For example, `app.container` companion
-files default to `/var/lib/tetra/quadlets/app` in system scope.
+files default to `~ultramarine-apps/.local/share/tetra/quadlets/app` in apps
+scope and `/var/lib/tetra/quadlets/app` in system scope.
+
+In apps scope, every file and directory Tetra writes below the account's home
+is handed to `ultramarine-apps` (`lchown` after the atomic write; modes stay
+`0600` for units and `0644` for companions, directories are `0755` and the
+home `0700`), and the `write` and `install` responses say so with
+`"owner": "ultramarine-apps"` (`"root"` in system scope). The home and every
+directory below it are refused if one is a symlink, since the account (and
+so an app container's root) owns that tree. Without root (tests, development)
+files keep their owner. `quadlets` only writes files: run
+`services.daemon_reload` with `"scope": "apps"` afterwards, and use
+`apps.create` (which also prepares the account, see [apps](#apps)) to install
+apps.
 
 Supported Quadlet filename extensions:
 
@@ -718,7 +748,7 @@ Supported Quadlet filename extensions:
 `list` payload:
 
 ```json
-{ "scope": "user" }
+{ "scope": "apps" }
 ```
 
 `write` payload:
@@ -779,7 +809,7 @@ is refused by `read`, `write`, `delete` and `install`.
 `list_files` payload:
 
 ```json
-{ "scope": "user" }
+{ "scope": "apps" }
 ```
 
 `list_files` returns all regular files under the selected base directory, including
@@ -787,17 +817,17 @@ companion files:
 
 ```json
 {
-  "base_dir": "/home/example/.config/containers/systemd",
-  "files_base_dir": "/home/example/.local/share/tetra/quadlets",
+  "base_dir": "/var/lib/ultramarine-apps/.config/containers/systemd",
+  "files_base_dir": "/var/lib/ultramarine-apps/.local/share/tetra/quadlets",
   "files": [
     {
       "filename": "app.container",
-      "path": "/home/example/.config/containers/systemd/app.container",
+      "path": "/var/lib/ultramarine-apps/.config/containers/systemd/app.container",
       "quadlet": true
     },
     {
       "filename": "app/index.html",
-      "path": "/home/example/.local/share/tetra/quadlets/app/index.html",
+      "path": "/var/lib/ultramarine-apps/.local/share/tetra/quadlets/app/index.html",
       "quadlet": false
     }
   ]
@@ -811,7 +841,7 @@ To read a companion file from the companion-file directory, include
 
 ```json
 {
-  "scope": "user",
+  "scope": "apps",
   "filename": "app.container",
   "dry_run": true
 }
@@ -825,7 +855,27 @@ Cooks recipes into installed Quadlet-backed apps and manages their lifecycle.
 An app is a named bundle: rendered Quadlet units land in the Quadlet scan
 directory, while companion files and a manifest (`app.json`) live under a
 per-app directory inside the companion-file data root (the same roots used by
-the `quadlets` module). The manifest records the recipe source, parameter
+the `quadlets` module).
+
+Every action takes `scope`, an `AppScope`:
+
+- `"apps"` (the default): a rootless app of the `ultramarine-apps` system
+  account (UID/GID 242, home `/var/lib/ultramarine-apps`). Units go to its
+  `~/.config/containers/systemd`, the bundle to its
+  `~/.local/share/tetra/quadlets/<name>`, all owned by the account (see
+  [quadlets](#quadlets)), and the services run in its lingering user manager
+  (`systemctl --user -M ultramarine-apps@`).
+- `"system"`: a rootful app, for real system services:
+  `/etc/containers/systemd`, `/var/lib/tetra/quadlets/<name>` (root's) and
+  the system manager.
+
+The manifest records the scope, and `get`, `update` and `remove` refuse an
+app whose manifest names another scope, so an app stays where it was
+installed: apps that earlier releases installed in system scope keep working
+with `"scope": "system"` (they are not listed in apps scope). Tetra does not
+move them; reinstalling one in apps scope (and moving its data) is up to the
+administrator. A `"user"` scope (earlier releases' per-user home) is refused,
+and a manifest that says `user` is listed as `invalid`. The manifest records the recipe source, parameter
 values, installed unit filenames, and companion files so `update` can
 re-render and `remove` can clean up without the caller resending the recipe.
 
@@ -852,7 +902,7 @@ with `.` or `-`.
 ```json
 {
   "name": "my-site",
-  "scope": "user",
+  "scope": "apps",
   "recipe": "id: nginx-site\n...",
   "templates": {
     "app.container": "[Container]\nImage=docker.io/nginx:alpine\n"
@@ -885,7 +935,8 @@ defaults and per-instance overrides can ship in one call.
 
 If the recipe declares a `bundle_dir` parameter and the caller does not
 supply a value for it, `create` and `update` inject the app's bundle
-directory path (e.g. `/var/lib/tetra/quadlets/my-site`) so templates can
+directory path (e.g. `/var/lib/ultramarine-apps/.local/share/tetra/quadlets/my-site`)
+so templates can
 bind-mount companion files with `Volume={{ bundle_dir }}/...` without the
 caller knowing the agent's layout. An explicitly supplied `bundle_dir`
 always wins, and recipes that do not declare the parameter are unaffected
@@ -893,8 +944,8 @@ always wins, and recipes that do not declare the parameter are unaffected
 
 `create` renders the recipe, writes the Quadlet units and companion files,
 writes `<bundle>/app.json`, optionally applies SELinux contexts to the bundle,
-and — unless `converge` is `false` — runs `systemctl daemon-reload`, then
-starts the derived services. Quadlet services are generated units, which
+and — unless `converge` is `false` — prepares the apps account (apps scope),
+runs `systemctl daemon-reload`, then starts the derived services. Quadlet services are generated units, which
 `systemctl enable` refuses; a unit's `[Install]` section (for example
 `WantedBy=default.target`) is what starts it at boot. Service names are derived from unit
 filenames: `.container` and `.kube` units map to `<stem>.service`, `.pod`
@@ -902,11 +953,37 @@ units to `<stem>-pod.service`; network and volume units have no service.
 `converge` defaults to `true`; `create` and `update` never run `systemctl
 enable` or `disable`.
 
+Preparing the apps account (`account` in the response; empty in system
+scope or with `converge: false`) makes sure the host can run rootless apps,
+skipping what is already there:
+
+1. Subordinate UIDs and GIDs, which `systemd-sysusers` does not allocate:
+   when `/etc/subuid` or `/etc/subgid` has no range for `ultramarine-apps`
+   (by name or UID), `usermod --add-subuids FIRST-LAST --add-subgids
+   FIRST-LAST ultramarine-apps` with the first free range of 65536 IDs from
+   524288 up, as `useradd` picks them (Fedora's `SUB_UID_MIN`/`COUNT`).
+2. Lingering: `loginctl enable-linger ultramarine-apps` unless
+   `/var/lib/systemd/linger/ultramarine-apps` exists (the packaged
+   `tetra.tmpfiles.conf` creates it), then `systemctl start user@242.service`,
+   so the account's manager is running before Tetra talks to it.
+3. On SELinux hosts, unless the policy's `file_contexts.subs` already has it:
+   `semanage fcontext -a -e /var/lib/containers/storage
+   /var/lib/ultramarine-apps/.local/share/containers/storage` and `restorecon
+   -R` on it, so rootless storage gets the labels of rootful storage (a home
+   under `/var/lib` gets none of the `HOME_DIR` rules that label rootless
+   storage in `/home`).
+
+The account must exist (`systemd-sysusers`); converging in apps scope fails
+otherwise. Rootless containers cannot publish ports below 1024 unless the
+host lowers `net.ipv4.ip_unprivileged_port_start`; put a reverse proxy in
+front instead. Units must use `WantedBy=default.target` (as the shipped
+recipes do): the user manager has no `multi-user.target`.
+
 A parameter with a `generate` strategy (such as `random_32`) and neither a
 value nor a default is generated once and stored in the manifest with the
 other values, so later `update`s keep it instead of generating a new secret.
-`app.json` is written atomically, root-only (`0600`), because it holds those
-values. The `create` and `update` responses return the manifest as stored,
+`app.json` is written atomically and private (`0600`, the apps account's in
+apps scope, root's in system scope), because it holds those values. The `create` and `update` responses return the manifest as stored,
 secrets included; only `get` redacts them.
 
 Response:
@@ -916,7 +993,7 @@ Response:
   "app": {
     "version": 1,
     "name": "my-site",
-    "scope": "user",
+    "scope": "apps",
     "recipe_id": "nginx-site",
     "recipe_version": "0.1.0",
     "recipe": { "source": "inline", "recipe": "...", "templates": {} },
@@ -926,12 +1003,14 @@ Response:
     "created_at": 1750000000,
     "updated_at": 1750000000
   },
-  "base_dir": "/home/example/.config/containers/systemd",
-  "bundle_dir": "/home/example/.local/share/tetra/quadlets/my-site",
-  "manifest_path": "/home/example/.local/share/tetra/quadlets/my-site/app.json",
+  "base_dir": "/var/lib/ultramarine-apps/.config/containers/systemd",
+  "bundle_dir": "/var/lib/ultramarine-apps/.local/share/tetra/quadlets/my-site",
+  "owner": "ultramarine-apps",
+  "manifest_path": "/var/lib/ultramarine-apps/.local/share/tetra/quadlets/my-site/app.json",
   "units": ["my-site.container"],
   "files": ["index.html"],
   "services": ["my-site.service"],
+  "account": [],
   "systemd": [],
   "selinux": [],
   "written": true,
@@ -942,7 +1021,7 @@ Response:
 `list` payload:
 
 ```json
-{ "scope": "user" }
+{ "scope": "apps" }
 ```
 
 Returns one summary per app plus an `invalid` array naming bundle directories
@@ -951,18 +1030,18 @@ directories):
 
 ```json
 {
-  "files_base_dir": "/home/example/.local/share/tetra/quadlets",
+  "files_base_dir": "/var/lib/ultramarine-apps/.local/share/tetra/quadlets",
   "apps": [
     {
       "name": "my-site",
       "recipe_id": "nginx-site",
       "recipe_version": "0.1.0",
-      "scope": "user",
+      "scope": "apps",
       "units": ["my-site.container"],
       "services": ["my-site.service"],
       "created_at": 1750000000,
       "updated_at": 1750000000,
-      "bundle_dir": "/home/example/.local/share/tetra/quadlets/my-site"
+      "bundle_dir": "/var/lib/ultramarine-apps/.local/share/tetra/quadlets/my-site"
     }
   ],
   "invalid": []
@@ -972,7 +1051,7 @@ directories):
 `get` payload:
 
 ```json
-{ "name": "my-site", "scope": "user" }
+{ "name": "my-site", "scope": "apps" }
 ```
 
 Returns the manifest plus the unit listing (each unit with its absolute path
@@ -1008,7 +1087,7 @@ from `get` can be sent back unchanged.
 ```json
 {
   "name": "my-site",
-  "scope": "user",
+  "scope": "apps",
   "converge": true,
   "dry_run": true
 }
@@ -1020,7 +1099,10 @@ Stops the derived services (failures are reported inline in the
 for the app's `.volume` units are intentionally preserved.
 
 `create`, `update`, and `remove` all honor `dry_run`, which previews the file
-writes and the exact `systemctl` commands without changing the host. Setting
+writes and the exact `usermod`, `loginctl`, `semanage` and `systemctl`
+commands without changing the host. In apps scope these are
+`systemctl --user -M ultramarine-apps@ daemon-reload` and
+`systemctl --user -M ultramarine-apps@ start|restart|stop <service>`. Setting
 `converge: false` skips systemd interaction entirely, which is useful for
 staging files on hosts without systemd.
 
@@ -1042,13 +1124,22 @@ Actions:
 - `enable` (privileged)
 - `disable` (privileged)
 
-Every action takes an optional `scope`, `system` (the default) or `user`
-(`systemctl --user`, `journalctl --user`).
+Every action takes an optional `scope`:
+
+- `system` (the default): the system manager.
+- `user`: the user manager of whoever the command runs as (`systemctl
+  --user`, `journalctl --user`).
+- `apps`: the user manager of `ultramarine-apps`, where apps-scope apps run.
+  As root (privileged actions, `run_as: root`) that is `systemctl --user -M
+  ultramarine-apps@`, and `logs` reads `journalctl _UID=<uid>
+  _SYSTEMD_USER_UNIT=<service>`; reads with `"run_as": "apps"` use plain
+  `--user` as the account itself. A signed-in user's own `runuser` cannot
+  reach the account's manager, so reads in this scope need `run_as`.
 
 `list` payload:
 
 ```json
-{ "scope": "user" }
+{ "scope": "apps", "run_as": "apps" }
 ```
 
 Response payload includes raw command output and parsed `services`:
@@ -1775,14 +1866,26 @@ Actions:
 - `restart` (privileged)
 - `remove` (privileged)
 
+Reads run as `ultramarine-apps` by default, so they show the containers,
+images, volumes and networks of user apps; send `"run_as": "root"`
+(administrators) for rootful ones, or `"run_as": "user"` for the signed-in
+user's own (see [Run As](#run-as)). Mutations always run as root, so they
+act on rootful containers; manage apps through `apps` and `services` with
+`"scope": "apps"` instead.
+
 List actions return raw command output plus parsed JSON in `data`.
 
-`inspect` returns `podman inspect NAME` output in `data`.
+`inspect` returns `podman inspect NAME` output in `data`. Environment values
+are replaced by `********` (`Config.Env` and the `--env`/`-e` arguments in
+`Config.CreateCommand`, in `data` and `stdout`), since apps keep secrets
+there (`Environment=DB_PASSWORD=...`) and the Containers page may be granted
+to non-administrators. `"show_env": true` returns them unredacted and is
+administrator-only.
 
 `inspect` payload:
 
 ```json
-{ "name": "app" }
+{ "name": "app", "show_env": false }
 ```
 
 `logs` payload:
@@ -2170,7 +2273,7 @@ disables it and removes the drop-in and the sealed token; as with
   "module": "quadlets",
   "action": "install",
   "payload": {
-    "scope": "user",
+    "scope": "apps",
     "dry_run": true,
     "resources": [
       {
@@ -2189,6 +2292,7 @@ disables it and removes the drop-in and the sealed token; as with
   "action": "restart",
   "payload": {
     "service": "nextcloud-app.service",
+    "scope": "apps",
     "dry_run": true
   }
 }

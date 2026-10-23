@@ -41,7 +41,8 @@ tetra/
 │   │   └── store.rs      # Root-only enrollment record under /var/lib/tetra/remote
 │   └── agent/
 │       ├── mod.rs              # Re-exports and module-level docs
-│       ├── dispatcher.rs       # Command routing registry
+│       ├── apps_account.rs     # The ultramarine-apps account user apps run under
+│       ├── dispatcher.rs       # Command routing registry, RunAs
 │       ├── queue.rs            # Bounded transport-to-dispatch queue
 │       ├── remote.rs           # remote.enabled gate for the outbound session
 │       ├── command.rs          # AgentCommand / AgentResponse types
@@ -123,7 +124,10 @@ Dispatcher flow:
 2. If `module == "agent"` and `action == "capabilities"`, return the metadata for every registered module.
 3. Look up the module by name (`unknown module` otherwise).
 4. Ask `module.metadata(action, payload)`, which answers the shared `capabilities` and `plan` actions.
-5. Otherwise call `module.handle(action, payload, user)`.
+5. Take `run_as` out of the payload (or use `module.default_run_as()`) to
+   pick the user host commands run as: the signed-in user, the
+   `ultramarine-apps` account, root, or both user and root.
+6. Call `module.handle(action, payload, user)`.
 
 Any `Err` becomes an `AgentResponse::error` with the command's `id`.
 
@@ -167,13 +171,17 @@ pub trait Mod: Send + Sync {
     fn metadata(&self, action: &str, payload: &Value) -> Option<Value> {
         self.info().metadata_response(action, payload)
     }
+    fn default_run_as(&self) -> RunAs { RunAs::User }
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value>;
 }
 ```
 
 `ModuleInfo` lists the module's actions and its `privileged_actions`, which
-always run as root. Unprivileged actions run as the session's user through
-`runuser` when the transport supplies one.
+always run as root. Unprivileged actions run as the `user` the dispatcher
+passes, through `runuser` (with `XDG_RUNTIME_DIR` set when that user's
+manager runs): the session's user, or whoever the payload's `run_as` names.
+A module whose host state belongs to the apps account (`podman`) overrides
+`default_run_as` to `RunAs::Apps`; modules never choose users on their own.
 
 ### Adding a new module
 
@@ -273,6 +281,10 @@ depend on one serde schema.
   refuses symlinks below the base; `write_under` writes atomically with a
   given mode and creates parent directories.
 - `apply_selinux` — run `semanage fcontext` + `restorecon` when a payload includes `selinux` options.
+- `apps_account::{write_owned, create_dir_owned}` — `write_under` and
+  directory creation that hand the result to the `ultramarine-apps` account
+  (`Owner`, `lchown`, refusing symlinks below its home), for apps-scope
+  Quadlets and bundles.
 - `restorecon` — reset a path to the policy's default label (skipped without SELinux).
 - `parse_action` — decode `{action: payload}` into an action enum.
 - `Commands` — record a sequence of commands for one action, including failures that are tolerated.
@@ -353,7 +365,31 @@ Users log in through Tetra (PAM password plus TOTP, or a passkey) and get a
 session token; the local socket identifies the client from its peer
 credentials. Every module action is authorized from the user's admin status
 and grants (`auth::authz`). Unprivileged actions run as the session user via
-`runuser`; privileged ones as root. See [auth-protocol.md](auth-protocol.md).
+`runuser` (or as `ultramarine-apps`, with `run_as: apps` or the module's
+default); privileged ones as root. See [auth-protocol.md](auth-protocol.md).
+
+## User apps and the apps account
+
+User apps are rootless Quadlets of one system account, `ultramarine-apps`
+(UID/GID 242, home `/var/lib/ultramarine-apps`, from
+`systemd/tetra.sysusers.conf` and `systemd/tetra.tmpfiles.conf`), whoever
+installs them. `apps` and `quadlets` default to this `apps` scope
+(`types::AppScope`); `system` scope keeps rootful Quadlets for real system
+services. There is no per-user scope.
+
+- Files: units in `~/.config/containers/systemd`, bundles in
+  `~/.local/share/tetra/quadlets/<app>`. Tetra writes them as root,
+  atomically, then `lchown`s each file and directory to the account
+  (`apps_account::Owner`), after checking that nothing from the home down is
+  a symlink.
+- Host setup (`AppsAccount::provision`, on `apps.create`/`update` with
+  `converge`): subordinate UID/GID ranges (`usermod --add-subuids/
+  --add-subgids`, since `systemd-sysusers` allocates none), lingering, the
+  user manager started, and the rootful storage labels for its
+  `~/.local/share/containers/storage` (`semanage fcontext -a -e`).
+- systemd: `systemctl --user -M ultramarine-apps@` (`ServiceScope::Apps`).
+- Reads: `podman` defaults to `run_as: apps`; `agent-serve` warns at startup
+  when the account is missing or its IDs are not 242.
 
 ### Remote and development transports
 
@@ -377,6 +413,7 @@ Default mutable paths (bootc-friendly):
 | `/var/lib/tetra/secrets/`  | Credentials for other services, sealed with `systemd-creds`. |
 | `/var/lib/tetra/remote/`   | Remote-control client key, certificate, server CA and controller record (root-only). |
 | `/var/lib/tetra/quadlets/` | Companion files and `app.json` manifests of system-scope apps. |
+| `/var/lib/ultramarine-apps/` | Home of the apps account: apps-scope Quadlets (`.config/containers/systemd`), bundles (`.local/share/tetra/quadlets`) and rootless Podman storage, owned by the account. |
 | `/run/tetra/`              | The socket, the setup code for the console, short-lived files. |
 
 Generated identities, enrollment state, and rotation metadata must live in
