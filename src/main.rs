@@ -599,25 +599,33 @@ enum Listener {
 }
 
 async fn agent_serve(cli: AgentServeCli) -> Result<()> {
+    let hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .context("failed to install the SIGHUP handler")?;
     let listener = Listener::Socket {
         path: cli.socket,
         peers: PeerPolicy::from_users(&cli.dashboard_user, &cli.oobe_user),
     };
-    Box::pin(run_daemon(cli.daemon, listener)).await
+    Box::pin(run_daemon(cli.daemon, listener, hangup)).await
 }
 
 #[cfg(feature = "dev-listener")]
 async fn agent_ws_serve(cli: AgentWsServeCli) -> Result<()> {
+    let hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .context("failed to install the SIGHUP handler")?;
     let client = match cli.client {
         DevClient::Dashboard => auth::sessions::ClientKind::Dashboard,
         DevClient::Oobe => auth::sessions::ClientKind::Oobe,
     };
     let listener = tetra::agent::dev_listener::bind(cli.listen).await?;
     let listener = Listener::Tcp { listener, client };
-    Box::pin(run_daemon(cli.daemon, listener)).await
+    Box::pin(run_daemon(cli.daemon, listener, hangup)).await
 }
 
-async fn run_daemon(cli: DaemonArgs, listener: Listener) -> Result<()> {
+async fn run_daemon(
+    cli: DaemonArgs,
+    listener: Listener,
+    hangup: tokio::signal::unix::Signal,
+) -> Result<()> {
     let identity = HostIdentity::load_or_generate(&cli.identity_dir)?;
     let host_fingerprint = public_key_fingerprint(&identity.verifying_key());
     eprintln!("host identity: {}", identity.path().display());
@@ -669,7 +677,7 @@ async fn run_daemon(cli: DaemonArgs, listener: Listener) -> Result<()> {
     let result = tokio::select! {
         result = serve => result,
         () = remote::supervise(settings, queue, audit) => Ok(()),
-        result = remote::reload_on_hangup(cli.config, sender, select) => result,
+        result = remote::reload_on_hangup(hangup, cli.config, sender, select) => result,
         () = auth.flush_sessions_every(SESSION_FLUSH_INTERVAL) => Ok(()),
         result = tokio::signal::ctrl_c() => result.map_err(Into::into),
         _ = terminate.recv() => Ok(()),
@@ -679,6 +687,8 @@ async fn run_daemon(cli: DaemonArgs, listener: Listener) -> Result<()> {
 }
 
 async fn agent_connect(cli: AgentConnectCli) -> Result<()> {
+    let hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .context("failed to install the SIGHUP handler")?;
     anyhow::ensure!(
         RuntimeConfig::load(&cli.runtime_config)?.remote.enabled,
         "remote control is disabled; set remote.enabled to true in `{}`",
@@ -731,6 +741,6 @@ async fn agent_connect(cli: AgentConnectCli) -> Result<()> {
     };
     tokio::select! {
         () = remote::supervise(settings, queue, audit) => Ok(()),
-        result = remote::reload_on_hangup(cli.runtime_config, sender, select) => result,
+        result = remote::reload_on_hangup(hangup, cli.runtime_config, sender, select) => result,
     }
 }
