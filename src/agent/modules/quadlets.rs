@@ -42,13 +42,12 @@
 use serde_json::json;
 
 use crate::actions;
-use crate::agent::apps_account::{
-    APPS_USER, AppsAccount, Owner, check_no_symlinks, create_dir_owned, write_owned,
-};
+use crate::agent::apps_account::{APPS_USER, AppsAccount, Owner};
 use crate::agent::module_support::{
-    ModuleInfo, ModuleStatus, SelinuxOptions, apply_selinux, resolve_under, safe_join,
+    ModuleInfo, ModuleStatus, SelinuxOptions, apply_selinux, safe_join,
 };
 use crate::agent::modules::Mod;
+use crate::agent::tree::{Kind, Tree};
 use crate::prelude::*;
 use crate::types::AppScope;
 
@@ -139,8 +138,9 @@ actions!(Action [payload user] => {
         #[serde(default)]
         scope: AppScope,
     } => {
-        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope)?;
-        Ok(json!({ "base_dir": base_dir, "files": QuadletFile::list(&base_dir)? }))
+        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope);
+        let tree = scope_tree(&base_dir, payload.scope, None);
+        Ok(json!({ "base_dir": base_dir, "files": QuadletFile::list(&tree, &base_dir)? }))
     },
     ListFiles {
         base_dir: Option<PathBuf>,
@@ -148,10 +148,13 @@ actions!(Action [payload user] => {
         #[serde(default)]
         scope: AppScope,
     } => {
-        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope)?;
+        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope);
         let files_base_dir = quadlet_files_base_dir(payload.files_base_dir, payload.scope, None)?;
-        let mut files = ManagedFile::list(&base_dir)?;
-        files.extend(list_companion_files(&files_base_dir)?);
+        let mut files = ManagedFile::list(&scope_tree(&base_dir, payload.scope, None), &base_dir)?;
+        files.extend(list_companion_files(
+            &scope_tree(&files_base_dir, payload.scope, None),
+            &files_base_dir,
+        )?);
         // Quadlet entries first, then companions, each group sorted by filename.
         files.sort_by(|left, right| {
             left.quadlet
@@ -179,8 +182,7 @@ actions!(Action [payload user] => {
             &payload.filename,
             payload.companion,
         )?;
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read `{}`", path.display()))?;
+        let contents = scope_tree(&base_dir, payload.scope, None).read_to_string(&path)?;
         Ok(json!({ "base_dir": base_dir, "filename": payload.filename, "contents": contents, "dry_run": payload.dry_run }))
     },
     Write {
@@ -195,16 +197,16 @@ actions!(Action [payload user] => {
         selinux: Option<SelinuxOptions>,
     } => {
         validate_quadlet(&payload.filename, &payload.contents)?;
-        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope)?;
+        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope);
         let owner = scope_owner(payload.scope, payload.dry_run)?;
-        let path = write_owned(
-            &base_dir,
-            &payload.filename,
-            payload.contents.as_bytes(),
-            UNIT_MODE,
-            payload.dry_run,
-            owner.as_ref(),
-        )?;
+        let path = safe_join(&base_dir, &payload.filename)?;
+        if !payload.dry_run {
+            scope_tree(&base_dir, payload.scope, owner).write(
+                &path,
+                payload.contents.as_bytes(),
+                UNIT_MODE,
+            )?;
+        }
         let selinux =
             apply_selinux(payload.selinux.as_ref(), Some(&path), payload.dry_run)?;
         Ok(json!({
@@ -232,9 +234,9 @@ actions!(Action [payload user] => {
             &payload.filename,
             payload.companion,
         )?;
-        if !payload.dry_run {
-            fs::remove_file(&path)
-                .with_context(|| format!("failed to delete `{}`", path.display()))?;
+        if !payload.dry_run && !scope_tree(&base_dir, payload.scope, None).remove_file(&path)? {
+            return Err(io::Error::from(io::ErrorKind::NotFound))
+                .with_context(|| format!("failed to delete `{}`", path.display()));
         }
         Ok(json!({
             "base_dir": base_dir, "filename": payload.filename, "path": path,
@@ -262,7 +264,7 @@ actions!(Action [payload user] => {
         #[serde(default)]
         selinux: Option<SelinuxOptions>,
     } => {
-        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope)?;
+        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope);
         let owner = scope_owner(payload.scope, payload.dry_run)?;
         // The companion bundle is named after the first Quadlet
         // resource's stem (`site.container` -> `site`). Callers are
@@ -281,14 +283,21 @@ actions!(Action [payload user] => {
         // Create both roots up front so a permission or disk failure
         // surfaces before any file is written, rather than midway
         // through the bundle.
-        create_dir_owned(&base_dir, payload.dry_run, owner.as_ref())?;
-        create_dir_owned(&files_base_dir, payload.dry_run, owner.as_ref())?;
+        let units = scope_tree(&base_dir, payload.scope, owner.clone());
+        let companions = scope_tree(&files_base_dir, payload.scope, owner);
+        if !payload.dry_run {
+            units.create_dir(&base_dir)?;
+            companions.create_dir(&files_base_dir)?;
+        }
 
         let mut installed = Vec::new();
         let mut selinux_ops = Vec::new();
         for resource in payload.resources {
             validate_quadlet(&resource.filename, &resource.contents)?;
-            let path = write_owned(&base_dir, &resource.filename, resource.contents.as_bytes(), UNIT_MODE, payload.dry_run, owner.as_ref())?;
+            let path = safe_join(&base_dir, &resource.filename)?;
+            if !payload.dry_run {
+                units.write(&path, resource.contents.as_bytes(), UNIT_MODE)?;
+            }
             selinux_ops.extend(apply_selinux(
                 resource.selinux.as_ref(),
                 Some(&path),
@@ -301,7 +310,10 @@ actions!(Action [payload user] => {
         }
         let mut files = Vec::new();
         for resource in payload.files {
-            let path = write_owned(&files_base_dir, &resource.filename, resource.contents.as_bytes(), COMPANION_MODE, payload.dry_run, owner.as_ref())?;
+            let path = safe_join(&files_base_dir, &resource.filename)?;
+            if !payload.dry_run {
+                companions.write(&path, resource.contents.as_bytes(), COMPANION_MODE)?;
+            }
             selinux_ops.extend(apply_selinux(
                 resource.selinux.as_ref(),
                 Some(&path),
@@ -337,27 +349,16 @@ impl QuadletFile {
     /// List Quadlet unit files directly under `base_dir` (non-recursive). Only
     /// flat files with a Quadlet extension are returned; subdirectories and
     /// non-Quadlet files are skipped, mirroring how Podman scans the directory.
-    fn list(base_dir: &Path) -> Result<Vec<Self>> {
-        if !base_dir.exists() {
-            return Ok(Vec::new());
-        }
-
+    fn list(tree: &Tree, base_dir: &Path) -> Result<Vec<Self>> {
         let mut files = Vec::new();
-        for entry in fs::read_dir(base_dir)
-            .with_context(|| format!("failed to read `{}`", base_dir.display()))?
-        {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+        for (name, kind) in tree.read_dir(base_dir)?.unwrap_or_default() {
+            let Some(filename) = name.to_str() else {
                 continue;
             };
-            if is_quadlet_filename(filename) {
+            if kind == Kind::File && is_quadlet_filename(filename) {
                 files.push(Self {
                     filename: filename.to_owned(),
-                    path,
+                    path: base_dir.join(filename),
                 });
             }
         }
@@ -370,8 +371,8 @@ impl ManagedFile {
     /// Same scan as [`QuadletFile::list`] but returns [`ManagedFile`] entries tagged
     /// `quadlet: true`, so `list_files` can merge Quadlet and companion results
     /// into a single response.
-    fn list(base_dir: &Path) -> Result<Vec<Self>> {
-        Ok(QuadletFile::list(base_dir)?
+    fn list(tree: &Tree, base_dir: &Path) -> Result<Vec<Self>> {
+        Ok(QuadletFile::list(tree, base_dir)?
             .into_iter()
             .map(|QuadletFile { filename, path }| Self {
                 filename,
@@ -385,25 +386,14 @@ impl ManagedFile {
 /// Resolve the Quadlet scan directory for a request. An explicit `base_dir`
 /// always wins — tests and custom deployments rely on this — otherwise the
 /// scope picks the default Podman scan path.
-///
-/// The apps account's directories are refused when a directory on the way
-/// is a symlink (see [`check_no_symlinks`]).
-pub(crate) fn quadlet_base_dir(base_dir: Option<PathBuf>, scope: AppScope) -> Result<PathBuf> {
+pub(crate) fn quadlet_base_dir(base_dir: Option<PathBuf>, scope: AppScope) -> PathBuf {
     if let Some(base_dir) = base_dir {
-        return Ok(base_dir);
+        return base_dir;
     }
     match scope {
-        AppScope::Apps => apps_dir(AppsAccount::quadlet_dir),
-        AppScope::System => Ok(PathBuf::from("/etc/containers/systemd")),
+        AppScope::Apps => AppsAccount::resolve().quadlet_dir(),
+        AppScope::System => PathBuf::from("/etc/containers/systemd"),
     }
-}
-
-/// One of the apps account's directories, checked for symlinks.
-fn apps_dir(dir: fn(&AppsAccount) -> PathBuf) -> Result<PathBuf> {
-    let account = AppsAccount::resolve();
-    let dir = dir(&account);
-    check_no_symlinks(&account.home, &dir)?;
-    Ok(dir)
 }
 
 /// Resolve the companion-files data root, optionally nested under a bundle
@@ -418,7 +408,7 @@ pub(crate) fn quadlet_files_base_dir(
 ) -> Result<PathBuf> {
     let base = match (files_base_dir, scope) {
         (Some(files_base_dir), _) => files_base_dir,
-        (None, AppScope::Apps) => apps_dir(AppsAccount::data_dir)?,
+        (None, AppScope::Apps) => AppsAccount::resolve().data_dir(),
         (None, AppScope::System) => PathBuf::from("/var/lib/tetra/quadlets"),
     };
     if let Some(bundle_name) = bundle_name {
@@ -426,6 +416,15 @@ pub(crate) fn quadlet_files_base_dir(
     } else {
         Ok(base)
     }
+}
+
+/// The [`Tree`] `dir` belongs to in `scope`: in apps scope, a directory
+/// below the apps account's home is resolved from the home's descriptor,
+/// since the account owns everything there. Writes hand what they create to
+/// `owner`.
+pub(crate) fn scope_tree(dir: &Path, scope: AppScope, owner: Option<Owner>) -> Tree {
+    let home = (scope == AppScope::Apps).then(|| AppsAccount::resolve().home);
+    Tree::new(dir, home.as_deref(), owner)
 }
 
 /// Who files written in `scope` are handed to: the apps account in apps
@@ -468,59 +467,35 @@ fn quadlet_bundle_name(pathstr: &str) -> Result<String> {
 
 /// Recursively list companion files under the data root. Recursive because,
 /// unlike the Quadlet scan dir, the companion tree is ours to organize and
-/// may hold nested paths like `app/nginx/default.conf`.
-pub(crate) fn list_companion_files(base_dir: &Path) -> Result<Vec<ManagedFile>> {
-    if !base_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut files = Vec::new();
-    collect_files(base_dir, base_dir, &mut files)?;
+/// may hold nested paths like `app/nginx/default.conf`. Each entry's
+/// `filename` is relative to `base_dir` (with forward slashes), while
+/// `path` is absolute. Symlinks are skipped, never followed.
+pub(crate) fn list_companion_files(tree: &Tree, base_dir: &Path) -> Result<Vec<ManagedFile>> {
+    let mut files: Vec<ManagedFile> = tree
+        .files_below(base_dir)?
+        .into_iter()
+        .map(|relative| {
+            let filename = relative.to_string_lossy().replace('\\', "/");
+            // Classification is a suffix check only: a companion file that
+            // happens to end in `.container` would be flagged `quadlet: true`.
+            // This is fine because the flag is display-only and never gates a
+            // write — real Quadlet files should not live under the companion root.
+            ManagedFile {
+                quadlet: is_quadlet_filename(&filename),
+                filename,
+                path: base_dir.join(relative),
+            }
+        })
+        .collect();
     files.sort_by(|left, right| left.filename.cmp(&right.filename));
     Ok(files)
-}
-
-/// Recursive worker for `list_companion_files`. `base_dir` is anchored at
-/// the root so each entry's `filename` is reported relative to it (with
-/// forward slashes regardless of platform), while `path` stays absolute for
-/// filesystem access.
-fn collect_files(base_dir: &Path, dir: &Path, files: &mut Vec<ManagedFile>) -> Result<()> {
-    for entry in fs::read_dir(dir).with_context(|| format!("failed to read `{}`", dir.display()))? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let path = entry.path();
-        if file_type.is_dir() {
-            collect_files(base_dir, &path, files)?;
-            continue;
-        }
-        if !file_type.is_file() {
-            continue;
-        }
-
-        let filename = path
-            .strip_prefix(base_dir)
-            .with_context(|| format!("failed to make `{}` relative", path.display()))?
-            .to_string_lossy()
-            .replace('\\', "/");
-        // Classification is a suffix check only: a companion file that
-        // happens to end in `.container` would be flagged `quadlet: true`.
-        // This is fine because the flag is display-only and never gates a
-        // write — real Quadlet files should not live under the companion root.
-        files.push(ManagedFile {
-            quadlet: is_quadlet_filename(&filename),
-            filename,
-            path,
-        });
-    }
-
-    Ok(())
 }
 
 /// The directory and path of a Quadlet (`companion: false`) or companion
 /// file named by a `read`/`delete` payload. Companion files are addressed by
 /// their full relative path (e.g. `site/index.html`), so no bundle is
 /// derived; Quadlets resolve against the flat scan directory. The path may
-/// not leave the directory or pass through a symlink.
+/// not leave the directory; the [`Tree`] that opens it refuses symlinks.
 fn target(
     base_dir: Option<PathBuf>,
     files_base_dir: Option<PathBuf>,
@@ -532,9 +507,9 @@ fn target(
         quadlet_files_base_dir(files_base_dir, scope, None)?
     } else {
         quadlet_bundle_name(filename)?;
-        quadlet_base_dir(base_dir, scope)?
+        quadlet_base_dir(base_dir, scope)
     };
-    let path = resolve_under(&base_dir, filename)?;
+    let path = safe_join(&base_dir, filename)?;
     Ok((base_dir, path))
 }
 
@@ -600,7 +575,7 @@ mod tests {
     #[test]
     fn system_scope_uses_system_quadlet_directory() {
         assert_eq!(
-            quadlet_base_dir(None, AppScope::System).unwrap(),
+            quadlet_base_dir(None, AppScope::System),
             PathBuf::from("/etc/containers/systemd")
         );
     }
@@ -619,7 +594,7 @@ mod tests {
         assert_eq!(list.scope, AppScope::Apps);
         let home = AppsAccount::resolve().home;
         assert_eq!(
-            quadlet_base_dir(None, AppScope::Apps).unwrap(),
+            quadlet_base_dir(None, AppScope::Apps),
             home.join(".config/containers/systemd")
         );
         assert_eq!(
@@ -628,7 +603,7 @@ mod tests {
         );
         // Overrides win in any scope.
         assert_eq!(
-            quadlet_base_dir(Some("/srv/q".into()), AppScope::Apps).unwrap(),
+            quadlet_base_dir(Some("/srv/q".into()), AppScope::Apps),
             Path::new("/srv/q")
         );
         assert_eq!(owner_name(AppScope::Apps), "ultramarine-apps");
@@ -646,24 +621,15 @@ mod tests {
         let (owner, chowned) = crate::agent::apps_account::tests::recording_owner(&home);
         let base = home.join(".config/containers/systemd");
         let files = home.join(".local/share/tetra/quadlets/site");
-        create_dir_owned(&base, false, Some(&owner)).unwrap();
-        create_dir_owned(&files, false, Some(&owner)).unwrap();
-        write_owned(
-            &base,
-            "site.container",
-            b"[Container]\n",
-            UNIT_MODE,
-            false,
-            Some(&owner),
-        )
-        .unwrap();
-        write_owned(
-            &files,
-            "nginx/default.conf",
+        let tree = Tree::new(&base, Some(&home), Some(owner));
+        tree.create_dir(&base).unwrap();
+        tree.create_dir(&files).unwrap();
+        tree.write(&base.join("site.container"), b"[Container]\n", UNIT_MODE)
+            .unwrap();
+        tree.write(
+            &files.join("nginx/default.conf"),
             b"server {}\n",
             COMPANION_MODE,
-            false,
-            Some(&owner),
         )
         .unwrap();
         let chowned = chowned.lock().unwrap().clone();
@@ -686,21 +652,8 @@ mod tests {
         assert_eq!(mode(&base.join("site.container")), 0o600);
         assert_eq!(mode(&files.join("nginx/default.conf")), 0o644);
 
-        // A dry run neither writes nor gives anything away.
-        let before = chowned.len();
-        let (dry_owner, dry_chowned) = crate::agent::apps_account::tests::recording_owner(&home);
-        write_owned(
-            &base,
-            "other.container",
-            b"[Container]\n",
-            UNIT_MODE,
-            true,
-            Some(&dry_owner),
-        )
-        .unwrap();
-        assert!(!base.join("other.container").exists());
-        assert!(dry_chowned.lock().unwrap().is_empty());
-        assert!(before > 0);
+        // A dry run gives nothing away.
+        assert!(scope_owner(AppScope::Apps, true).unwrap().is_none());
     }
 
     #[test]

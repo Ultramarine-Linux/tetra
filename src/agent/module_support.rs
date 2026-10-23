@@ -583,44 +583,12 @@ pub fn safe_join(base: &Path, name: &str) -> Result<PathBuf> {
     Ok(base.join(path))
 }
 
-/// [`safe_join`] `relative` onto `base`, also refusing a path that passes
-/// through a symlink below `base`, so a link planted in a managed directory
-/// is never followed.
-///
-/// # Errors
-/// Fails when `relative` escapes `base` or a component is a symlink.
-pub fn resolve_under(base: &Path, relative: &str) -> Result<PathBuf> {
-    let path = safe_join(base, relative)?;
-    let mut current = base.to_path_buf();
-    for component in Path::new(relative).components() {
-        if let Component::Normal(component) = component {
-            current.push(component);
-            if fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.is_symlink()) {
-                bail!("managed path `{relative}` contains a symlink");
-            }
-        }
-    }
-    Ok(path)
-}
-
-/// Remove `relative` under `base` (see [`resolve_under`]) unless `dry_run`;
-/// a missing file is not an error. Returns its path.
-///
-/// # Errors
-/// Fails when the path is refused or the file cannot be removed.
-pub fn remove_under(base: &Path, relative: &str, dry_run: bool) -> Result<PathBuf> {
-    let path = resolve_under(base, relative)?;
-    if !dry_run {
-        crate::auth::store::remove_if_exists(&path)?;
-    }
-    Ok(path)
-}
-
 /// Atomically write `contents` to `relative` under `base` with `mode`.
 ///
 /// Parent directories are created for nested paths. The path must stay inside
-/// `base` and contain no symlink, so a planted link is never followed.
-/// Nothing is written on a dry run; the path is returned either way.
+/// `base`, and is resolved from `base`'s descriptor without following a
+/// symlink ([`Tree`](super::tree::Tree)), so a planted link is never
+/// followed. Nothing is written on a dry run; the path is returned either way.
 ///
 /// # Errors
 /// Fails when the path escapes `base` or contains a symlink, or the write
@@ -632,13 +600,9 @@ pub fn write_under(
     mode: u32,
     dry_run: bool,
 ) -> Result<PathBuf> {
-    let path = resolve_under(base, relative)?;
+    let path = safe_join(base, relative)?;
     if !dry_run {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create `{}`", parent.display()))?;
-        }
-        crate::auth::store::replace(&path, contents, mode)?;
+        super::tree::Tree::trusted(base).write(&path, contents, mode)?;
     }
     Ok(path)
 }

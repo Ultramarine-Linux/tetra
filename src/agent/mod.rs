@@ -35,6 +35,7 @@ pub mod queue;
 pub mod remote;
 pub mod shell;
 pub mod transport;
+pub mod tree;
 pub mod websocket;
 
 pub use command::{AgentCommand, AgentResponse};

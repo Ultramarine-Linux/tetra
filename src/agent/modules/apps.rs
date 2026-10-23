@@ -69,15 +69,14 @@ use serde_json::json;
 use serde_norway::Value as YamlValue;
 
 use crate::actions;
-use crate::agent::apps_account::{AppsAccount, HostPaths, Owner, create_dir_owned, write_owned};
-use crate::agent::module_support::{
-    Commands, ModuleInfo, ModuleStatus, apply_selinux, remove_under, resolve_under, safe_join,
-};
+use crate::agent::apps_account::{AppsAccount, HostPaths};
+use crate::agent::module_support::{Commands, ModuleInfo, ModuleStatus, apply_selinux, safe_join};
 use crate::agent::modules::Mod;
 use crate::agent::modules::quadlets::{
     list_companion_files, owner_name, quadlet_base_dir, quadlet_files_base_dir, scope_owner,
-    validate_quadlet,
+    scope_tree, validate_quadlet,
 };
+use crate::agent::tree::{Kind, Tree};
 use crate::catalog::{RenderedResource, ResourceKind, load_values};
 use crate::prelude::*;
 use crate::types::{
@@ -169,10 +168,11 @@ actions!(Action [payload user] => {
             .iter()
             .map(|filename| {
                 let path = dirs.base_dir.join(filename);
-                json!({ "filename": filename, "path": path, "exists": path.exists() })
+                let exists = dirs.units.exists(&path)?;
+                Ok(json!({ "filename": filename, "path": path, "exists": exists }))
             })
-            .collect::<Vec<_>>();
-        let files = list_companion_files(&bundle.dir)?
+            .collect::<Result<Vec<_>>>()?;
+        let files = list_companion_files(&dirs.files, &bundle.dir)?
             .into_iter()
             .filter(|file| file.filename() != APP_MANIFEST)
             .collect::<Vec<_>>();
@@ -193,7 +193,7 @@ actions!(Action [payload user] => {
             .owned(payload.scope, payload.dry_run)?;
         let bundle = dirs.bundle(&payload.name)?;
         ensure!(
-            !bundle.exists(),
+            !bundle.exists()?,
             "app `{}` already exists; use `update` to modify it",
             payload.name
         );
@@ -346,7 +346,7 @@ actions!(Action [payload user] => {
         if payload.converge {
             systemd.push(phase.daemon_reload()?);
         }
-        bundle.remove(payload.dry_run)?;
+        bundle.remove_bundle(payload.dry_run)?;
         Ok(json!({
             "name": payload.name,
             "bundle_dir": bundle.dir,
@@ -374,35 +374,42 @@ struct InstallOutcome {
 
 /// The two directory trees an app spans: the Quadlet scan directory its units
 /// install into, and the companion-file data root its bundle lives under,
-/// plus who the files written there belong to. Apps default to apps scope;
-/// the request-level overrides keep the protocol testable without touching
-/// real system paths.
+/// each with the [`Tree`] that resolves paths in it (handing what it writes
+/// to the scope's owner). Apps default to apps scope; the request-level
+/// overrides keep the protocol testable without touching real system paths.
 #[derive(Debug)]
 struct AppDirs {
     base_dir: PathBuf,
     files_root: PathBuf,
-    /// The apps account, for writes in apps scope (see [`Owner::for_apps`]).
-    owner: Option<Owner>,
+    units: Tree,
+    files: Tree,
 }
 
 impl AppDirs {
-    /// Resolve both roots for a request, honoring its directory overrides.
+    /// Resolve both roots for a request, honoring its directory overrides,
+    /// for reading.
     fn resolve(
         base_dir: Option<PathBuf>,
         files_base_dir: Option<PathBuf>,
         scope: AppScope,
     ) -> Result<Self> {
+        let base_dir = quadlet_base_dir(base_dir, scope);
+        let files_root = quadlet_files_base_dir(files_base_dir, scope, None)?;
         Ok(Self {
-            base_dir: quadlet_base_dir(base_dir, scope)?,
-            files_root: quadlet_files_base_dir(files_base_dir, scope, None)?,
-            owner: None,
+            units: scope_tree(&base_dir, scope, None),
+            files: scope_tree(&files_root, scope, None),
+            base_dir,
+            files_root,
         })
     }
 
-    /// The same roots, for writes: files go to the scope's owner.
+    /// The same roots, for writes: files go to the scope's owner (see
+    /// [`Owner::for_apps`](crate::agent::apps_account::Owner::for_apps)).
     fn owned(self, scope: AppScope, dry_run: bool) -> Result<Self> {
+        let owner = scope_owner(scope, dry_run)?;
         Ok(Self {
-            owner: scope_owner(scope, dry_run)?,
+            units: scope_tree(&self.base_dir, scope, owner.clone()),
+            files: scope_tree(&self.files_root, scope, owner),
             ..self
         })
     }
@@ -410,11 +417,11 @@ impl AppDirs {
     /// Address an app's bundle directory inside the data root. `safe_join`
     /// keeps names with traversal components from escaping the root.
     fn bundle(&self, name: &str) -> Result<AppBundle> {
-        let dir = resolve_under(&self.files_root, name)?;
         Ok(AppBundle {
             base_dir: self.base_dir.clone(),
-            dir,
-            owner: self.owner.clone(),
+            dir: safe_join(&self.files_root, name)?,
+            units: self.units.clone(),
+            files: self.files.clone(),
         })
     }
 }
@@ -507,13 +514,15 @@ struct AppBundle {
     base_dir: PathBuf,
     /// Per-app bundle directory under the companion-file data root.
     dir: PathBuf,
-    /// Who the files belong to (apps scope, when Tetra runs as root).
-    owner: Option<Owner>,
+    /// Where the units are written.
+    units: Tree,
+    /// Where the bundle is written.
+    files: Tree,
 }
 
 impl AppBundle {
-    fn exists(&self) -> bool {
-        self.dir.exists()
+    fn exists(&self) -> Result<bool> {
+        self.files.exists(&self.dir)
     }
 
     /// Recipes that declare a `bundle_dir` parameter (typically for bind
@@ -528,8 +537,10 @@ impl AppBundle {
 
     /// Read and parse `<dir>/app.json`.
     fn manifest(&self) -> Result<AppManifest> {
-        let path = resolve_under(&self.dir, APP_MANIFEST)?;
-        let text = fs::read_to_string(&path)
+        let path = self.dir.join(APP_MANIFEST);
+        let text = self
+            .files
+            .read_to_string(&path)
             .with_context(|| format!("failed to read app manifest `{}`", path.display()))?;
         let manifest: AppManifest = serde_json::from_str(&text)
             .with_context(|| format!("failed to parse app manifest `{}`", path.display()))?;
@@ -546,19 +557,12 @@ impl AppBundle {
     /// Serialize the manifest into the bundle. Skipped on dry runs; returns
     /// the target path either way so previews show where it would land.
     fn write_manifest(&self, manifest: &AppManifest, dry_run: bool) -> Result<PathBuf> {
-        let path = resolve_under(&self.dir, APP_MANIFEST)?;
+        let path = self.dir.join(APP_MANIFEST);
         if !dry_run {
             let contents =
                 serde_json::to_vec_pretty(manifest).context("failed to serialize app manifest")?;
             // Holds the app's values, secrets included.
-            write_owned(
-                &self.dir,
-                APP_MANIFEST,
-                &contents,
-                PRIVATE_MODE,
-                false,
-                self.owner.as_ref(),
-            )?;
+            self.files.write(&path, &contents, PRIVATE_MODE)?;
         }
         Ok(path)
     }
@@ -610,8 +614,8 @@ impl AppBundle {
             .map(|manifest| manifest.units.iter().map(String::as_str).collect())
             .unwrap_or_default();
         for unit in &units {
-            let path = resolve_under(&self.base_dir, &unit.filename)?;
-            if path.exists() && !previous_units.contains(unit.filename.as_str()) {
+            let path = safe_join(&self.base_dir, &unit.filename)?;
+            if self.units.exists(&path)? && !previous_units.contains(unit.filename.as_str()) {
                 bail!(
                     "Quadlet unit `{}` already exists and is not owned by this app",
                     unit.filename
@@ -619,8 +623,10 @@ impl AppBundle {
             }
         }
 
-        create_dir_owned(&self.base_dir, dry_run, self.owner.as_ref())?;
-        create_dir_owned(&self.dir, dry_run, self.owner.as_ref())?;
+        if !dry_run {
+            self.units.create_dir(&self.base_dir)?;
+            self.files.create_dir(&self.dir)?;
+        }
 
         let mut outcome = InstallOutcome::default();
         if let Some(previous) = previous {
@@ -630,7 +636,7 @@ impl AppBundle {
                 if desired_units.contains(unit.as_str()) {
                     continue;
                 }
-                remove_under(&self.base_dir, unit, dry_run)?;
+                remove_under(&self.units, &self.base_dir, unit, dry_run)?;
                 outcome.removed_units.push(unit.clone());
             }
             let desired_files: HashSet<&str> = companions
@@ -641,33 +647,27 @@ impl AppBundle {
                 if desired_files.contains(file.as_str()) {
                     continue;
                 }
-                remove_under(&self.dir, file, dry_run)?;
+                remove_under(&self.files, &self.dir, file, dry_run)?;
                 outcome.removed_files.push(file.clone());
             }
         }
 
         for unit in units {
             // Units can carry secrets (`Environment=MYSQL_PASSWORD=...`).
-            write_owned(
-                &self.base_dir,
-                &unit.filename,
-                unit.contents.as_bytes(),
-                unit.kind.mode(),
-                dry_run,
-                self.owner.as_ref(),
-            )?;
+            if !dry_run {
+                let path = safe_join(&self.base_dir, &unit.filename)?;
+                self.units
+                    .write(&path, unit.contents.as_bytes(), unit.kind.mode())?;
+            }
             outcome.units.push(unit.filename.clone());
         }
         for companion in companions {
             // Containers read companions through bind mounts.
-            write_owned(
-                &self.dir,
-                &companion.filename,
-                companion.contents.as_bytes(),
-                companion.kind.mode(),
-                dry_run,
-                self.owner.as_ref(),
-            )?;
+            if !dry_run {
+                let path = safe_join(&self.dir, &companion.filename)?;
+                self.files
+                    .write(&path, companion.contents.as_bytes(), companion.kind.mode())?;
+            }
             outcome.files.push(companion.filename.clone());
         }
         Ok(outcome)
@@ -678,15 +678,14 @@ impl AppBundle {
     fn delete_units(&self, units: &[String], dry_run: bool) -> Result<Vec<PathBuf>> {
         units
             .iter()
-            .map(|unit| remove_under(&self.base_dir, unit, dry_run))
+            .map(|unit| remove_under(&self.units, &self.base_dir, unit, dry_run))
             .collect()
     }
 
     /// Remove the bundle directory and everything in it.
-    fn remove(&self, dry_run: bool) -> Result<()> {
+    fn remove_bundle(&self, dry_run: bool) -> Result<()> {
         if !dry_run {
-            fs::remove_dir_all(&self.dir)
-                .with_context(|| format!("failed to remove `{}`", self.dir.display()))?;
+            self.files.remove_dir_all(&self.dir)?;
         }
         Ok(())
     }
@@ -714,6 +713,16 @@ impl AppBundle {
     }
 }
 
+/// Remove `relative` under `base` in `tree` unless `dry_run`; a missing
+/// file is not an error. Returns its path.
+fn remove_under(tree: &Tree, base: &Path, relative: &str, dry_run: bool) -> Result<PathBuf> {
+    let path = safe_join(base, relative)?;
+    if !dry_run {
+        tree.remove_file(&path)?;
+    }
+    Ok(path)
+}
+
 /// Mode of `app.json`, which holds the app's values (secrets included).
 const PRIVATE_MODE: u32 = 0o600;
 
@@ -728,30 +737,24 @@ fn list_scope(
     apps: &mut Vec<Value>,
     invalid: &mut Vec<String>,
 ) -> Result<()> {
-    if dirs.files_root.exists() {
-        for entry in fs::read_dir(&dirs.files_root)
-            .with_context(|| format!("failed to read `{}`", dirs.files_root.display()))?
-        {
-            let entry = entry?;
-            let entry_type = entry.file_type()?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if entry_type.is_symlink() {
-                invalid.push(name);
-                continue;
+    for (name, kind) in dirs.files.read_dir(&dirs.files_root)?.unwrap_or_default() {
+        let name = name.to_string_lossy().into_owned();
+        if kind == Kind::Symlink {
+            invalid.push(name);
+            continue;
+        }
+        if kind != Kind::Dir {
+            continue;
+        }
+        let Ok(bundle) = dirs.bundle(&name) else {
+            invalid.push(name);
+            continue;
+        };
+        match bundle.manifest() {
+            Ok(manifest) if manifest.name == name && manifest.scope == scope => {
+                apps.push(bundle.summary(&manifest));
             }
-            if !entry_type.is_dir() {
-                continue;
-            }
-            let Ok(bundle) = dirs.bundle(&name) else {
-                invalid.push(name);
-                continue;
-            };
-            match bundle.manifest() {
-                Ok(manifest) if manifest.name == name && manifest.scope == scope => {
-                    apps.push(bundle.summary(&manifest));
-                }
-                Ok(_) | Err(_) => invalid.push(name),
-            }
+            Ok(_) | Err(_) => invalid.push(name),
         }
     }
     Ok(())
@@ -1222,10 +1225,13 @@ resources:
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("apps");
         let (owner, chowned) = crate::agent::apps_account::tests::recording_owner(&home);
+        let base_dir = home.join(".config/containers/systemd");
+        let files_root = home.join(".local/share/tetra/quadlets");
         let dirs = AppDirs {
-            base_dir: home.join(".config/containers/systemd"),
-            files_root: home.join(".local/share/tetra/quadlets"),
-            owner: Some(owner),
+            units: Tree::new(&base_dir, Some(&home), Some(owner.clone())),
+            files: Tree::new(&files_root, Some(&home), Some(owner)),
+            base_dir,
+            files_root,
         };
         let bundle = dirs.bundle("demo").unwrap();
         let source = crate::types::AppRecipeSource::Inline {

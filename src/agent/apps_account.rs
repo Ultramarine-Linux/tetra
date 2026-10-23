@@ -8,10 +8,12 @@
 //! a login. Rootful Quadlets are kept for real system services (`scope:
 //! "system"`).
 //!
-//! Tetra writes the account's files as root and then hands them to the
-//! account. Since the account (and so any app container's root) owns that
-//! tree, every directory from the home down is checked for symlinks first,
-//! and ownership is changed with `lchown`, which never follows one.
+//! Tetra writes the account's files as root and hands them to the account
+//! ([`Owner`]). Since the account (and so any app container's root) owns
+//! that tree, nothing below the home is used by path: every operation goes
+//! through [`Tree`](crate::agent::tree::Tree), which resolves paths from the
+//! home's descriptor with `openat2` and never follows a symlink, and
+//! ownership and modes are set with `fchown`/`fchmod` on open descriptors.
 //!
 //! `systemd-sysusers` does not allocate subordinate UIDs and GIDs, which
 //! rootless Podman needs, so [`AppsAccount::provision`] adds a free range
@@ -19,14 +21,11 @@
 //! converged, enables lingering, and gives the account's container storage
 //! the labels of `/var/lib/containers/storage`.
 
-use std::{
-    os::unix::fs::{DirBuilderExt as _, MetadataExt as _},
-    sync::Arc,
-};
+use std::{os::fd::BorrowedFd, sync::Arc};
 
 use nix::unistd::User;
 
-use crate::agent::module_support::{Commands, write_under};
+use crate::agent::module_support::Commands;
 use crate::prelude::*;
 
 /// The account user apps run as.
@@ -215,39 +214,6 @@ impl AppsAccount {
     }
 }
 
-/// Refuse `dir` when a directory between `home` and it is a symlink, so a
-/// link the account planted cannot point a root read, write or removal
-/// elsewhere. Components that do not exist yet are fine.
-///
-/// # Errors
-/// Fails on a symlink, or when a component cannot be inspected.
-pub fn check_no_symlinks(home: &Path, dir: &Path) -> Result<()> {
-    let Ok(below) = dir.strip_prefix(home) else {
-        return Ok(());
-    };
-    let mut current = home.to_path_buf();
-    for component in std::iter::once(None).chain(below.components().map(Some)) {
-        if let Some(component) = component {
-            current.push(component);
-        }
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                bail!(
-                    "`{}` is a symlink; refusing to follow it",
-                    current.display()
-                )
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect `{}`", current.display()));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// `/run/user/<uid>`, a user manager's `XDG_RUNTIME_DIR`.
 #[must_use]
 pub fn runtime_dir(uid: u32) -> PathBuf {
@@ -350,15 +316,14 @@ fn has_equivalence(subs: &str, path: &str, target: &str) -> bool {
     })
 }
 
-type ChownFn = dyn Fn(&Path, u32, u32) -> io::Result<()> + Send + Sync;
+type ChownFn = dyn Fn(BorrowedFd<'_>, &Path, u32, u32) -> io::Result<()> + Send + Sync;
 
-/// Hands files Tetra wrote (as root) to the apps account.
+/// Hands files and directories Tetra creates (as root) to the apps account,
+/// through their open descriptors ([`Tree`](crate::agent::tree::Tree)).
 #[derive(Clone)]
 pub struct Owner {
     uid: u32,
     gid: u32,
-    /// The account's home: directories from here down are the account's.
-    home: PathBuf,
     chown: Arc<ChownFn>,
 }
 
@@ -367,29 +332,33 @@ impl std::fmt::Debug for Owner {
         f.debug_struct("Owner")
             .field("uid", &self.uid)
             .field("gid", &self.gid)
-            .field("home", &self.home)
             .finish_non_exhaustive()
     }
 }
 
 impl Owner {
-    /// Change ownership with `lchown`.
+    /// Change ownership with `fchown`.
     #[must_use]
     pub fn new(account: &AppsAccount) -> Self {
-        Self::with_chown(account, |path, uid, gid| {
-            std::os::unix::fs::lchown(path, Some(uid), Some(gid))
+        Self::with_chown(account, |fd, _, uid, gid| {
+            rustix::fs::fchown(
+                fd,
+                Some(rustix::fs::Uid::from_raw(uid)),
+                Some(rustix::fs::Gid::from_raw(gid)),
+            )
+            .map_err(io::Error::from)
         })
     }
 
-    /// Change ownership with `chown` (a fake, in tests).
+    /// Change ownership with `chown`, which gets the open file and its path
+    /// (for messages; a fake, in tests).
     pub fn with_chown<F>(account: &AppsAccount, chown: F) -> Self
     where
-        F: Fn(&Path, u32, u32) -> io::Result<()> + Send + Sync + 'static,
+        F: Fn(BorrowedFd<'_>, &Path, u32, u32) -> io::Result<()> + Send + Sync + 'static,
     {
         Self {
             uid: account.uid,
             gid: account.gid,
-            home: account.home.clone(),
             chown: Arc::new(chown),
         }
     }
@@ -407,142 +376,42 @@ impl Owner {
         Ok(Some(Self::new(&AppsAccount::require()?)))
     }
 
-    /// Create `dir` if needed, every directory from the account's home down
-    /// to it owned by the account (just `dir` itself, when it is outside
-    /// the home). A symlink on the way is refused, since the account could
-    /// have planted it to point a root write elsewhere.
+    /// Give the open file or directory `fd` (at `path`) to the account,
+    /// unless it already belongs to it.
     ///
     /// # Errors
-    /// Fails on a symlink or non-directory on the way, or when a directory
-    /// cannot be created or given away.
-    pub fn prepare_dir(&self, dir: &Path) -> Result<()> {
-        let Ok(below) = dir.strip_prefix(&self.home) else {
-            fs::create_dir_all(dir)
-                .with_context(|| format!("failed to create `{}`", dir.display()))?;
-            return self.claim_entry(dir, true);
-        };
-        // The home itself, then each component below it.
-        let mut current = self.home.clone();
-        self.make_dir(&current, 0o700)?;
-        for component in below.components() {
-            let std::path::Component::Normal(component) = component else {
-                bail!("`{}` is not a plain path below the home", dir.display());
-            };
-            current.push(component);
-            self.make_dir(&current, 0o755)?;
-        }
-        Ok(())
-    }
-
-    /// Give `path`, just written, to the account, along with the directories
-    /// between the account's home and it.
-    ///
-    /// # Errors
-    /// See [`prepare_dir`](Self::prepare_dir).
-    pub fn claim(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            self.prepare_dir(parent)?;
-        }
-        self.claim_entry(path, false)
-    }
-
-    fn make_dir(&self, dir: &Path, mode: u32) -> Result<()> {
-        match fs::symlink_metadata(dir) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match fs::DirBuilder::new().mode(mode).create(dir) {
-                    // The umask may have narrowed the mode.
-                    Ok(()) => {
-                        use std::os::unix::fs::PermissionsExt as _;
-                        fs::set_permissions(dir, fs::Permissions::from_mode(mode))?;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(error) => {
-                        return Err(error)
-                            .with_context(|| format!("failed to create `{}`", dir.display()));
-                    }
-                }
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect `{}`", dir.display()));
-            }
-        }
-        self.claim_entry(dir, true)
-    }
-
-    /// `lchown` one entry unless it already belongs to the account.
-    fn claim_entry(&self, path: &Path, directory: bool) -> Result<()> {
-        let metadata = fs::symlink_metadata(path)
+    /// Fails when `fd` cannot be inspected or given away.
+    pub fn claim(&self, fd: BorrowedFd<'_>, path: &Path) -> Result<()> {
+        let stat = rustix::fs::fstat(fd)
+            .map_err(io::Error::from)
             .with_context(|| format!("failed to inspect `{}`", path.display()))?;
-        ensure!(
-            !metadata.file_type().is_symlink(),
-            "`{}` is a symlink; refusing to write through it",
-            path.display()
-        );
-        ensure!(
-            !directory || metadata.is_dir(),
-            "`{}` is not a directory",
-            path.display()
-        );
-        if metadata.uid() != self.uid || metadata.gid() != self.gid {
-            (self.chown)(path, self.uid, self.gid)
+        if stat.st_uid != self.uid || stat.st_gid != self.gid {
+            (self.chown)(fd, path, self.uid, self.gid)
                 .with_context(|| format!("failed to give `{}` to `{APPS_USER}`", path.display()))?;
         }
         Ok(())
     }
-}
 
-/// [`write_under`], handing the file (and the directories it needed) to
-/// `owner` when there is one. The directories from the owner's home down to
-/// `base` are checked before anything is written.
-///
-/// # Errors
-/// Fails when the path is refused, or the write or ownership change fails.
-pub fn write_owned(
-    base: &Path,
-    relative: &str,
-    contents: &[u8],
-    mode: u32,
-    dry_run: bool,
-    owner: Option<&Owner>,
-) -> Result<PathBuf> {
-    let owner = owner.filter(|_| !dry_run);
-    if let Some(owner) = owner {
-        owner.prepare_dir(base)?;
-    }
-    let path = write_under(base, relative, contents, mode, dry_run)?;
-    if let Some(owner) = owner {
-        owner.claim(&path)?;
-    }
-    Ok(path)
-}
-
-/// Create `dir` and its parents (owned by `owner`, when there is one),
-/// unless `dry_run`.
-///
-/// # Errors
-/// Fails when a directory cannot be created or given away.
-pub fn create_dir_owned(dir: &Path, dry_run: bool, owner: Option<&Owner>) -> Result<()> {
-    match owner {
-        _ if dry_run => Ok(()),
-        Some(owner) => owner.prepare_dir(dir),
-        None => {
-            fs::create_dir_all(dir).with_context(|| format!("failed to create `{}`", dir.display()))
-        }
+    /// Whether a home owned by `uid` may be written to and handed to the
+    /// account: it must already be the account's, or Tetra's own (one it
+    /// just created, or that `systemd-tmpfiles` has not handed over yet).
+    /// Anyone else's directory is refused rather than given away, in case
+    /// the account database points the home somewhere it should not.
+    #[must_use]
+    pub fn may_own_home(&self, uid: u32) -> bool {
+        uid == self.uid || uid == nix::unistd::geteuid().as_raw()
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::Mutex;
-
     use super::*;
 
-    /// An owner rooted at `home` whose chown records the paths it was asked
-    /// to give away, relative to `home`.
-    pub fn recording_owner(home: &Path) -> (Owner, Arc<Mutex<Vec<String>>>) {
-        let chowned = Arc::new(Mutex::new(Vec::new()));
+    /// An owner whose chown records the paths it was asked to give away,
+    /// relative to `home`.
+    #[cfg(feature = "quadlets")]
+    pub fn recording_owner(home: &Path) -> (Owner, Arc<std::sync::Mutex<Vec<String>>>) {
+        let chowned = Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = Arc::clone(&chowned);
         let base = home.to_path_buf();
         let account = AppsAccount {
@@ -551,7 +420,7 @@ pub(crate) mod tests {
             gid: u32::MAX - 1,
             home: home.to_path_buf(),
         };
-        let owner = Owner::with_chown(&account, move |path, uid, gid| {
+        let owner = Owner::with_chown(&account, move |_, path, uid, gid| {
             assert_eq!((uid, gid), (u32::MAX - 1, u32::MAX - 1));
             let relative = path.strip_prefix(&base).unwrap_or(path);
             record
@@ -701,66 +570,5 @@ pub(crate) mod tests {
                 "systemctl start user@242.service",
             ]
         );
-    }
-
-    #[test]
-    fn owner_creates_and_gives_away_the_tree_below_the_home() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        let (owner, chowned) = recording_owner(&home);
-        let quadlets = home.join(".config/containers/systemd");
-        owner.prepare_dir(&quadlets).unwrap();
-        assert!(quadlets.is_dir());
-        assert_eq!(
-            *chowned.lock().unwrap(),
-            [
-                "",
-                ".config",
-                ".config/containers",
-                ".config/containers/systemd"
-            ]
-        );
-        let mode = |path: &Path| {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::metadata(path).unwrap().permissions().mode() & 0o777
-        };
-        assert_eq!(mode(&home), 0o700);
-        assert_eq!(mode(&quadlets), 0o755);
-
-        chowned.lock().unwrap().clear();
-        let unit = quadlets.join("app.container");
-        fs::write(&unit, "[Container]\n").unwrap();
-        owner.claim(&unit).unwrap();
-        assert!(
-            chowned
-                .lock()
-                .unwrap()
-                .ends_with(&[".config/containers/systemd/app.container".to_owned()])
-        );
-    }
-
-    #[test]
-    fn owner_refuses_symlinks_below_the_home() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        fs::create_dir_all(&home).unwrap();
-        let elsewhere = dir.path().join("etc");
-        fs::create_dir_all(&elsewhere).unwrap();
-        std::os::unix::fs::symlink(&elsewhere, home.join(".config")).unwrap();
-        let (owner, chowned) = recording_owner(&home);
-        let error = owner
-            .prepare_dir(&home.join(".config/containers/systemd"))
-            .unwrap_err();
-        assert!(error.to_string().contains("symlink"), "{error}");
-        assert!(!elsewhere.join("containers").exists());
-        assert_eq!(*chowned.lock().unwrap(), [""]);
-
-        let file = home.join("link");
-        std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
-        owner.claim(&file).unwrap_err();
-
-        check_no_symlinks(&home, &home.join(".config/containers")).unwrap_err();
-        check_no_symlinks(&home, &home.join(".local/share")).unwrap();
-        check_no_symlinks(&home, &elsewhere).unwrap();
     }
 }

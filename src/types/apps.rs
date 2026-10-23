@@ -116,11 +116,13 @@ impl AppRecipeSource {
                 let parsed = AppRecipe::load_str(&recipe)?;
                 let mut templates = BTreeMap::new();
                 for resource in parsed.resources {
-                    let path = crate::agent::module_support::resolve_under(
-                        templates_dir,
-                        &resource.template,
-                    )?;
-                    templates.insert(resource.template, std::fs::read_to_string(path)?);
+                    // Resolved without following a symlink below the
+                    // templates directory.
+                    let path =
+                        crate::agent::module_support::safe_join(templates_dir, &resource.template)?;
+                    let template =
+                        crate::agent::tree::Tree::trusted(templates_dir).read_to_string(&path)?;
+                    templates.insert(resource.template, template);
                 }
                 Ok(Self::Inline { recipe, templates })
             }
