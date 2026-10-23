@@ -220,13 +220,24 @@ export function bundleSha256(recipe: string, templates: Record<string, string>):
   the default for non-admins.
 - **`apps.get`** shows secret parameter values as `"********"`. Send the
   placeholder back unchanged on update and Tetra keeps the stored value.
+- **Services in apps scope:** `services.list`/`status` with
+  `"scope": "apps"` now default to `run_as: apps` (the account's user
+  manager); no need to send it.
+- **nginx-site recipe layout:** content is in `site/` and config in `conf/`
+  of the bundle (only `site/` is served); an `apps.update` moves existing
+  installs.
+- **Apps-scope ports:** `apps.create`/`update` in apps scope refuse a
+  `PublishPort=` host port below 1024 (rootless can't bind it); offer 1024+
+  in the UI.
 - **`network.pending`**: after a network change cuts the connection, call it
   on reconnect to get the confirmation token, then `network.confirm`.
   NetworkManager rolls the change back after 60s otherwise.
 - **Sessions:**
   - a user can have at most 32 sessions; the 33rd login ends the oldest.
-  - `users.set_password` and `users.delete` end the target's other
-    sessions.
+  - a successful `users.set_password` or `users.delete` ends **every**
+    session of that account, from any path (dashboard, remote controller,
+    CLI), including the caller's own when users change their own password:
+    send them back to login afterwards.
 - **No signatures:** commands are not signed. `module.dispatch` params take
   only `module`, `action` and `payload`, and unknown fields such as
   `signature` are refused (`bad_request`); controller-key login is gone. On
