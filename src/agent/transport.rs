@@ -60,7 +60,7 @@ mod tests {
     fn accepts_only_complete_wss_configurations() {
         let url = "wss://dashboard.example.com/tetra/agent";
         assert_eq!(config(url).wss_url().unwrap(), url);
-        for url in ["ws://127.0.0.1:7780", "vsock://host:2048", "https://x"] {
+        for url in ["ws://127.0.0.1:7780", "tcp://host:2048", "https://x"] {
             config(url).wss_url().unwrap_err();
         }
         let incomplete = TransportConfig {

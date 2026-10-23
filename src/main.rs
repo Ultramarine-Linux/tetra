@@ -1,5 +1,6 @@
 use std::{
     fs,
+    future::Future,
     io::{self, Read},
     path::PathBuf,
     sync::Arc,
@@ -44,12 +45,12 @@ use tetra::{
 /// - **Recipe rendering** (`render`) — pure local tooling that turns a YAML
 ///   recipe + Tera templates into container unit and companion files. No agent
 ///   backend, no transport.
-/// - **Agent** (`agent-serve`, `agent-dispatch`, `agent-vsock-serve`,
-///   `agent-connect`, `agent-ws-serve`) — the same dispatcher
-///   exposed through different surfaces: the local Unix socket daemon, a
-///   one-shot CLI, an outbound WSS control-plane connection, and (with the
-///   `dev-listener` feature) a vsock smoke-test listener and a development TCP
-///   WebSocket listener.
+/// - **Agent** (`agent-serve`, `agent-dispatch`, `agent-connect`,
+///   `agent-ws-serve`) — the same dispatcher exposed through different
+///   surfaces: the local Unix socket daemon, a one-shot CLI, an outbound WSS
+///   control-plane connection, and (with the `dev-listener` feature) the
+///   daemon serving its session protocol on loopback TCP instead of the
+///   socket.
 #[derive(Debug, Parser)]
 #[command(
     author,
@@ -72,15 +73,11 @@ enum Commands {
     /// Dispatch one agent command envelope from stdin locally, as root and without authorization.
     AgentDispatch(AgentDispatchCli),
 
-    /// Serve the local agent backend over a Linux virtio-vsock listener
-    /// (unauthenticated development smoke test).
-    #[cfg(feature = "dev-listener")]
-    AgentVsockServe(tetra::agent::vsock::VsockAgentConfig),
-
     /// Connect the local agent backend to an outbound WSS control plane.
     AgentConnect(AgentConnectCli),
 
-    /// Serve an authenticated WebSocket over TCP (development only).
+    /// Run the host agent daemon, serving the local session protocol on a
+    /// loopback TCP port instead of the Unix socket (development only).
     #[cfg(feature = "dev-listener")]
     AgentWsServe(AgentWsServeCli),
 
@@ -197,21 +194,12 @@ struct AgentDispatchCli {
 
 #[derive(Debug, Parser)]
 struct AgentServeCli {
-    /// Runtime config (`remote.enabled`, ...). Re-read on SIGHUP.
-    #[arg(long, env = "TETRA_CONFIG", default_value = config::DEFAULT_CONFIG_PATH)]
-    config: PathBuf,
+    #[command(flatten)]
+    daemon: DaemonArgs,
 
     /// Unix socket to bind when not started by systemd socket activation.
     #[arg(long, env = "TETRA_SOCKET", default_value = local_socket::DEFAULT_SOCKET_PATH)]
     socket: PathBuf,
-
-    /// Mutable identity directory. Defaults to /var/lib/tetra/identity.
-    #[arg(long, default_value = "/var/lib/tetra/identity")]
-    identity_dir: PathBuf,
-
-    /// Root-only state directory for credentials, grants and sessions.
-    #[arg(long, env = "TETRA_STATE_DIR", default_value = auth::service::DEFAULT_STATE_DIR)]
-    state_dir: PathBuf,
 
     /// Account whose UID identifies the dashboard on the local socket.
     #[arg(long, env = "TETRA_DASHBOARD_USER", default_value = peer::DEFAULT_DASHBOARD_USER)]
@@ -220,6 +208,22 @@ struct AgentServeCli {
     /// Account whose UID identifies the server OOBE on the local socket.
     #[arg(long, env = "TETRA_OOBE_USER", default_value = peer::DEFAULT_OOBE_USER)]
     oobe_user: String,
+}
+
+/// Options of the daemon shared by `agent-serve` and `agent-ws-serve`.
+#[derive(Debug, clap::Args)]
+struct DaemonArgs {
+    /// Runtime config (`remote.enabled`, ...). Re-read on SIGHUP.
+    #[arg(long, env = "TETRA_CONFIG", default_value = config::DEFAULT_CONFIG_PATH)]
+    config: PathBuf,
+
+    /// Mutable identity directory. Defaults to /var/lib/tetra/identity.
+    #[arg(long, default_value = "/var/lib/tetra/identity")]
+    identity_dir: PathBuf,
+
+    /// Root-only state directory for credentials, grants and sessions.
+    #[arg(long, env = "TETRA_STATE_DIR", default_value = auth::service::DEFAULT_STATE_DIR)]
+    state_dir: PathBuf,
 
     /// PAM service used to verify dashboard passwords.
     #[arg(long, default_value = tetra_pam::DEFAULT_SERVICE)]
@@ -246,32 +250,29 @@ struct AgentServeCli {
     enrollment_dir: PathBuf,
 }
 
+/// `agent-ws-serve`: the daemon on loopback TCP. TCP has no peer
+/// credentials, so every connection is taken to be `--client`.
 #[cfg(feature = "dev-listener")]
 #[derive(Debug, Parser)]
 struct AgentWsServeCli {
-    /// Loopback address for the WebSocket listener.
-    #[arg(long, default_value = "127.0.0.1:7780")]
+    #[command(flatten)]
+    daemon: DaemonArgs,
+
+    /// Loopback address to listen on. Non-loopback addresses are refused.
+    #[arg(long, default_value = tetra::agent::dev_listener::DEFAULT_LISTEN)]
     listen: std::net::SocketAddr,
 
-    /// URL-safe base64 Ed25519 public key enrolled for the dashboard controller.
-    #[arg(long, env = "TETRA_CONTROLLER_PUBLIC_KEY")]
-    controller_public_key: Option<String>,
+    /// The client every connection is treated as. Development only: any
+    /// local process that can reach the port gets this client's access.
+    #[arg(long, value_enum, default_value_t = DevClient::Dashboard)]
+    client: DevClient,
+}
 
-    /// One-time token accepted to enroll a controller while no key is stored.
-    #[arg(long, env = "TETRA_ENROLLMENT_TOKEN")]
-    enrollment_token: Option<String>,
-
-    /// Mutable identity directory. Defaults to /var/lib/tetra/identity.
-    #[arg(long, default_value = "/var/lib/tetra/identity")]
-    identity_dir: PathBuf,
-
-    /// PEM certificate for WSS. Required with --tls-key for non-loopback binds.
-    #[arg(long)]
-    tls_cert: Option<PathBuf>,
-
-    /// PEM private key for WSS. Required with --tls-cert for non-loopback binds.
-    #[arg(long)]
-    tls_key: Option<PathBuf>,
+#[cfg(feature = "dev-listener")]
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum DevClient {
+    Dashboard,
+    Oobe,
 }
 
 #[derive(Debug, Parser)]
@@ -359,11 +360,9 @@ async fn main() -> Result<()> {
         Commands::Render(cli) => render(cli),
         Commands::AgentServe(cli) => Box::pin(agent_serve(cli)).await,
         Commands::AgentDispatch(cli) => agent_dispatch(cli).await,
-        #[cfg(feature = "dev-listener")]
-        Commands::AgentVsockServe(cli) => cli.serve(),
         Commands::AgentConnect(cli) => agent_connect(cli).await,
         #[cfg(feature = "dev-listener")]
-        Commands::AgentWsServe(cli) => agent_ws_serve(cli).await,
+        Commands::AgentWsServe(cli) => Box::pin(agent_ws_serve(cli)).await,
         Commands::Enroll(cli) => {
             enrollment::run(enrollment::Options {
                 dashboard_url: cli.dashboard_url,
@@ -581,7 +580,38 @@ fn migrate_legacy_proxy_sites() {
 /// How often in-memory session activity is written to disk.
 const SESSION_FLUSH_INTERVAL: Duration = Duration::from_mins(1);
 
+/// Where the daemon serves local clients.
+enum Listener {
+    /// The Unix socket, identifying clients by their peer credentials.
+    Socket { path: PathBuf, peers: PeerPolicy },
+    /// Loopback TCP, every connection taken to be one client.
+    #[cfg(feature = "dev-listener")]
+    Tcp {
+        listener: tokio::net::TcpListener,
+        client: auth::sessions::ClientKind,
+    },
+}
+
 async fn agent_serve(cli: AgentServeCli) -> Result<()> {
+    let listener = Listener::Socket {
+        path: cli.socket,
+        peers: PeerPolicy::from_users(&cli.dashboard_user, &cli.oobe_user),
+    };
+    Box::pin(run_daemon(cli.daemon, listener)).await
+}
+
+#[cfg(feature = "dev-listener")]
+async fn agent_ws_serve(cli: AgentWsServeCli) -> Result<()> {
+    let client = match cli.client {
+        DevClient::Dashboard => auth::sessions::ClientKind::Dashboard,
+        DevClient::Oobe => auth::sessions::ClientKind::Oobe,
+    };
+    let listener = tetra::agent::dev_listener::bind(cli.listen).await?;
+    let listener = Listener::Tcp { listener, client };
+    Box::pin(run_daemon(cli.daemon, listener)).await
+}
+
+async fn run_daemon(cli: DaemonArgs, listener: Listener) -> Result<()> {
     let identity = HostIdentity::load_or_generate(&cli.identity_dir)?;
     let host_fingerprint = public_key_fingerprint(&identity.verifying_key());
     eprintln!("host identity: {}", identity.path().display());
@@ -607,12 +637,21 @@ async fn agent_serve(cli: AgentServeCli) -> Result<()> {
     let audit = auth.audit();
     let server = LocalServer {
         auth: auth.clone(),
-        peers: PeerPolicy::from_users(&cli.dashboard_user, &cli.oobe_user),
         host_fingerprint,
     };
-    let listener = local_socket::listener(&cli.socket)?;
-    peer::check_socket_group();
     apps_account::check_apps_account();
+    let serve = match listener {
+        Listener::Socket { path, peers } => {
+            let listener = local_socket::listener(&path)?;
+            peer::check_socket_group();
+            Box::pin(local_socket::serve(listener, server, peers))
+                as std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
+        }
+        #[cfg(feature = "dev-listener")]
+        Listener::Tcp { listener, client } => {
+            Box::pin(tetra::agent::dev_listener::serve(listener, server, client))
+        }
+    };
 
     let enrollment_dir = cli.enrollment_dir;
     let select = move |config: &RuntimeConfig| remote::connection_from(config, &enrollment_dir);
@@ -621,7 +660,7 @@ async fn agent_serve(cli: AgentServeCli) -> Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to install the SIGTERM handler")?;
     let result = tokio::select! {
-        result = local_socket::serve(listener, server) => result,
+        result = serve => result,
         () = remote::supervise(settings, queue, audit) => Ok(()),
         result = remote::reload_on_hangup(cli.config, sender, select) => result,
         () = auth.flush_sessions_every(SESSION_FLUSH_INTERVAL) => Ok(()),
@@ -630,33 +669,6 @@ async fn agent_serve(cli: AgentServeCli) -> Result<()> {
     };
     auth.flush_sessions()?;
     result
-}
-
-#[cfg(feature = "dev-listener")]
-async fn agent_ws_serve(
-    AgentWsServeCli {
-        listen,
-        controller_public_key,
-        enrollment_token,
-        identity_dir,
-        tls_cert,
-        tls_key,
-    }: AgentWsServeCli,
-) -> Result<()> {
-    anyhow::ensure!(
-        tls_cert.as_ref().xor(tls_key.as_ref()).is_none(),
-        "--tls-cert and --tls-key must be supplied together"
-    );
-    tetra::agent::dev_listener::WebSocketServerConfig::serve(
-        tetra::agent::dev_listener::WebSocketServerConfig {
-            listen,
-            controller_public_key,
-            enrollment_token,
-            identity_dir,
-            tls_cert_key_path: tls_cert.zip(tls_key),
-        },
-    )
-    .await
 }
 
 async fn agent_connect(cli: AgentConnectCli) -> Result<()> {

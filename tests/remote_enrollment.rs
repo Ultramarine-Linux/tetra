@@ -566,8 +566,6 @@ impl Host {
             .arg("--public-dir")
             .arg(self.root.path().join("public"))
             .env("LISTEN_FDS", "1")
-            .env_remove("TETRA_CONTROLLER_PUBLIC_KEY")
-            .env_remove("TETRA_ENROLLMENT_TOKEN")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         // SAFETY: the closure runs in the forked child before exec and only

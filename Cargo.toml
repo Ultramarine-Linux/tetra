@@ -46,16 +46,16 @@ quadlets = []
 reverse-proxy = []
 users = []
 virtual-machines = []
-# Development-only TCP listener (`agent-ws-serve`). Release builds leave this
-# off so the binary cannot listen on the network.
-dev-listener = ["dep:tokio-rustls"]
+# Development-only loopback TCP listener (`agent-ws-serve`). Release builds
+# leave this off so the binary cannot listen on the network.
+dev-listener = []
 
 
 [dependencies]
 anyhow = "1"
 base64 = "0.23"
 clap = { version = "4.5", features = ["derive", "env"] }
-ed25519-dalek = { version = "3.0", features = ["rand_core"] }
+ed25519-dalek = "3.0"
 futures-util = { version = "0.3", default-features = false, features = [
     "sink",
     "std",
@@ -79,7 +79,6 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
-tokio-rustls = { version = "0.26", optional = true }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 rustls = "0.23"
 itertools = "0.15.0"
@@ -103,6 +102,7 @@ tetra = { path = ".", default-features = false, features = ["testing"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 tempfile = "3"
 time = "0.3"
+# The in-process mTLS controller fixture in `tests/remote_enrollment.rs`.
 tokio-rustls = "0.26"
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
 

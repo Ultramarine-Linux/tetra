@@ -1,32 +1,25 @@
 # Remote Enrollment: Controller Changes
 
-`tetra enroll` now enrolls a host for **outbound** remote control only. The
-host no longer registers an inbound `wss://host:7780` address, no longer writes
-`TETRA_LISTEN`, and no longer sends a self-signed server certificate. Instead it
-sends a certificate signing request (CSR), and the controller returns a client
-certificate that the host presents over mTLS when it dials out.
+`tetra enroll` obtains mTLS credentials for an **outbound** control-plane
+connection only. It does not register or enable an inbound listener:
+production local clients use the Unix socket, while the optional
+`agent-ws-serve` listener is a development-only loopback server for the same
+Tetra session protocol ([auth-protocol.md](auth-protocol.md)). That command
+uses `--client dashboard|oobe`
+(default `dashboard`) because TCP has no peer credentials; it is unrelated to
+this device flow.
 
 This document describes what the controller (the service behind
-`--dashboard-url`) has to change to match. Nothing here has been implemented
-on the controller side yet.
+`--dashboard-url`) has to implement to match outbound enrollment. Nothing here
+has been implemented on the controller side yet.
 
-## Summary of changes
+## Summary
 
-| Area                       | Before                                          | Now                                                                  |
-| -------------------------- | ----------------------------------------------- | -------------------------------------------------------------------- |
-| Create request             | `agent_url`, `host_public_key`, `tls_ca_certificate` | `enrollment_version: 2`, `csr`                                       |
-| Approval response          | `controller_public_key`                         | `host_id`, `control_plane_url`, `client_certificate`, `server_ca_certificate` |
-| Who connects               | Controller dials `agent_url`                    | Host dials `control_plane_url`                                       |
-| Host transport identity    | Self-signed server certificate                  | Client certificate signed by the controller's client CA (`clientAuth`) |
-| Controller identity on host | Ed25519 controller key written into the local-socket key file | Server CA bundle stored in the enrollment directory                   |
-
-The old flow also wrote the controller's Ed25519 public key into
-`/var/lib/tetra/identity/controller-ed25519-public.key`. That was the file the
-local Unix socket then used to authenticate the local dashboard, so remote
-enrollment was overwriting the local dashboard's key. (The local socket now
-uses session tokens, and only the development TCP listener reads that file.)
-The new flow does not touch it, and the controller should stop returning
-`controller_public_key`. Tetra ignores it if present.
+- The host submits a CSR with `enrollment_version: 2` and a display name.
+- The controller approves the request and returns a stable `host_id`, a
+  `wss://` endpoint, a client certificate, and the server CA bundle.
+- The host stores that material under `/var/lib/tetra/remote` and connects to
+  the control plane over mTLS; no inbound network address is involved.
 
 ## Endpoints
 
@@ -47,9 +40,7 @@ Request:
 }
 ```
 
-- `enrollment_version`: `2` for this flow. A controller that supports both
-  flows can switch on this field. Requests without it come from older Tetra
-  builds and carry `agent_url` instead of `csr`.
+- `enrollment_version`: `2`, identifying the CSR-based enrollment flow.
 - `csr`: PEM PKCS#10 request. The key is ECDSA P-256. The request asks for
   key usage `digitalSignature` and extended key usage `clientAuth` only. The
   subject CN is the host name, for display only.

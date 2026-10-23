@@ -1,16 +1,8 @@
 # Tetra Agent Protocol
 
-This document describes the JSON protocol used between an outside
-dashboard/controller and the Tetra host agent.
-
-The local CLI command `tetra agent-dispatch` accepts the same command envelope
-that the transports carry.
-
-For host-to-guest virtio-vsock smoke testing, `tetra agent-vsock-serve` runs a
-Linux-only guest listener that accepts one raw `AgentCommand` JSON object per
-connection and replies with one raw `AgentResponse` JSON object. It is only
-built with the `dev-listener` feature and is a development harness for testing
-the VM vsock path from the host, not a production transport.
+This document describes the JSON command envelope used by the Tetra host
+agent. The local CLI command `tetra agent-dispatch` accepts the same envelope
+that module transports carry.
 
 ## Connection Negotiation
 
@@ -20,6 +12,23 @@ session protocol described in [auth-protocol.md](auth-protocol.md): users log
 in through Tetra and each request carries a session token. Module commands are
 sent with the `module.dispatch` operation using the envelope documented below.
 Production installs do not listen on the network.
+
+For local development, `agent-ws-serve` (built with `--features dev-listener`)
+serves the same WebSocket session protocol on loopback TCP. Build it and run
+with the same privileges and PAM setup as the daemon (usually root):
+
+```sh
+cargo build --features dev-listener
+sudo target/debug/tetra agent-ws-serve \
+  --listen 127.0.0.1:7780 --client dashboard
+```
+
+`--listen` refuses non-loopback addresses. TCP has no peer credentials, so
+`--client dashboard|oobe` (default `dashboard`) is applied to every
+connection; any local process can claim that client. The listener uses the
+same Tetra-issued session tokens and `AuthService` as the Unix socket.
+It is development-only and has no TLS. See
+[auth-protocol.md](auth-protocol.md#development-tcp-listener).
 
 An outbound connection to a remote control plane is optional and ships
 disabled. It runs only while `remote.enabled` is `true` in
@@ -42,7 +51,7 @@ Transport configuration:
 Fields (all required):
 
 - `control_plane_url`: Endpoint the agent connects to. Must be `wss://`;
-  any other scheme (`ws://`, `vsock://`, `https://`) is refused.
+  any other scheme is refused.
 - `client_cert_path`: Agent client certificate for mTLS.
 - `client_key_path`: Private key for the client certificate.
 - `server_ca_path`: CA bundle used to verify the dashboard/control-plane server
@@ -129,27 +138,6 @@ Response frame:
   }
 }
 ```
-
-### Host-to-Guest Vsock Smoke Test
-
-Inside the VM guest, with a build that has the `dev-listener` feature (the
-listener is unauthenticated, so release builds leave it out):
-
-```sh
-tetra agent-vsock-serve --port 2048
-```
-
-From the VM host, connect to the guest CID:
-
-```sh
-printf '%s' '{"id":"cmd-1","module":"settings","action":"get_system","payload":{}}' \
-  | socat - VSOCK-CONNECT:GUEST_CID:2048
-```
-
-The smoke-test listener accepts the command envelope directly, without the
-outer `{ "type": "command" }` transport frame, so it matches `agent-dispatch`.
-It is unauthenticated and dispatches straight to the modules, without the
-authorization or action log of the other transports.
 
 Heartbeat frame:
 

@@ -5,8 +5,7 @@
 //! listen on the network. Each connection is identified by its peer
 //! credentials ([`super::peer`]) and then speaks the session protocol in
 //! [`super::local_protocol`]: every request carries a Tetra-issued session
-//! token. The controller-key login of `websocket_server` is not
-//! accepted here; it remains only on the development TCP listener.
+//! token.
 //!
 //! The socket is normally created by systemd (`tetra.socket`) as
 //! `root:tetra 0660`, and handed over through socket activation. When Tetra is
@@ -15,7 +14,7 @@
 use std::{
     env,
     fs::{self, Permissions},
-    io::ErrorKind,
+    io::{self, ErrorKind},
     os::{
         fd::{FromRawFd, OwnedFd},
         unix::fs::{FileTypeExt, PermissionsExt},
@@ -29,7 +28,7 @@ use std::sync::Arc;
 
 use tokio::net::UnixListener;
 
-use super::local_protocol::LocalServer;
+use super::{local_protocol::LocalServer, peer::PeerPolicy};
 
 /// Default socket path. Matches `ListenStream=` in `systemd/tetra.socket`.
 pub const DEFAULT_SOCKET_PATH: &str = "/run/tetra/tetra.sock";
@@ -38,8 +37,10 @@ pub const DEFAULT_SOCKET_PATH: &str = "/run/tetra/tetra.sock";
 const LISTEN_FDS_START: i32 = 3;
 /// Mode for a socket Tetra binds itself: owner and group only.
 const SOCKET_MODE: u32 = 0o660;
-/// Most local connections open at once.
-const MAX_CONNECTIONS: usize = 64;
+/// Most local connections open at once. Bounds the tasks (and descriptors)
+/// any number of idle or stuck clients can pin; the dashboard and the OOBE
+/// need a handful.
+pub(crate) const MAX_CONNECTIONS: usize = 64;
 
 /// Return the systemd-activated listener if one was passed to this process,
 /// otherwise bind `path`.
@@ -124,32 +125,32 @@ fn bind(path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-/// Accept local clients forever, running the session protocol on each
-/// connection.
-pub async fn serve(listener: UnixListener, server: LocalServer) -> Result<()> {
-    // Bounds the tasks (and descriptors) any number of idle or stuck clients
-    // can pin; the dashboard and the OOBE need a handful.
+/// Whether a failed `accept()` is transient. Running out of descriptors or
+/// memory, or a client giving up mid-handshake, must not take the whole
+/// daemon (and the remote session) down.
+pub(crate) fn transient_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOBUFS
+                | libc::ENOMEM
+                | libc::ECONNABORTED
+                | libc::EINTR
+                | libc::EPROTO
+        )
+    )
+}
+
+/// Accept local clients forever, identifying each by its peer credentials
+/// under `peers` and running the session protocol on the connection.
+pub async fn serve(listener: UnixListener, server: LocalServer, peers: PeerPolicy) -> Result<()> {
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
-            // Running out of descriptors or memory, or a client giving up
-            // mid-handshake, is transient: it must not take the whole daemon
-            // (and the remote session) down.
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(
-                        libc::EMFILE
-                            | libc::ENFILE
-                            | libc::ENOBUFS
-                            | libc::ENOMEM
-                            | libc::ECONNABORTED
-                            | libc::EINTR
-                            | libc::EPROTO
-                    )
-                ) =>
-            {
+            Err(error) if transient_accept_error(&error) => {
                 eprintln!("failed to accept local client: {error}");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
@@ -171,10 +172,11 @@ pub async fn serve(listener: UnixListener, server: LocalServer) -> Result<()> {
             },
         );
         let server = server.clone();
+        let peers = peers.clone();
         tokio::spawn(async move {
-            server
-                .handle(stream, cred.map(|cred| cred.uid()), peer)
-                .await;
+            // Resolves account names, so off the accept loop.
+            let client = cred.and_then(|cred| peers.classify(cred.uid()));
+            server.handle(stream, client, peer).await;
             drop(permit);
         });
     }
@@ -206,13 +208,13 @@ mod tests {
         let path = dir.join("tetra.sock");
         let server = LocalServer {
             auth: host.service.clone(),
-            peers: PeerPolicy {
-                dashboard: PeerMatch::Uid(dashboard),
-                oobe: PeerMatch::Uid(u32::MAX),
-            },
             host_fingerprint: "fingerprint".into(),
         };
-        tokio::spawn(serve(bind(&path).unwrap(), server));
+        let peers = PeerPolicy {
+            dashboard: PeerMatch::Uid(dashboard),
+            oobe: PeerMatch::Uid(u32::MAX),
+        };
+        tokio::spawn(serve(bind(&path).unwrap(), server, peers));
         (path, host)
     }
 

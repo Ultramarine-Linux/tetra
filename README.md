@@ -19,11 +19,12 @@ TOTP, or a passkey, and every request carries a Tetra-issued session token. See
 An outbound mTLS WSS connection (`wss://` only) to a remote control plane also
 exists. It is off unless `remote.enabled` is set in `/etc/tetra/tetra.json`.
 
-For development, `agent-ws-serve` runs the older controller-key WebSocket
-protocol (Ed25519-signed command frames) on a TCP listener, and
-`agent-vsock-serve` is an unauthenticated virtio-vsock smoke test for VM
-guests. Both are only compiled with the `dev-listener` feature, so release
-builds cannot listen on the network.
+For development, `agent-ws-serve` (the `dev-listener` feature) serves the
+same Tetra session protocol as the Unix socket over loopback TCP. TCP has no
+peer credentials, so `--client dashboard|oobe` (default `dashboard`) applies
+to every connection; any local process can claim that client identity, but
+still needs a valid Tetra session. It is dev-only and refuses non-loopback
+binds. See [the session protocol](docs/auth-protocol.md#development-tcp-listener).
 
 The local `agent-dispatch` command accepts the same command envelope shape for
 one-shot debugging. See [docs/agent-protocol.md](docs/agent-protocol.md) for
@@ -41,7 +42,7 @@ to render.
 - [Recipe authoring guide](docs/recipes.md) — How to write recipes, parameters, templates, and resources.
 - [Architecture overview](docs/architecture.md) — Crate layout, dispatcher, queue, transports, and how to add a module.
 - [Remote enrollment](docs/remote-enrollment.md) — The controller side of `tetra enroll` and the outbound mTLS connection.
-- [Troubleshooting](docs/troubleshooting.md) — Common issues with TLS, identity, WebSocket auth, recipe rendering, SELinux, and queue backpressure.
+- [Troubleshooting](docs/troubleshooting.md) — Common issues with TLS, identity, the development listener, recipe rendering, SELinux, and queue backpressure.
 
 ## Feature Flags
 
@@ -67,8 +68,8 @@ Default build features:
 Additional optional features:
 
 - `virtual-machines`
-- `dev-listener`: the development listeners (`agent-ws-serve` on TCP and
-  `agent-vsock-serve` on vsock). Leave it off in release builds.
+- `dev-listener`: the development-only loopback TCP session listener
+  (`agent-ws-serve`). Leave it off in release builds.
 - `testing`: exposes `tetra::auth::testing` (fake PAM, accounts, sealer and
   host) for integration tests.
 
@@ -157,27 +158,30 @@ cargo run -- agent-serve \
 Clients open a WebSocket over the Unix stream; the HTTP `Host` and path are
 ignored. With Node's `ws`, use `ws+unix:///run/tetra/tetra.sock`.
 
-### Inbound WebSocket server (development)
+### Loopback session server (development)
 
-`agent-ws-serve` runs an authenticated WebSocket on TCP. It is only built
-with the `dev-listener` feature (add `--features dev-listener` to the commands
-below). It requires an enrolled controller Ed25519 public key before accepting commands.
-The host identity is automatically generated under `/var/lib/tetra/identity`:
-
-```sh
-cargo run --features dev-listener -- agent-ws-serve \
-  --listen 127.0.0.1:7780 \
-  --controller-public-key "$TETRA_CONTROLLER_PUBLIC_KEY"
-```
-
-For non-loopback addresses, TLS is required:
+`agent-ws-serve` runs the host daemon on loopback TCP instead of the Unix
+socket. It is only built with `dev-listener`; it uses the same `AuthService`,
+PAM/TOTP or passkey login, session tokens, grants, and action log as
+`agent-serve`. On a server, this normally means running it as root; the
+example uses scratch state so it does not reuse the host's login database:
 
 ```sh
-cargo run --features dev-listener -- agent-ws-serve \
-  --listen 0.0.0.0:7780 \
-  --tls-cert /etc/tetra/tetra.crt \
-  --tls-key /etc/tetra/tetra.key
+cargo build --features dev-listener
+sudo target/debug/tetra agent-ws-serve \
+  --listen 127.0.0.1:7780 --client dashboard \
+  --identity-dir /tmp/tetra-identity --state-dir /tmp/tetra-state
 ```
+
+`--client` accepts `dashboard` or `oobe` and defaults to `dashboard`. Since
+TCP has no peer credentials, the selected client is applied to every
+connection; any local process that reaches the port gets that client identity,
+but every request still needs a valid Tetra session. `--listen` rejects
+non-loopback addresses. TLS is omitted because this
+loopback-only development endpoint is not a remote transport and cannot replace
+the process credentials of the Unix socket. Use the Unix socket in production.
+See [docs/auth-protocol.md](docs/auth-protocol.md#development-tcp-listener)
+for connection and frame details.
 
 ### Outbound WSS control plane (remote control)
 
@@ -226,28 +230,6 @@ cargo run -- agent-connect --runtime-config examples/tetra.json
 cargo run -- agent-connect --config examples/transport.json --host-id myhost \
   --runtime-config examples/tetra.json
 ```
-
-### Vsock smoke test
-
-For a VM guest with virtio-vsock enabled, run Tetra as a small test listener
-inside the guest. It is only built with the `dev-listener` feature:
-
-```sh
-cargo run --features dev-listener -- agent-vsock-serve --port 2048
-```
-
-From the VM host, connect to the guest CID and send one command JSON object.
-For libvirt guests, find the CID with `virsh dumpxml VM_NAME | grep -A4 -i vsock`.
-
-```sh
-printf '%s' '{"id":"cmd-1","module":"settings","action":"get_system","payload":{}}' \
-  | socat - VSOCK-CONNECT:GUEST_CID:2048
-```
-
-The listener reads one command per connection and writes one `AgentResponse`
-JSON object. It does no authentication or authorization, so it is a
-development smoke test for host-to-guest command dispatch over vsock, not a
-production transport.
 
 ## Systemd
 
@@ -378,7 +360,8 @@ every request; Tetra authorizes each action from the user's admin status
 transport identity, with the client certificate issued by `tetra enroll`; its
 commands run with full rights, always as root, and are recorded as remote
 actions. Commands are not signed on either production transport. The
-development TCP listener still uses Ed25519 controller-key authentication.
+development TCP listener uses the same Tetra-issued session protocol as the
+Unix socket.
 
 Console recovery: `sudo tetra auth reset-2fa <user>` removes a user's TOTP and
 recovery codes, and `sudo tetra setup code` prints the first-boot setup code. On a host that

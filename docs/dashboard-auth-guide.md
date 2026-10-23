@@ -256,15 +256,10 @@ who sends one gets `forbidden`, so leave them out of forms for everyone else.
 `apps.get` shows secret parameter values as `"********"`; sending that value
 back in `apps.update` keeps the stored secret.
 
-The old flow is gone:
-
-- Ed25519 controller keys and signed commands on the local socket,
-- `elevation_request` and the 30-minute password elevation,
-- the `user` field in `authenticate`.
-
-Privileged actions are now authorized per request from the user's admin
-status and grants. Web shell `sudo` still asks for the system password
-separately.
+The Unix socket and the loopback-only development TCP listener use the same
+Tetra-issued session tokens and per-request authorization. Privileged actions
+are authorized from the user's admin status and grants. Web shell `sudo` still
+asks for the system password separately.
 
 ## 10. OOBE flow
 

@@ -4,8 +4,9 @@
 //! The crate is organized into two top-level modules:
 //!
 //! - [`agent`]: the dispatcher, its feature-gated modules, and the transports
-//!   (vsock, WSS) that expose the same command-envelope protocol to the
-//!   dashboard or control plane.
+//!   (local Unix socket, development loopback TCP, and outbound WSS) that
+//!   expose the same command-envelope protocol to local clients or the control
+//!   plane.
 //! - [`catalog`]: the recipe engine that renders YAML recipes into Quadlet and
 //!   companion files using Tera templates.
 //!

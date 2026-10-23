@@ -45,7 +45,7 @@ pub struct ClientFiles {
 
 impl ClientFiles {
     /// The client files `transport` uses, or `None` when it has no client
-    /// certificate (vsock, or an incomplete config).
+    /// certificate (an incomplete config).
     #[must_use]
     pub fn from_transport(transport: &TransportConfig) -> Option<Self> {
         Some(Self {

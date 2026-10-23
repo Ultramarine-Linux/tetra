@@ -1,8 +1,11 @@
-//! The session protocol local clients speak over the Unix socket.
+//! The session protocol local clients speak over the Unix socket and the
+//! development loopback TCP listener.
 //!
-//! The dashboard and the OOBE send JSON frames over a WebSocket, as before,
-//! but every request carries a Tetra-issued session token instead of being
-//! signed with a controller key. Documented in `docs/auth-protocol.md`.
+//! The dashboard and the OOBE send JSON frames over a WebSocket, and every
+//! request carries a Tetra-issued session token. Documented in
+//! `docs/auth-protocol.md`. The transport decides which client a connection
+//! is: the Unix socket from its peer credentials ([`super::peer`]), the
+//! development TCP listener from its `--client` flag.
 //!
 //! Tetra sends `hello` first. The client then sends `request` frames and gets
 //! one `response` per request, matched by `id`. Requests run concurrently, so
@@ -29,8 +32,6 @@ use crate::auth::{
     api::{ApiError, ErrorCode, PROTOCOL_VERSION, Request, Response},
     sessions::ClientKind,
 };
-
-use super::peer::PeerPolicy;
 
 /// Largest WebSocket message or frame a client may send (file writes
 /// included). Tungstenite's default is 64 MiB, per in-flight request.
@@ -76,18 +77,17 @@ pub enum ClientFrame {
 #[derive(Clone)]
 pub struct LocalServer {
     pub auth: AuthService,
-    pub peers: PeerPolicy,
     pub host_fingerprint: String,
 }
 
 impl LocalServer {
-    /// Serve one connection from a peer with `uid` until it disconnects.
-    /// Errors are logged, not returned.
-    pub async fn handle<S>(self, stream: S, uid: Option<u32>, peer: String)
+    /// Serve one connection from `client` until it disconnects. `None` is a
+    /// peer that is neither the dashboard nor the OOBE: it gets an `error`
+    /// frame and is closed. Errors are logged, not returned.
+    pub async fn handle<S>(self, stream: S, client: Option<ClientKind>, peer: String)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let client = uid.and_then(|uid| self.peers.classify(uid));
         if let Err(error) = self.run(stream, client).await {
             eprintln!("local peer {peer} closed with error: {error:#}");
         }

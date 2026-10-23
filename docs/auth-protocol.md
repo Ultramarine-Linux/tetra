@@ -4,7 +4,9 @@ This is the API local clients (the dashboard and the server OOBE) use on
 `/run/tetra/tetra.sock`. Tetra is the only authority for login and
 authorization: it verifies passwords, TOTP codes and passkeys, issues session
 tokens, and checks every request against the caller's role and grants. Local
-clients only hold Tetra-issued tokens.
+clients only hold Tetra-issued tokens. The development-only `agent-ws-serve`
+listener serves this same protocol on loopback TCP; it does not introduce a
+second authentication system.
 
 For how the dashboard should drive these operations, see
 [dashboard-auth-guide.md](dashboard-auth-guide.md). Module actions themselves
@@ -42,10 +44,25 @@ Protocol version: `2026-10-session-v1`.
 }
 ```
 
-The controller-key login (Ed25519 challenge, signed commands) is **not**
-accepted on the local socket. It remains only on the development TCP listener
-(`agent-ws-serve`, `dev-listener` feature). Remote controllers use the outbound
-mTLS connection, which is unchanged.
+## Development TCP listener
+
+Build with `--features dev-listener`, then run `tetra agent-ws-serve` to serve
+the same session protocol over WebSocket on loopback TCP. Use the same
+privileges and PAM setup as the daemon (usually root):
+
+```sh
+cargo build --features dev-listener
+sudo target/debug/tetra agent-ws-serve \
+  --listen 127.0.0.1:7780 --client dashboard
+```
+
+`--listen` rejects non-loopback addresses. TCP has no peer credentials, so
+`--client dashboard|oobe` (default `dashboard`) is applied to every connection;
+any local process that can connect is treated as that client. Every request
+still uses the session tokens and authorization described below. The listener
+is development-only, has no TLS, and must not be exposed to other hosts. Use
+the Unix socket in production. Remote controllers use the outbound mTLS
+connection, not this local session protocol.
 
 ## Frames
 

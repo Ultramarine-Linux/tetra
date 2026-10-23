@@ -53,12 +53,7 @@ tetra/
 │       ├── peer.rs             # SO_PEERCRED client identification
 │       ├── transport.rs        # Outbound endpoint/TLS configuration (wss:// only)
 │       ├── websocket.rs        # Outbound WSS control-plane client
-│       ├── protocol.rs         # Signed frame protocol          ┐
-│       ├── crypto.rs           # Ed25519 signing/verification  │
-│       ├── verify_password.rs  # Shadow password verification  │ `dev-listener`
-│       ├── websocket_server.rs # Controller-key WebSocket      │ feature only
-│       ├── dev_listener.rs     # Dev-only TCP listener         │
-│       ├── vsock.rs            # Virtio-vsock smoke test       ┘
+│       ├── dev_listener.rs     # Dev-only loopback TCP listener
 │       ├── module_support.rs   # Shared module helpers
 │       ├── modules.rs          # Mod trait, actions! macro, module registry
 │       └── modules/            # One module per host-management surface
@@ -331,25 +326,24 @@ Key files:
 - `transport.rs` — `control_plane_url` and the client cert/key/CA paths.
 - `enrollment/renewal.rs` — renews the client certificate over the session.
 
-### Development transports (`dev-listener` feature)
+### Development transport (`dev-listener` feature)
 
-`protocol.rs`, `crypto.rs`, `verify_password.rs`, `websocket_server.rs`,
-`dev_listener.rs` and `vsock.rs` are only compiled with the `dev-listener`
-Cargo feature. Release builds leave it off, so production binaries cannot
-listen on the network.
+`dev_listener.rs` is only compiled with the `dev-listener` Cargo feature.
+Release builds leave it off, so production binaries cannot listen on the
+network.
 
-**Inbound WebSocket (`agent-ws-serve`).** An authenticated WebSocket listener
-that accepts Ed25519-signed command frames from a controller client. Requires
-an explicitly configured controller public key before accepting commands.
-
-- Loopback `ws://` is allowed without TLS.
-- Non-loopback addresses require `--tls-cert` and `--tls-key`.
-- `dev_listener.rs` — TCP bind, optional TLS, loopback-or-TLS check.
-- `websocket_server.rs` — challenge/auth handshake and session management.
-
-**Vsock (`agent-vsock-serve`).** VM guest smoke-test listener over
-virtio-vsock. One raw command per connection, unauthenticated, dispatched on
-its own thread straight to a `Dispatcher` (not through the queue).
+**Loopback WebSocket (`agent-ws-serve`).** Runs the daemon and serves the same
+`LocalServer` session protocol and `AuthService` as the Unix socket, over TCP
+for dashboard or OOBE development. Every request still needs a Tetra-issued
+session token and goes through the normal authorization and action log. TCP
+has no peer credentials, so `--client dashboard|oobe` (default `dashboard`)
+is applied to every connection. Any process on the host can connect and claim
+that configured client; use it only for development. `--listen` refuses every
+non-loopback address. TLS is intentionally omitted: this listener is for
+loopback-only development; plain TLS would not identify the local process,
+while mutual TLS would require a separate client-credential setup. It does not
+make the dev listener suitable for remote access. Production uses
+`SO_PEERCRED` on the Unix socket.
 
 ### Local dispatch (`agent-dispatch`)
 
@@ -357,7 +351,7 @@ One-shot CLI that reads a JSON command envelope from a file (or stdin) and
 routes it through `Dispatcher::full()`. No authorization; useful for debugging
 and integration testing.
 
-## Authentication and elevation
+## Authentication and authorization
 
 ### Local clients
 
@@ -397,9 +391,10 @@ services. There is no per-user scope.
   commands are authorized as the remote controller, which may run every
   action, and logged as remote actions. The `user` field of a remote command
   is cleared, so every remote action runs as root.
-- The development TCP listener uses Ed25519 challenge-response with
-  signed commands (session id, sequence, timestamp, nonce; five-minute skew;
-  bounded replay cache) and the old password elevation.
+- The development TCP listener uses the same token-based session protocol as
+  the Unix socket, including PAM/TOTP or passkeys, per-request authorization,
+  and session-bound user execution. It is loopback-only and is not a production
+  transport.
 
 ## Data paths
 
@@ -407,7 +402,7 @@ Default mutable paths (bootc-friendly):
 
 | Path                       | Purpose                                     |
 | -------------------------- | ------------------------------------------- |
-| `/var/lib/tetra/identity/` | Host Ed25519 keypair (and the dev listener's controller key). |
+| `/var/lib/tetra/identity/` | Host Ed25519 keypair, used for the host fingerprint in `hello`. |
 | `/var/lib/tetra/auth/`     | Login state: sealed store key, per-user credentials, grants, sessions, setup code (root-only). |
 | `/var/lib/tetra/access.json`, `launcher.json`, `updates.json`, `setup-complete`, `audit/` | Access mode, launcher, update policy, setup marker, action log. |
 | `/var/lib/tetra/secrets/`  | Credentials for other services, sealed with `systemd-creds`. |

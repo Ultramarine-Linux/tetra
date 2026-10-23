@@ -63,8 +63,8 @@ old inbound flow:
 - `/etc/tetra/tetra.key`
 - `/etc/tetra/tetra.crt`
 
-Tetra no longer reads any of them (unless you pass the key and certificate to
-the development `agent-ws-serve` listener yourself); the current enrollment
+Tetra no longer reads these inbound enrollment files, and the development
+`agent-ws-serve` listener does not use them. The current outbound enrollment
 lives in `/var/lib/tetra/remote`. They can be deleted:
 
 ```sh
@@ -79,21 +79,16 @@ remotely controlled.
 ### `unrecognized subcommand 'agent-ws-serve'`
 
 The TCP listener is development-only and is compiled only with the
-`dev-listener` feature. Build with `cargo run --features dev-listener -- ...`.
+`dev-listener` feature. Build with `cargo build --features dev-listener`.
 Release builds intentionally leave it out; local clients use the Unix socket
 at `/run/tetra/tetra.sock`.
 
 ### `agent-ws-serve` refuses to bind to a non-loopback address
 
-Non-loopback addresses require TLS. Provide both `--tls-cert` and `--tls-key`:
-
-```sh
-cargo run --features dev-listener -- agent-ws-serve \
-  --listen 0.0.0.0:7780 \
-  --tls-cert /etc/tetra/tetra.crt \
-  --tls-key /etc/tetra/tetra.key \
-  --controller-public-key "$TETRA_CONTROLLER_PUBLIC_KEY"
-```
+That is intentional: the development listener always refuses non-loopback
+binds, even if a TLS certificate is available. Use `127.0.0.1:7780` (the
+default) or `[::1]:7780`. It is not a remote transport; production clients use
+the Unix socket and outbound remote control uses mTLS WSS.
 
 ### Host identity is not generated
 
@@ -110,38 +105,28 @@ sudo chmod 0700 /var/lib/tetra
 `--identity-dir` (on `agent-serve` and `agent-ws-serve`) overrides the default
 path. The `TETRA_IDENTITY_DIR` environment variable is not read.
 
-## WebSocket authentication (development listener)
+## Development TCP listener
 
-These only apply to `agent-ws-serve` (`dev-listener` feature). The local socket
-uses session tokens ([auth-protocol.md](auth-protocol.md)) and the outbound
-session uses mTLS.
+These notes apply only to `agent-ws-serve` built with `--features
+dev-listener`. It runs the same session protocol and `AuthService` as the Unix
+socket, including per-request authorization.
 
-### Inbound connections fail with "missing controller public key"
+### A connection is treated as the wrong client
 
-`agent-ws-serve` requires an enrolled controller Ed25519 public key before it
-will accept commands. Pass it on startup:
+TCP has no peer credentials, so the `--client` option is applied to every
+connection. It accepts `dashboard` or `oobe`, and defaults to `dashboard`.
+Restart with `--client oobe` to exercise the OOBE flow. This is not an
+identity check: any local process that reaches the port gets the configured
+client identity, which is why the listener must remain loopback-only and
+unshipped.
 
-```sh
-cargo run --features dev-listener -- agent-ws-serve \
-  --listen 127.0.0.1:7780 \
-  --controller-public-key "$TETRA_CONTROLLER_PUBLIC_KEY"
-```
+### `auth.password` fails on the development listener
 
-### Commands are rejected with "stale timestamp" or "duplicate nonce"
-
-The authenticated WebSocket protocol enforces:
-- Timestamp skew ≤ 5 minutes.
-- Nonce replay protection per session.
-
-Ensure the host and dashboard clocks are synchronized (e.g. NTP). If testing
-across VMs, check that guest time is correct.
-
-### Elevation grant expires too quickly
-
-Password elevation only exists on `agent-ws-serve`. A grant lasts 30 minutes;
-the duration is fixed. It is cleared when the session disconnects or Tetra
-restarts. On the local socket there is no elevation: privileged actions are
-authorized per request from the user's admin status and grants.
+The development listener uses the same PAM service as `agent-serve` (by
+default `ultramarine-dashboard`), account eligibility rules, rate limits,
+TOTP/passkey setup, and session state. Configure the host's PAM stack and run
+Tetra with the same privileges and state directory as the daemon. Successful
+login returns a Tetra session token; send that token on every later request.
 
 ## Recipe rendering
 
@@ -242,27 +227,6 @@ The queue worker sends the response through a oneshot channel. If the caller
 times out or disconnects before receiving the response, the command still ran.
 Use command IDs for idempotency and reconciliation rather than relying solely on
  the transport response.
-
-## Vsock development
-
-### `agent-vsock-serve` does not respond
-
-Ensure the VM guest has virtio-vsock enabled and that you are connecting to the
-correct CID and port:
-
-```sh
-# Find the guest CID (host-side)
-virsh dumpxml VM_NAME | grep -A4 -i vsock
-
-# Send a command
-printf '%s' '{"id":"cmd-1","module":"settings","action":"get_system","payload":{}}' \
-  | socat - VSOCK-CONNECT:GUEST_CID:2048
-```
-
-The vsock listener reads one command per connection and writes one JSON response.
-It is a development smoke-test, not a production transport, and only exists in
-builds with the `dev-listener` feature (`cargo run --features dev-listener --
-agent-vsock-serve`).
 
 ## Network changes
 
