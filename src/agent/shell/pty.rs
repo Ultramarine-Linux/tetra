@@ -26,6 +26,7 @@
 //! [`ShellProcess::terminate`] stops the unit (`SIGTERM` then `SIGHUP` to
 //! everything in it, `SIGKILL` after `TimeoutStopSec`), whether or not
 //! systemd-run is still running, hangs up systemd-run and reaps it.
+//! [`stop_leftover_units`] stops the units a previous run of Tetra left.
 
 use std::{
     io,
@@ -53,6 +54,12 @@ pub const TERM: &str = "xterm-256color";
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long systemd-run gets to exit after the hangup before it is killed.
 const HANGUP_GRACE: Duration = Duration::from_secs(5);
+/// `systemctl`.
+pub const SYSTEMCTL: &str = "/usr/bin/systemctl";
+/// Start of every web shell's unit name.
+pub const UNIT_PREFIX: &str = "tetra-shell-";
+/// Every web shell's unit.
+const UNIT_GLOB: &str = "tetra-shell-*.service";
 
 /// What to start.
 #[derive(Debug, Clone, Copy)]
@@ -115,7 +122,7 @@ impl SystemdRun {
         Self {
             pam_service,
             systemd_run: "/usr/bin/systemd-run".into(),
-            systemctl: "/usr/bin/systemctl".into(),
+            systemctl: SYSTEMCTL.into(),
         }
     }
 
@@ -422,6 +429,95 @@ fn systemctl_command(systemctl: &Path) -> tokio::process::Command {
         .stderr(Stdio::null())
         .kill_on_drop(true);
     command
+}
+
+/// Stop the web shell units (`tetra-shell-*.service`) still loaded, apart
+/// from those `live` claims.
+///
+/// At startup, those are the shells of a previous run of Tetra that crashed
+/// or was restarted. Stopping Tetra kills its
+/// systemd-run processes, which hangs up their shells, but a shell that
+/// ignores `SIGHUP` keeps running in its unit. Best-effort: failures are
+/// logged.
+pub async fn stop_leftover_units<F: Fn(&str) -> bool>(systemctl: &Path, live: F) {
+    let mut command = systemctl_command(systemctl);
+    command
+        .args([
+            "list-units",
+            "--all",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+            "--full",
+            "--type=service",
+            "--",
+            UNIT_GLOB,
+        ])
+        .stdout(Stdio::piped());
+    let listed = match tokio::time::timeout(SYSTEMCTL_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) if output.status.success() => output.stdout,
+        Ok(Ok(output)) => {
+            eprintln!(
+                "`systemctl list-units {UNIT_GLOB}` failed: {}",
+                output.status
+            );
+            return;
+        }
+        Ok(Err(error)) => {
+            eprintln!("failed to run `systemctl list-units {UNIT_GLOB}`: {error}");
+            return;
+        }
+        Err(_) => {
+            eprintln!("`systemctl list-units {UNIT_GLOB}` timed out");
+            return;
+        }
+    };
+    let leftovers: Vec<String> = shell_units(&String::from_utf8_lossy(&listed))
+        .into_iter()
+        .filter(|unit| !live(unit))
+        .collect();
+    if leftovers.is_empty() {
+        return;
+    }
+    eprintln!(
+        "stopping {} leftover web shell unit(s): {}",
+        leftovers.len(),
+        leftovers.join(" ")
+    );
+    stop_units(systemctl, &leftovers).await;
+}
+
+/// The web shell units in `systemctl list-units --plain --no-legend`
+/// output: one unit per line, its name in the first column (after a `●`,
+/// or `*` without UTF-8, when it failed or was not found).
+fn shell_units(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.split_whitespace();
+            let first = columns.next()?;
+            let name = if matches!(first, "●" | "*" | "×") {
+                columns.next()?
+            } else {
+                first
+            };
+            is_shell_unit(name).then(|| name.to_owned())
+        })
+        .collect()
+}
+
+/// Whether `name` is a web shell's unit, as [`super::ShellServer`] names
+/// them (`tetra-shell-<uid>-<random>.service`), so nothing else is passed
+/// to `systemctl stop`.
+fn is_shell_unit(name: &str) -> bool {
+    name.strip_prefix(UNIT_PREFIX)
+        .and_then(|rest| rest.strip_suffix(".service"))
+        .is_some_and(|middle| {
+            !middle.is_empty()
+                && middle
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -833,6 +929,56 @@ mod tests {
             systemctl.calls(),
             ["stop --no-block --no-ask-password -- tetra-shell-1000-abc.service"]
         );
+    }
+
+    #[test]
+    fn shell_units_are_read_from_the_listing() {
+        let listing = "tetra-shell-1000-1a2b3c.service loaded active running Tetra web shell of alice\n\
+                       ● tetra-shell-1001-ffff.service loaded failed failed Tetra web shell of bob\n\
+                       * tetra-shell-test-42.service not-found inactive dead tetra-shell-test-42.service\n\
+                       tetra.service loaded active running Tetra\n\
+                       tetra-shell-x;rm.service loaded active running odd\n\
+                       tetra-shell-.service loaded active running odd\n\
+                       \n";
+        assert_eq!(
+            shell_units(listing),
+            [
+                "tetra-shell-1000-1a2b3c.service",
+                "tetra-shell-1001-ffff.service",
+                "tetra-shell-test-42.service",
+            ]
+        );
+        assert!(!is_shell_unit("tetra-shell-1000-abc.socket"));
+        assert!(!is_shell_unit("-tetra-shell-1000-abc.service"));
+    }
+
+    #[tokio::test]
+    async fn leftover_units_are_listed_and_stopped_but_live_ones_kept() {
+        let systemctl = FakeSystemctl::new(
+            "tetra-shell-1000-aa.service loaded active running a\n\
+             ● tetra-shell-1000-bb.service loaded failed failed b\n\
+             tetra-shell-1001-cc.service loaded active running c\n",
+        );
+        stop_leftover_units(&systemctl.path(), |unit| {
+            unit == "tetra-shell-1001-cc.service"
+        })
+        .await;
+        assert_eq!(
+            systemctl.calls(),
+            [
+                "list-units --all --plain --no-legend --no-pager --full --type=service -- \
+                 tetra-shell-*.service",
+                "stop --no-block --no-ask-password -- tetra-shell-1000-aa.service \
+                 tetra-shell-1000-bb.service",
+            ]
+        );
+
+        // Nothing left: nothing stopped.
+        let systemctl = FakeSystemctl::new("tetra.service loaded active running Tetra\n");
+        stop_leftover_units(&systemctl.path(), |_| false).await;
+        assert_eq!(systemctl.calls().len(), 1);
+        // A failing systemctl is only logged.
+        stop_leftover_units(Path::new("/nonexistent/systemctl"), |_| false).await;
     }
 
     /// Starts a real shell through systemd. Needs root and a user to run it

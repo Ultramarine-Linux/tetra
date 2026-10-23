@@ -291,7 +291,10 @@ journalctl -t systemd -g tetra-shell     # or: journalctl -u 'tetra-shell-*'
 
 Shells that are running show up as `tetra-shell-<uid>-<random>.service`
 (`systemctl list-units 'tetra-shell-*'`) and as logind sessions
-(`loginctl`). `systemctl stop` on the unit ends one.
+(`loginctl`). `systemctl stop` on the unit ends one. Tetra stops a shell's
+unit whenever the shell ends, and at startup stops the `tetra-shell-*`
+units a previous run left (journal: `stopping … leftover web shell
+unit(s)`).
 
 ## Logging and debugging
 

@@ -27,7 +27,7 @@ pub mod frames;
 pub mod pty;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -116,30 +116,41 @@ pub struct ShellServer {
 struct Inner {
     spawner: Arc<dyn PtySpawner>,
     limits: ShellLimits,
-    /// Open shells per UID.
-    open: Mutex<HashMap<u32, usize>>,
+    open: Mutex<Open>,
+}
+
+/// The shells open right now.
+#[derive(Default)]
+struct Open {
+    /// Per UID.
+    per_user: HashMap<u32, usize>,
+    /// Their units (`tetra-shell-….service`), so the startup sweep leaves
+    /// them alone.
+    units: HashSet<String>,
 }
 
 /// A shell's place under [`ShellLimits`], given back when dropped.
 struct Slot {
     inner: Arc<Inner>,
     uid: u32,
+    unit: String,
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
         let mut open = self.inner.lock();
-        if let Some(count) = open.get_mut(&self.uid) {
+        open.units.remove(&self.unit);
+        if let Some(count) = open.per_user.get_mut(&self.uid) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                open.remove(&self.uid);
+                open.per_user.remove(&self.uid);
             }
         }
     }
 }
 
 impl Inner {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u32, usize>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Open> {
         self.open
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -187,7 +198,7 @@ impl ShellServer {
             inner: Arc::new(Inner {
                 spawner,
                 limits,
-                open: Mutex::new(HashMap::new()),
+                open: Mutex::new(Open::default()),
             }),
         }
     }
@@ -205,14 +216,27 @@ impl ShellServer {
     /// Shells open right now.
     #[must_use]
     pub fn open_shells(&self) -> usize {
-        self.inner.lock().values().sum()
+        self.inner.lock().per_user.values().sum()
     }
 
-    fn acquire(&self, uid: u32) -> Result<Slot, ApiError> {
+    /// Stop the web shell units a previous run of Tetra left behind (it
+    /// crashed or was restarted), leaving this run's own shells alone.
+    /// Best-effort and logged; see [`pty::stop_leftover_units`]. For
+    /// startup.
+    pub async fn stop_leftover_units(&self) {
+        self.stop_leftover_units_with(pty::SYSTEMCTL.as_ref()).await;
+    }
+
+    async fn stop_leftover_units_with(&self, systemctl: &std::path::Path) {
+        pty::stop_leftover_units(systemctl, |unit| self.inner.lock().units.contains(unit)).await;
+    }
+
+    /// Take a slot for a shell of `uid` in `unit` (without `.service`).
+    fn acquire(&self, uid: u32, unit: &str) -> Result<Slot, ApiError> {
         let limits = self.inner.limits;
         let mut open = self.inner.lock();
-        let total: usize = open.values().sum();
-        let mine = open.get(&uid).copied().unwrap_or_default();
+        let total: usize = open.per_user.values().sum();
+        let mine = open.per_user.get(&uid).copied().unwrap_or_default();
         if mine >= limits.per_user {
             return Err(ApiError::new(
                 ErrorCode::LimitReached,
@@ -228,11 +252,16 @@ impl ShellServer {
                 "too many shells are open on this server; try again later",
             ));
         }
-        open.insert(uid, mine.saturating_add(1));
+        open.per_user.insert(uid, mine.saturating_add(1));
+        // Before the unit exists, so the startup sweep never sees it as a
+        // leftover.
+        let unit = format!("{unit}.service");
+        open.units.insert(unit.clone());
         drop(open);
         Ok(Slot {
             inner: Arc::clone(&self.inner),
             uid,
+            unit,
         })
     }
 
@@ -319,8 +348,8 @@ impl ShellServer {
         let params: OpenParams = params(&request.params)?;
         let size = WindowSize::new(params.cols, params.rows).map_err(ApiError::bad_request)?;
         let grant = auth.redeem_shell_ticket(client, &params.ticket)?;
-        let slot = self.acquire(grant.uid)?;
         let unit = unit_name(grant.uid);
+        let slot = self.acquire(grant.uid, &unit)?;
         let spawned = self.inner.spawner.spawn(&ShellRequest {
             grant: &grant,
             unit: &unit,
@@ -585,7 +614,7 @@ async fn pump_output<R: AsyncRead + Unpin>(
 fn unit_name(uid: u32) -> String {
     let mut random = [0_u8; 6];
     rand::fill(&mut random);
-    format!("tetra-shell-{uid}-{}", hex(&random))
+    format!("{}{uid}-{}", pty::UNIT_PREFIX, hex(&random))
 }
 
 /// Whether `request` asks to turn its connection into a shell.
@@ -1184,6 +1213,34 @@ mod tests {
         assert!(terminated.load(Ordering::SeqCst));
         flood.abort();
         drop(socket);
+    }
+
+    #[tokio::test]
+    async fn the_startup_sweep_stops_leftover_units_but_not_open_shells() {
+        let mut h = harness(fast());
+        let token = login(&h.host, "alice").await;
+        let ticket = ticket(&h.host, &token).await;
+        let mut socket = connect(&h.path).await;
+        assert!(open(&mut socket, &ticket).await.ok);
+        let shell = h.shells.recv().await.unwrap();
+        let systemctl = pty::fake_systemctl::FakeSystemctl::new(&format!(
+            "{}.service loaded active running Tetra web shell of alice\n\
+             tetra-shell-1000-0123456789ab.service loaded active running Tetra web shell of alice\n",
+            shell.unit
+        ));
+        h.server.stop_leftover_units_with(&systemctl.path()).await;
+        assert_eq!(
+            systemctl.calls()[1..],
+            ["stop --no-block --no-ask-password -- tetra-shell-1000-0123456789ab.service"]
+        );
+
+        // Once the shell is closed its unit is a leftover too.
+        shell.exit(Some(0));
+        drop(shell);
+        exit_frame(&mut socket).await;
+        let server = h.server.clone();
+        until(|| server.open_shells() == 0).await;
+        assert!(h.server.inner.lock().units.is_empty());
     }
 
     #[tokio::test]
