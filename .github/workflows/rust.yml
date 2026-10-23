@@ -3,6 +3,7 @@ permissions:
     contents: read
 on:
     push:
+    pull_request:
 
 jobs:
     rust:
@@ -16,3 +17,34 @@ jobs:
             # The CI image already ships openssl-devel for webauthn-rs.
             clippy-pre: dnf install --assumeyes pam-devel clang-devel
             test-pre: dnf install --assumeyes pam-devel clang-devel
+            # Also run the dev-listener and virtual-machines code and tests.
+            test-cargo-flags: --all-features
+
+    # The shared workflow's clippy step never fails the build; this one does,
+    # for every feature set the crate ships with.
+    lint:
+        runs-on: ubuntu-latest
+        container: ghcr.io/fyralabs/ci:f44
+        steps:
+            - run: dnf install --assumeyes pam-devel clang-devel
+            - uses: actions/checkout@v5
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: clippy, rustfmt
+            - run: cargo fmt --check
+            - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+            - run: cargo clippy --locked --all-targets -- -D warnings
+            - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+            - run: RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --locked --no-deps
+
+    audit:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            checks: write
+            issues: write
+        steps:
+            - uses: actions/checkout@v5
+            - uses: rustsec/audit-check@v2
+              with:
+                  token: ${{ secrets.GITHUB_TOKEN }}
