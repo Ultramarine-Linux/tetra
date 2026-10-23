@@ -71,6 +71,13 @@ pub trait Mod: Send + Sync {
         self.info().metadata_response(action, payload)
     }
 
+    /// Who unprivileged actions run as when the payload has no `run_as`
+    /// (see [`RunAs`]): the signed-in user, unless the module's host state
+    /// is the apps account's (`podman`).
+    fn default_run_as(&self) -> RunAs {
+        RunAs::User
+    }
+
     /// Handle one module-specific action.
     ///
     /// - `action` is the command's `action` field

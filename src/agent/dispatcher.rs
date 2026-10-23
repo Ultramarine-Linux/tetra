@@ -2,6 +2,7 @@ use crate::prelude::*;
 
 use std::collections::BTreeMap;
 
+use super::apps_account::APPS_USER;
 use super::{AgentCommand, AgentResponse};
 
 /// Registry of modules that the dispatcher routes commands to.
@@ -81,13 +82,14 @@ impl Dispatcher {
         if let Some(response) = module.metadata(&command.action, &command.payload) {
             return Ok(response);
         }
-        let run_as = RunAs::take(&mut command.payload)?;
+        let run_as = RunAs::take(&mut command.payload)?.unwrap_or_else(|| module.default_run_as());
         // The command is owned: hand the (possibly large) payload over
         // instead of copying it.
         let payload = std::mem::take(&mut command.payload);
         let action = command.action.as_str();
         match run_as {
             RunAs::User => module.handle(action, payload, command.user()),
+            RunAs::Apps => module.handle(action, payload, Some(APPS_USER)),
             RunAs::Root => module.handle(action, payload, None),
             RunAs::Both => {
                 let user = command
@@ -112,18 +114,22 @@ impl Dispatcher {
 }
 
 /// Who host commands of an action run as, from the payload's optional
-/// `run_as` field (removed before the module sees the payload).
+/// `run_as` field (removed before the module sees the payload), or the
+/// module's [`Mod::default_run_as`] without one.
 ///
 /// Unprivileged actions run as the signed-in user by default, so a user sees
-/// their own containers or VMs; `root` shows the host's, and `both` runs the
-/// action twice and returns `{user, root}`, each `{ok, result}` or
-/// `{ok, error}`. Privileged actions always run as root. Anything but
-/// `user` is administrator-only (see `auth::authz::admin_only_field`).
+/// their own containers or VMs; `apps` runs them as the
+/// [`APPS_USER`] account that user apps run under (the default of
+/// `podman`), `root` shows the host's, and `both` runs the action twice and
+/// returns `{user, root}`, each `{ok, result}` or `{ok, error}`. Privileged
+/// actions always run as root. `root` and `both` are administrator-only (see
+/// `auth::authz::admin_only_field`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunAs {
     #[default]
     User,
+    Apps,
     Root,
     Both,
 }
@@ -132,14 +138,17 @@ impl RunAs {
     /// The payload field naming it.
     pub const FIELD: &str = "run_as";
 
-    fn take(payload: &mut Value) -> Result<Self> {
+    /// Remove the field from `payload`; `None` when it has none.
+    fn take(payload: &mut Value) -> Result<Option<Self>> {
         let Some(value) = payload
             .as_object_mut()
             .and_then(|object| object.remove(Self::FIELD))
         else {
-            return Ok(Self::User);
+            return Ok(None);
         };
-        serde_json::from_value(value).context("`run_as` must be `user`, `root` or `both`")
+        serde_json::from_value(value)
+            .map(Some)
+            .context("`run_as` must be `user`, `apps`, `root` or `both`")
     }
 }
 
@@ -222,5 +231,52 @@ mod tests {
 
         assert!(!as_alice("wipe", json!({ "run_as": "both" }), "alice").ok);
         assert!(!as_alice("ping", json!({ "run_as": "admin" }), "alice").ok);
+
+        let apps = as_alice("ping", json!({ "run_as": "apps" }), "alice");
+        assert_eq!(apps.payload.unwrap()["user"], "ultramarine-apps");
+    }
+
+    /// Echo, defaulting to the apps account like `podman`.
+    struct AppsEcho;
+
+    impl Mod for AppsEcho {
+        fn info(&self) -> ModuleInfo {
+            ModuleInfo {
+                name: "apps_echo",
+                ..Echo.info()
+            }
+        }
+
+        fn default_run_as(&self) -> RunAs {
+            RunAs::Apps
+        }
+
+        fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
+            Echo.handle(action, payload, user)
+        }
+    }
+
+    #[test]
+    fn modules_pick_their_default_run_as() {
+        let dispatcher = Dispatcher::new().with_module(AppsEcho);
+        let run = |payload: Value, user: Option<&str>| {
+            dispatcher
+                .dispatch(AgentCommand {
+                    id: "cmd".into(),
+                    module: "apps_echo".into(),
+                    action: "ping".into(),
+                    payload,
+                    signature: None,
+                    user: user.map(str::to_owned),
+                })
+                .payload
+                .unwrap()["user"]
+                .clone()
+        };
+        // Without `run_as`, as the apps account, signed in or not.
+        assert_eq!(run(json!({}), Some("alice")), "ultramarine-apps");
+        assert_eq!(run(json!({}), None), "ultramarine-apps");
+        assert_eq!(run(json!({ "run_as": "user" }), Some("alice")), "alice");
+        assert!(run(json!({ "run_as": "root" }), Some("alice")).is_null());
     }
 }

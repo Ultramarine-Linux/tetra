@@ -13,9 +13,11 @@
 //!   never be granted: managing users, reading or writing files (the files
 //!   module runs as root on any path), changing settings and
 //!   SELinux, mounting or configuring storage, and anything that manages
-//!   rootful systemd units, containers or VMs. Apps are installed as system-scope units today, so app management is
-//!   admin-only too; it becomes grantable once apps run rootless under
-//!   `ultramarine-apps`.
+//!   rootful systemd units, containers or VMs. App management stays
+//!   admin-only even though apps now run rootless under `ultramarine-apps`:
+//!   its payloads read recipes from host paths and relabel paths as root
+//!   (`selinux`), and every app shares the account, so one app's units could
+//!   read another's secrets.
 //! - Actions missing from the table are admin-only, so a new action is never
 //!   accidentally open. A test checks that every action of every compiled
 //!   module is listed.
@@ -323,37 +325,48 @@ pub const SETUP_OPERATIONS: &[&str] = &[
 ];
 
 /// Payload fields that only administrators (and remote controllers) may set,
-/// because they point an action at arbitrary host paths. The setup session
-/// and granted users always get the defaults; a field may still be sent with
-/// its default value (the third element), since documented payloads do.
-const ADMIN_ONLY_FIELDS: &[(&str, &str, Option<&str>)] = &[
-    ("reverse_proxy", "config_dir", None),
-    ("quadlets", "base_dir", None),
-    ("quadlets", "files_base_dir", None),
-    ("apps", "base_dir", None),
-    ("apps", "files_base_dir", None),
+/// because they point an action at arbitrary host paths or widen what it
+/// shows. The setup session and granted users always get the defaults; a
+/// field may still be sent with one of the values in the third element (its
+/// default, written as JSON), since documented payloads do.
+const ADMIN_ONLY_FIELDS: &[(&str, &str, &[&str])] = &[
+    ("reverse_proxy", "config_dir", &[]),
+    ("quadlets", "base_dir", &[]),
+    ("quadlets", "files_base_dir", &[]),
+    ("apps", "base_dir", &[]),
+    ("apps", "files_base_dir", &[]),
     // A new account sharing another's home could replace that account's SSH
     // keys with `set_authorized_keys`.
-    ("users", "home", None),
+    ("users", "home", &[]),
     // The sharing modules read and replace `path` as root; any other path
     // would turn the Sharing page into `files.read`/`files.write`.
-    ("samba", "path", Some(SAMBA_CONFIG_PATH)),
+    ("samba", "path", &[SAMBA_CONFIG_PATH]),
     // Running a read as root (or as both) shows the host's view: rootful
-    // containers with their environment, every VM.
-    ("*", "run_as", Some("user")),
-    ("nfs", "path", Some(EXPORTS_PATH)),
+    // containers with their environment, every VM. The signed-in user's own
+    // view and the apps account's (where user apps run) are fine.
+    ("*", "run_as", &["user", "apps"]),
+    // Apps keep secrets in their containers' environment.
+    ("podman", "show_env", &["false"]),
+    ("nfs", "path", &[EXPORTS_PATH]),
 ];
 
 /// The first admin-only field set in a `module` payload, if any.
 #[must_use]
 pub fn admin_only_field(module: &str, payload: &Value) -> Option<&'static str> {
+    // A string, or another JSON value written out (`false`).
+    let allowed = |value: &Value, allowed: &[&str]| {
+        allowed.iter().any(|allowed| {
+            value.as_str() == Some(*allowed)
+                || serde_json::from_str::<Value>(allowed).is_ok_and(|allowed| allowed == *value)
+        })
+    };
     ADMIN_ONLY_FIELDS
         .iter()
-        .find(|(m, field, default)| {
+        .find(|(m, field, values)| {
             (*m == module || *m == "*")
                 && payload
                     .get(field)
-                    .is_some_and(|value| default.is_none_or(|default| value != default))
+                    .is_some_and(|value| !allowed(value, values))
         })
         .map(|(_, field, _)| *field)
 }
@@ -964,9 +977,23 @@ mod tests {
                 let payload = serde_json::json!({ "run_as": run_as });
                 assert_eq!(admin_only_field(module, &payload), Some("run_as"));
             }
-            let payload = serde_json::json!({ "run_as": "user" });
-            assert_eq!(admin_only_field(module, &payload), None);
+            for run_as in ["user", "apps"] {
+                let payload = serde_json::json!({ "run_as": run_as });
+                assert_eq!(admin_only_field(module, &payload), None);
+            }
         }
+    }
+
+    #[test]
+    fn container_environments_are_admin_only() {
+        let show = serde_json::json!({ "name": "db", "show_env": true });
+        assert_eq!(admin_only_field("podman", &show), Some("show_env"));
+        let hide = serde_json::json!({ "name": "db", "show_env": false });
+        assert_eq!(admin_only_field("podman", &hide), None);
+        assert_eq!(
+            admin_only_field("podman", &serde_json::json!({ "name": "db" })),
+            None
+        );
     }
 
     #[test]

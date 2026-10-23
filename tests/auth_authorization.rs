@@ -489,3 +489,132 @@ async fn grant_changes_are_in_the_action_log() {
     assert_eq!(logged["username"], "admin");
     assert_eq!(logged["ok"], true);
 }
+
+/// A `podman` module that reports who it ran as, defaulting to the apps
+/// account like the real one.
+struct StubPodman;
+
+impl tetra::agent::modules::Mod for StubPodman {
+    fn info(&self) -> tetra::agent::module_support::ModuleInfo {
+        tetra::agent::module_support::ModuleInfo {
+            name: "podman",
+            feature: "podman",
+            description: "Stub podman module",
+            status: tetra::agent::module_support::ModuleStatus::Available,
+            actions: &["containers", "inspect"],
+            privileged_actions: &[],
+        }
+    }
+
+    fn default_run_as(&self) -> tetra::agent::dispatcher::RunAs {
+        tetra::agent::dispatcher::RunAs::Apps
+    }
+
+    fn handle(
+        &self,
+        _action: &str,
+        payload: serde_json::Value,
+        user: Option<&str>,
+    ) -> anyhow::Result<serde_json::Value> {
+        Ok(json!({ "user": user, "payload": payload }))
+    }
+}
+
+#[tokio::test]
+async fn container_views_default_to_the_apps_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = tetra::auth::testing::TestHost::with_dispatcher(dir.path(), |dispatcher| {
+        dispatcher.with_module(StubPodman)
+    })
+    .unwrap();
+    host.accounts.add("alice", 1000, &[]);
+    host.accounts.add("admin", 1001, &["wheel"]);
+    host.passwords.set("alice", "hunter2");
+    host.passwords.set("admin", "hunter2");
+    let admin = login(&host.service, "admin").await;
+    let alice = login(&host.service, "alice").await;
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "admin.grants_set",
+        json!({"uid": 1000, "grants": {"containers": "view"}}),
+    )
+    .await;
+    let containers = |payload: serde_json::Value| json!({"module": "podman", "action": "containers", "payload": payload});
+    let ran_as = |result: serde_json::Value| result["user"].clone();
+
+    let default = ok(
+        &host.service,
+        Dashboard,
+        Some(&alice),
+        "module.dispatch",
+        containers(json!({})),
+    )
+    .await;
+    assert_eq!(ran_as(default), "ultramarine-apps");
+    for (run_as, expected) in [
+        ("apps", json!("ultramarine-apps")),
+        ("user", json!("alice")),
+    ] {
+        let result = ok(
+            &host.service,
+            Dashboard,
+            Some(&alice),
+            "module.dispatch",
+            containers(json!({ "run_as": run_as })),
+        )
+        .await;
+        assert_eq!(ran_as(result), expected, "{run_as}");
+    }
+    for payload in [json!({ "run_as": "root" }), json!({ "run_as": "both" })] {
+        fails(
+            &host.service,
+            Dashboard,
+            Some(&alice),
+            "module.dispatch",
+            containers(payload),
+            ErrorCode::Forbidden,
+        )
+        .await;
+    }
+    // Environments (app secrets) are for administrators.
+    let inspect = |show_env: bool| {
+        json!({"module": "podman", "action": "inspect",
+               "payload": {"name": "db", "show_env": show_env}})
+    };
+    fails(
+        &host.service,
+        Dashboard,
+        Some(&alice),
+        "module.dispatch",
+        inspect(true),
+        ErrorCode::Forbidden,
+    )
+    .await;
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&alice),
+        "module.dispatch",
+        inspect(false),
+    )
+    .await;
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "module.dispatch",
+        inspect(true),
+    )
+    .await;
+    let root = ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "module.dispatch",
+        containers(json!({ "run_as": "root" })),
+    )
+    .await;
+    assert!(ran_as(root).is_null());
+}

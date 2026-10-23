@@ -8,6 +8,11 @@
 //! shared `dry_run` flag. Note the action name `remove` maps to the `podman rm`
 //! subcommand, keeping the protocol verb consistent across modules while the
 //! underlying CLI uses its native spelling.
+//!
+//! Reads run as the `ultramarine-apps` account by default
+//! ([`Mod::default_run_as`]), since that is where user apps' containers live;
+//! `run_as` picks the signed-in user or root instead. `inspect` hides
+//! environment values unless an administrator sends `show_env: true`.
 
 use crate::agent::module_support::positional;
 use crate::prelude::*;
@@ -44,6 +49,12 @@ impl Mod for PodmanModule {
         INFO
     }
 
+    /// User apps' containers are the apps account's, so that is the view
+    /// reads show unless the payload says otherwise.
+    fn default_run_as(&self) -> RunAs {
+        RunAs::Apps
+    }
+
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
         Action::from_payload(action, payload)?.handle(user)
     }
@@ -53,8 +64,16 @@ actions!(Action [payload user] => {
     Containers => {
         crate::cmd!({ &INFO, "containers", user } "podman" ["ps", "--all", "--format", "json"] JSON)
     },
-    Inspect { name: String } => {
-        crate::cmd!({ &INFO, "inspect", user } "podman" ["inspect", positional("name", &payload.name)?] JSON)
+    Inspect {
+        name: String,
+        #[serde(default)]
+        show_env: bool,
+    } => {
+        let mut result = crate::cmd!({ &INFO, "inspect", user } "podman" ["inspect", positional("name", &payload.name)?] JSON)?;
+        if !payload.show_env {
+            redact_env(&mut result);
+        }
+        Ok(result)
     },
     Images => {
         crate::cmd!({ &INFO, "images", user } "podman" ["images", "--format", "json"] JSON)
@@ -106,6 +125,56 @@ const fn default_log_lines() -> u16 {
     100
 }
 
+/// What `inspect` shows in place of an environment value.
+const REDACTED: &str = "********";
+
+/// Hide environment values in an `inspect` result (its parsed `data` and the
+/// raw `stdout`): apps keep secrets there (`Environment=DB_PASSWORD=...`),
+/// and the Containers page may see the apps account's containers. Only
+/// administrators may ask for them (`show_env`).
+fn redact_env(result: &mut Value) {
+    let Some(entries) = result["data"].as_array_mut() else {
+        return;
+    };
+    let redact = |entry: &mut Value| {
+        let key = entry
+            .as_str()
+            .and_then(|pair| pair.split_once('='))
+            .map(|(key, _)| key.to_owned());
+        if let Some(key) = key {
+            *entry = Value::String(format!("{key}={REDACTED}"));
+        }
+    };
+    for entry in &mut *entries {
+        let config = &mut entry["Config"];
+        if let Some(env) = config.get_mut("Env").and_then(Value::as_array_mut) {
+            env.iter_mut().for_each(redact);
+        }
+        // Quadlet passes `Environment=` as `--env KEY=VALUE`.
+        if let Some(args) = config.get_mut("CreateCommand").and_then(Value::as_array_mut) {
+            let mut value_follows = false;
+            for arg in &mut *args {
+                let flag = arg.as_str().unwrap_or_default();
+                if value_follows {
+                    redact(arg);
+                    value_follows = false;
+                } else if matches!(flag, "--env" | "-e") {
+                    value_follows = true;
+                } else if let Some(pair) = flag
+                    .strip_prefix("--env=")
+                    .or_else(|| flag.strip_prefix("-e="))
+                {
+                    let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+                    *arg = Value::String(format!("--env={key}={REDACTED}"));
+                }
+            }
+        }
+    }
+    if let Ok(stdout) = serde_json::to_string_pretty(&result["data"]) {
+        result["stdout"] = Value::String(stdout);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +191,38 @@ mod tests {
         assert_eq!(response["command"], "podman rm app");
         assert_eq!(response["dry_run"], true);
         assert!(response["status"].is_null());
+    }
+
+    #[test]
+    fn reads_default_to_the_apps_account() {
+        assert_eq!(PodmanModule.default_run_as(), RunAs::Apps);
+    }
+
+    #[test]
+    fn inspect_hides_environment_values() {
+        let data = serde_json::json!([{
+            "Config": {
+                "Env": ["PATH=/usr/bin", "DB_PASSWORD=hunter2", "EMPTY"],
+                "CreateCommand": [
+                    "/usr/bin/podman", "run", "--env", "DB_PASSWORD=hunter2",
+                    "-e", "TOKEN=s3cret", "--env=KEY=v", "--name", "db",
+                ],
+            },
+        }]);
+        let mut result = jsonf! { "stdout": data.to_string(), data };
+        redact_env(&mut result);
+        let shown = result.to_string();
+        assert!(!shown.contains("hunter2") && !shown.contains("s3cret"), "{shown}");
+        assert_eq!(
+            result["data"][0]["Config"]["Env"],
+            serde_json::json!(["PATH=********", "DB_PASSWORD=********", "EMPTY"])
+        );
+        assert_eq!(
+            result["data"][0]["Config"]["CreateCommand"],
+            serde_json::json!([
+                "/usr/bin/podman", "run", "--env", "DB_PASSWORD=********",
+                "-e", "TOKEN=********", "--env=KEY=********", "--name", "db",
+            ])
+        );
     }
 }

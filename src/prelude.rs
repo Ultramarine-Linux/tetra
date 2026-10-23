@@ -1,3 +1,4 @@
+pub use crate::agent::dispatcher::RunAs;
 pub use crate::agent::module_support::{ModuleInfo, ModuleStatus};
 pub use crate::agent::modules::{Act, Mod};
 pub use crate::agent::{AgentCommand, AgentResponse};
