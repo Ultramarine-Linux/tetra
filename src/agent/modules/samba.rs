@@ -10,7 +10,7 @@
 use serde_json::json;
 
 use crate::{
-    agent::module_support::apply_selinux,
+    agent::module_support::{apply_selinux, run_for},
     prelude::*,
     types::{DryRunRequest, SambaConfigRequest, SambaWriteConfigRequest},
 };
@@ -79,9 +79,18 @@ actions!(Action [payload user] => {
             "selinux": selinux,
         }))
     },
-    Reload: DryRunRequest => crate::cmd!((payload.dry_run) { &INFO, "reload", user } "systemctl" ["reload-or-restart", "smb.service"] json),
-    Enable: DryRunRequest => crate::cmd!((payload.dry_run) { &INFO, "enable", user } "systemctl" ["enable", "--now", "smb.service"] json),
-    Disable: DryRunRequest => crate::cmd!((payload.dry_run) { &INFO, "disable", user } "systemctl" ["disable", "--now", "smb.service"] json),
+    Reload: DryRunRequest => Ok(run_for(
+        &INFO, "reload", user,
+        "systemctl", ["reload-or-restart", "smb.service"], payload.dry_run,
+    )?.into_json()),
+    Enable: DryRunRequest => Ok(run_for(
+        &INFO, "enable", user,
+        "systemctl", ["enable", "--now", "smb.service"], payload.dry_run,
+    )?.into_json()),
+    Disable: DryRunRequest => Ok(run_for(
+        &INFO, "disable", user,
+        "systemctl", ["disable", "--now", "smb.service"], payload.dry_run,
+    )?.into_json()),
 });
 
 /// Extracts share section names from smb.conf contents.

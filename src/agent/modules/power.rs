@@ -6,6 +6,7 @@
 
 use serde_json::json;
 
+use crate::agent::module_support::run_dry;
 use crate::prelude::*;
 
 /// Marker type for the power module.
@@ -51,14 +52,19 @@ fn schedule(verb: &str, dry_run: bool) -> Result<Value> {
     let on_active = format!("--on-active={DELAY_SECONDS}");
     let unit = format!("--unit=tetra-power-{verb}");
     let description = format!("--description=Tetra {verb} requested through power.{verb}");
-    let result = crate::cmd!((dry_run) "systemd-run" [
-        on_active.as_str(),
-        unit.as_str(),
-        description.as_str(),
-        "--collect",
-        "systemctl",
-        verb,
-    ] json)?;
+    let result = run_dry(
+        "systemd-run",
+        [
+            on_active.as_str(),
+            unit.as_str(),
+            description.as_str(),
+            "--collect",
+            "systemctl",
+            verb,
+        ],
+        dry_run,
+    )?
+    .into_json();
     Ok(json!({
         "action": verb,
         "in_seconds": DELAY_SECONDS,

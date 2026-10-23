@@ -12,7 +12,7 @@ tetra/
 ├── src/
 │   ├── main.rs           # CLI entry point (subcommands, argument parsing)
 │   ├── lib.rs            # Public API: agent, auth, catalog, enrollment, types
-│   ├── prelude.rs        # Common imports for modules (Mod, ModuleInfo, actions!, cmd!, ...)
+│   ├── prelude.rs        # Common imports for modules (Mod, ModuleInfo, actions!, ...)
 │   ├── catalog.rs        # Recipe engine (YAML → Tera → Quadlet units)
 │   ├── types.rs          # Shared module payload types (serde)
 │   ├── auth/             # Login, sessions, authorization (see auth-protocol.md)
@@ -195,6 +195,7 @@ A module whose host state belongs to the apps account (`podman`) overrides
 ```rust
 use serde_json::json;
 
+use crate::agent::module_support::{positional, run_for};
 use crate::prelude::*;
 
 #[derive(Clone, Copy, Debug)]
@@ -225,8 +226,10 @@ actions!(Action [payload user] => {
         name: String,
         #[serde(default)]
         dry_run: bool,
-    } => cmd!((payload.dry_run) { &INFO, "do_something", user }
-        "my-tool" ["apply", positional("name", &payload.name)?] json),
+    } => Ok(run_for(
+        &INFO, "do_something", user,
+        "my-tool", ["apply", positional("name", &payload.name)?], payload.dry_run,
+    )?.into_json()),
     // Or a named payload type: `Read: ReadRequest => { ... }`.
 });
 ```
@@ -274,10 +277,14 @@ depend on one serde schema.
 
 ### Shared helpers (`module_support`)
 
-- `cmd!` — run a host command through `run_command_output_as`: `(dry_run)`
-  previews it, `{ &INFO, action, user }` runs unprivileged actions as `user`,
-  and a trailing `json` or `JSON` wraps the result (`JSON` also parses stdout
-  into `data`). Commands time out after `COMMAND_TIMEOUT` (15 minutes).
+- `run` / `run_dry` / `run_for` — run a host command through
+  `run_command_output_as`: `run_dry(program, args, dry_run)` previews it when
+  `dry_run` is set, and `run_for(&INFO, action, user, program, args, dry_run)`
+  runs unprivileged actions as `user` (privileged ones as root). They return a
+  `CommandResult`; `into_json()` turns it into the response object
+  (`command`, `status`, `stdout`, `stderr`, `dry_run`), and
+  `into_json_stdout()` also parses stdout into `data`. Commands time out after
+  `COMMAND_TIMEOUT` (15 minutes).
 - `run_command_with_input` — feed a secret on stdin instead of the command line.
 - `positional` — refuse an empty payload value, or one starting with `-`,
   before it becomes a positional argument (so `podman rm -a` cannot happen).

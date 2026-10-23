@@ -2,8 +2,9 @@
 //!
 //! A thin wrapper around the `podman` CLI. The listing actions (`containers`,
 //! `images`, `volumes`, `networks`, `inspect`) all rely on podman's native
-//! `--format json`, so the `cmd!` macro's `JSON` mode parses stdout straight into the
-//! response `data` field with no module-specific parsing of our own. The
+//! `--format json`, so `CommandResult::into_json_stdout` parses stdout
+//! straight into the response `data` field with no module-specific parsing of
+//! our own. The
 //! mutating lifecycle actions (`start`/`stop`/`restart`/`remove`) honor the
 //! shared `dry_run` flag. Note the action name `remove` maps to the `podman rm`
 //! subcommand, keeping the protocol verb consistent across modules while the
@@ -14,7 +15,7 @@
 //! `run_as` picks the signed-in user or root instead. `inspect` hides
 //! environment values unless an administrator sends `show_env: true`.
 
-use crate::agent::module_support::positional;
+use crate::agent::module_support::{positional, run_for};
 use crate::prelude::*;
 
 /// Marker type for the podman module. Stateless; all behavior lives in the
@@ -62,62 +63,99 @@ impl Mod for PodmanModule {
 
 actions!(Action [payload user] => {
     Containers => {
-        crate::cmd!({ &INFO, "containers", user } "podman" ["ps", "--all", "--format", "json"] JSON)
+        run_for(
+            &INFO, "containers", user,
+            "podman", ["ps", "--all", "--format", "json"], false,
+        )?.into_json_stdout()
     },
     Inspect {
         name: String,
         #[serde(default)]
         show_env: bool,
     } => {
-        let mut result = crate::cmd!({ &INFO, "inspect", user } "podman" ["inspect", positional("name", &payload.name)?] JSON)?;
+        let mut result = run_for(
+            &INFO, "inspect", user,
+            "podman", ["inspect", positional("name", &payload.name)?], false,
+        )?.into_json_stdout()?;
         if !payload.show_env {
             redact_env(&mut result);
         }
         Ok(result)
     },
     Images => {
-        crate::cmd!({ &INFO, "images", user } "podman" ["images", "--format", "json"] JSON)
+        run_for(
+            &INFO, "images", user,
+            "podman", ["images", "--format", "json"], false,
+        )?.into_json_stdout()
     },
     Volumes => {
-        crate::cmd!({ &INFO, "volumes", user } "podman" ["volume", "ls", "--format", "json"] JSON)
+        run_for(
+            &INFO, "volumes", user,
+            "podman", ["volume", "ls", "--format", "json"], false,
+        )?.into_json_stdout()
     },
     Networks => {
-        crate::cmd!({ &INFO, "networks", user } "podman" ["network", "ls", "--format", "json"] JSON)
+        run_for(
+            &INFO, "networks", user,
+            "podman", ["network", "ls", "--format", "json"], false,
+        )?.into_json_stdout()
     },
     Logs {
         name: String,
         #[serde(default = "default_log_lines")]
         lines: u16,
     } => {
-        crate::cmd!({ &INFO, "logs", user } "podman" ["logs", "--tail", &payload.lines.to_string(), positional("name", &payload.name)?] json)
+        Ok(run_for(
+            &INFO, "logs", user,
+            "podman",
+            [
+                "logs",
+                "--tail",
+                &payload.lines.to_string(),
+                positional("name", &payload.name)?,
+            ],
+            false,
+        )?.into_json())
     },
     Start {
         name: String,
         #[serde(default)]
         dry_run: bool,
     } => {
-        crate::cmd!((payload.dry_run) { &INFO, "start", user } "podman" ["start", positional("name", &payload.name)?] json)
+        Ok(run_for(
+            &INFO, "start", user,
+            "podman", ["start", positional("name", &payload.name)?], payload.dry_run,
+        )?.into_json())
     },
     Stop {
         name: String,
         #[serde(default)]
         dry_run: bool,
     } => {
-        crate::cmd!((payload.dry_run) { &INFO, "stop", user } "podman" ["stop", positional("name", &payload.name)?] json)
+        Ok(run_for(
+            &INFO, "stop", user,
+            "podman", ["stop", positional("name", &payload.name)?], payload.dry_run,
+        )?.into_json())
     },
     Restart {
         name: String,
         #[serde(default)]
         dry_run: bool,
     } => {
-        crate::cmd!((payload.dry_run) { &INFO, "restart", user } "podman" ["restart", positional("name", &payload.name)?] json)
+        Ok(run_for(
+            &INFO, "restart", user,
+            "podman", ["restart", positional("name", &payload.name)?], payload.dry_run,
+        )?.into_json())
     },
     Remove {
         name: String,
         #[serde(default)]
         dry_run: bool,
     } => {
-        crate::cmd!((payload.dry_run) { &INFO, "remove", user } "podman" ["rm", positional("name", &payload.name)?] json)
+        Ok(run_for(
+            &INFO, "remove", user,
+            "podman", ["rm", positional("name", &payload.name)?], payload.dry_run,
+        )?.into_json())
     }
 });
 

@@ -45,7 +45,7 @@ use serde_json::json;
 
 use crate::prelude::*;
 
-use crate::agent::module_support::{CommandResult, SelinuxOptions, restorecon};
+use crate::agent::module_support::{CommandResult, SelinuxOptions, restorecon, run, run_for};
 use crate::types::{
     DryRunRequest, NetworkConfigRequest, NetworkConfigureRequest, NetworkConfirmRequest,
     NetworkConnectWifiRequest, NetworkInterfaceRequest, NetworkScanWifiRequest,
@@ -118,7 +118,7 @@ impl Mod for NetworkModule {
 }
 actions!(Action [payload user] => {
     Interfaces => {
-        let addresses = crate::cmd!({ &INFO, "interfaces", user } "ip" ["-json", "addr", "show"])
+        let addresses = run_for(&INFO, "interfaces", user, "ip", ["-json", "addr", "show"], false)
             .ok()
             .and_then(|result: CommandResult| serde_json::from_str(&result.stdout).ok())
             .map(|data: Value| parse_ip_addr_json(&data))
@@ -133,12 +133,15 @@ actions!(Action [payload user] => {
             keyfile::validate_interface(interface)?;
         }
         let args = payload.ip_args();
-        let mut response = crate::cmd!({ &INFO, "status", user } "ip" => &args ; JSON)?;
+        let mut response = run_for(&INFO, "status", user, "ip", &args, false)?.into_json_stdout()?;
         response["addresses"] = serde_json::to_value(parse_ip_addr_json(&response["data"]))?;
         Ok(response)
     },
     Dns => Ok(json!({ "resolv_conf": read_optional("/etc/resolv.conf") })),
-    Routes => crate::cmd!({ &INFO, "routes", user } "ip" ["-json", "route", "show"] JSON),
+    Routes => run_for(
+        &INFO, "routes", user,
+        "ip", ["-json", "route", "show"], false,
+    )?.into_json_stdout(),
     Configure: NetworkConfigureRequest => {
         configure(
             &payload,
@@ -157,7 +160,10 @@ actions!(Action [payload user] => {
         set_config(&payload, Path::new(SYSTEM_CONNECTIONS_DIR))
     },
     Reload: DryRunRequest => {
-        crate::cmd!((payload.dry_run) { &INFO, "reload", user } "systemctl" ["reload-or-restart", "NetworkManager.service"] json)
+        Ok(run_for(
+            &INFO, "reload", user,
+            "systemctl", ["reload-or-restart", "NetworkManager.service"], payload.dry_run,
+        )?.into_json())
     },
     ScanWifi: NetworkScanWifiRequest => {
         Ok(json!({ "networks": scan_wifi(&payload.interface, payload.rescan)? }))
@@ -181,10 +187,23 @@ fn scan_wifi(interface: &str, rescan: Option<bool>) -> Result<Vec<wifi::Network>
         Some(false) => "no",
         None => "auto",
     };
-    let result = crate::cmd!("nmcli" [
-        "--terse", "--escape", "yes", "--fields", wifi::SCAN_FIELDS,
-        "device", "wifi", "list", "--rescan", rescan, "ifname", interface,
-    ])?;
+    let result = run(
+        "nmcli",
+        [
+            "--terse",
+            "--escape",
+            "yes",
+            "--fields",
+            wifi::SCAN_FIELDS,
+            "device",
+            "wifi",
+            "list",
+            "--rescan",
+            rescan,
+            "ifname",
+            interface,
+        ],
+    )?;
     Ok(wifi::parse_scan(&result.stdout))
 }
 
@@ -455,13 +474,13 @@ struct NetworkManagerHost;
 
 impl NetworkManagerHost {
     fn nmcli(args: &[&str]) -> Result<CommandResult> {
-        crate::cmd!("nmcli" => args)
+        run("nmcli", args)
     }
 }
 
 impl NetworkHost for NetworkManagerHost {
     fn routable_addresses(&self, interface: &str) -> Result<Vec<IpAddr>> {
-        let result = crate::cmd!("ip" ["-json", "addr", "show", "dev", interface])?;
+        let result = run("ip", ["-json", "addr", "show", "dev", interface])?;
         let data: Value = serde_json::from_str(&result.stdout)
             .context("failed to parse `ip -json addr show` output")?;
         Ok(parse_ip_addr_json(&data)
@@ -475,7 +494,7 @@ impl NetworkHost for NetworkManagerHost {
         let mut gateways = Vec::new();
         for family in ["-4", "-6"] {
             let result =
-                crate::cmd!("ip" ["-json", family, "route", "show", "default", "dev", interface])?;
+                run("ip", ["-json", family, "route", "show", "default", "dev", interface])?;
             let routes: Value = serde_json::from_str(&result.stdout)
                 .context("failed to parse `ip -json route show` output")?;
             gateways.extend(

@@ -23,7 +23,7 @@ use serde_json::json;
 
 use crate::prelude::*;
 
-use crate::agent::module_support::safe_join;
+use crate::agent::module_support::{run_for, safe_join};
 pub use crate::auth::dns::DnsValue;
 
 /// Agent module that manages Caddy reverse proxy snippets.
@@ -425,7 +425,15 @@ pub fn migrate_legacy_sites(legacy_dir: &Path, config_dir: &Path) -> Result<Vec<
 /// restarting (which would drop active connections). Dry runs report the
 /// command that would run without invoking systemctl.
 fn reload_caddy(action: &str, dry_run: bool, user: Option<&str>) -> Result<Value> {
-    crate::cmd!((dry_run) { &INFO, action, user } "systemctl" ["reload", "caddy.service"] json)
+    Ok(run_for(
+        &INFO,
+        action,
+        user,
+        "systemctl",
+        ["reload", "caddy.service"],
+        dry_run,
+    )?
+    .into_json())
 }
 
 /// Filename of the dashboard's own site.

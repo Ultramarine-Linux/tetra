@@ -148,86 +148,52 @@ pub fn parse_action<T: serde::de::DeserializeOwned>(action: &str, payload: Value
 /// by passing a user to the `_for_module` helpers.
 pub const DEFAULT_USER_SUPPORT: bool = cfg!(target_os = "linux");
 
-/// Execute commands. Wrapper around [`run_command_output_as`].
+/// No arguments, for [`run`], [`run_dry`] and [`run_for`].
+pub const NO_ARGS: [&str; 0] = [];
+
+/// Run `program args` as Tetra's own user.
 ///
-/// # Usage
-/// - prefix `DRY_RUN` or `DRY_RUN(bool_expr)` to set dry run
-/// - prefix `{ &INFO, action, user }` to set default user
-/// - then add your program name (any expression)
-/// - add `=> args` for your arguments (`args` need to be `Copy`!)
-/// - add `; json` to wrap it around [`serde_json::json!`]
-/// - add `; JSON` to obtain json in the following format:
-/// ```ts
-/// {
-///     "command": result.command,
-///     "status": result.status,
-///     "stdout": result.stdout,
-///     "stderr": result.stderr,
-///     "dry_run": result.dry_run,
-///     "data": stdout,
-/// }
-/// ```
-///
-/// For aesthetic/formatting purposes, the macro partially accepts usages with elided `;` or `=>`.
-#[macro_export]
-macro_rules! cmd {
-    ($($idk:tt)+) => {
-        $crate::__cmd_inner!((false, None) $($idk)+)
-    };
+/// # Errors
+/// See [`run_command_output_as`].
+pub fn run<I, S>(program: &str, args: I) -> Result<CommandResult>
+where
+    I: IntoIterator<Item = S> + Copy,
+    S: AsRef<OsStr> + std::fmt::Display,
+{
+    run_command_output_as(program, args, false, None)
 }
 
-#[macro_export]
-macro_rules! __cmd_inner {
-    (($dry_run:expr, $default_user:expr) DRY_RUN($dry:expr) $($idk:tt)+) => {
-        $crate::__cmd_inner!(($dry, $default_user) $($idk)+)
-    };
-    (($dry_run:expr, $default_user:expr) ($dry:expr) $($idk:tt)+) => {
-        $crate::__cmd_inner!(($dry, $default_user) $($idk)+)
-    };
-    (($dry_run:expr, $default_user:expr) DRY_RUN $($idk:tt)+) => {
-        $crate::__cmd_inner!((true, $default_user) $($idk)+)
-    };
-    (($dry_run:expr, $default_user:expr) { $info:expr, $act:expr, $user:expr } $($idk:tt)+) => {{
-        let default_user = $crate::agent::module_support::effective_user($info, $act, $user);
-        $crate::__cmd_inner!(($dry_run, default_user) $($idk)+)
-    }};
-    (($dry_run:expr, $default_user:expr) $program:literal $args:expr $(; $($idk:tt)*)?) => {
-        $crate::__cmd_inner!(
-            @{$($($idk)*)?}
-            $crate::agent::module_support::run_command_output_as($program, $args, $dry_run, $default_user)
-        )
-    };
-    (($dry_run:expr, $default_user:expr) $program:literal [$($args:tt)+] $($idk:tt)*) => {
-        $crate::__cmd_inner!(
-            @{$($idk)*}
-            $crate::agent::module_support::run_command_output_as($program, [$($args)+], $dry_run, $default_user)
-        )
-    };
-    (($dry_run:expr, $default_user:expr) $program:expr $(; $($idk:tt)*)?) => {
-        $crate::__cmd_inner!(
-            @{$($($idk)*)?}
-            $crate::agent::module_support::run_command_output_as($program, &[""; 0], $dry_run, $default_user)
-        )
-    };
-    (($dry_run:expr, $default_user:expr) $program:expr => $args:expr $(; $($idk:tt)*)?) => {
-        $crate::__cmd_inner!(
-            @{$($($idk)*)?}
-            $crate::agent::module_support::run_command_output_as($program, $args, $dry_run, $default_user)
-        )
-    };
-    (($dry_run:expr, $default_user:expr) $program:expr => [$($args:tt)+] $($idk:tt)*) => {
-        $crate::__cmd_inner!(
-            @{$($idk)*}
-            $crate::agent::module_support::run_command_output_as($program, [$($args)+], $dry_run, $default_user)
-        )
-    };
-    (@{}$final:expr) => { $final };
-    (@{json}$final:expr) => { $final.map(|obj| ::serde_json::json!(obj)) };
-    (@{JSON}$final:expr) => { $final.and_then(|result| {
-        let data: ::serde_json::Value =
-            ::serde_json::from_str(&result.stdout).context("failed to parse command stdout as JSON")?;
-        Ok(::serde_json::json!({ "command": result.command, "status": result.status, "stdout": result.stdout, "stderr": result.stderr, "dry_run": result.dry_run, "data": data }))
-    }) };
+/// [`run`], or only plan the command when `dry_run` is set.
+///
+/// # Errors
+/// See [`run_command_output_as`].
+pub fn run_dry<I, S>(program: &str, args: I, dry_run: bool) -> Result<CommandResult>
+where
+    I: IntoIterator<Item = S> + Copy,
+    S: AsRef<OsStr> + std::fmt::Display,
+{
+    run_command_output_as(program, args, dry_run, None)
+}
+
+/// Run `program args` for a module's `action`: as `user`, unless the
+/// action is privileged ([`ModuleInfo::effective_user`]), and only planned
+/// when `dry_run` is set.
+///
+/// # Errors
+/// See [`run_command_output_as`].
+pub fn run_for<I, S>(
+    info: &ModuleInfo,
+    action: &str,
+    user: Option<&str>,
+    program: &str,
+    args: I,
+    dry_run: bool,
+) -> Result<CommandResult>
+where
+    I: IntoIterator<Item = S> + Copy,
+    S: AsRef<OsStr> + std::fmt::Display,
+{
+    run_command_output_as(program, args, dry_run, info.effective_user(action, user))
 }
 
 /// Upper bound for one host command.
@@ -237,6 +203,30 @@ macro_rules! __cmd_inner {
 pub const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(15);
 
 impl CommandResult {
+    /// The result as JSON: `command`, `status`, `stdout`, `stderr` and
+    /// `dry_run`.
+    #[must_use]
+    pub fn into_json(self) -> Value {
+        json!(self)
+    }
+
+    /// [`into_json`](Self::into_json), plus stdout parsed as JSON in `data`.
+    ///
+    /// # Errors
+    /// Fails when stdout is not JSON, as it is not in a dry run.
+    pub fn into_json_stdout(self) -> Result<Value> {
+        let data: Value =
+            serde_json::from_str(&self.stdout).context("failed to parse command stdout as JSON")?;
+        Ok(json!({
+            "command": self.command,
+            "status": self.status,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "dry_run": self.dry_run,
+            "data": data,
+        }))
+    }
+
     const fn planned(command: String) -> Self {
         Self {
             command,
@@ -433,20 +423,6 @@ pub fn run_command_with_input(
     Ok(result)
 }
 
-/// Compute the effective OS user for a module action.
-///
-/// Privileged actions always run as root (`None`). Unprivileged actions run as
-/// the supplied `user` when it is present, otherwise they fall back to root.
-#[inline]
-#[must_use]
-pub fn effective_user<'a>(
-    info: &ModuleInfo,
-    action: &str,
-    user: Option<&'a str>,
-) -> Option<&'a str> {
-    info.effective_user(action, user)
-}
-
 /// Apply SELinux file-context labeling to a path as part of a module action.
 ///
 /// Two phases:
@@ -516,8 +492,13 @@ pub fn apply_selinux(
             .context("SELinux context_type requires path, path_pattern, or default path")?;
         let context_type = positional("context_type", context_type)?;
         let pattern = positional("path_pattern", &pattern)?;
-        let fcontext =
-            |verb| cmd!((dry_run) "semanage" ["fcontext", verb, "-t", context_type, pattern]);
+        let fcontext = |verb| {
+            run_dry(
+                "semanage",
+                ["fcontext", verb, "-t", context_type, pattern],
+                dry_run,
+            )
+        };
         // `-a` refuses a pattern that already has a local rule (the second
         // `apps.update` with the same options); `-m` changes that rule.
         let result = match fcontext("-a") {
@@ -531,7 +512,7 @@ pub fn apply_selinux(
         let mut args = Vec::new();
         args.extend(options.recursive.then_some("-R"));
         args.extend_from_slice(&["-v", positional("path", path)?]);
-        operations.push(cmd!((dry_run) "restorecon" &args ; json)?);
+        operations.push(run_dry("restorecon", &args, dry_run)?.into_json());
     }
 
     Ok(operations)
@@ -552,13 +533,13 @@ pub fn restorecon(path: &Path, flags: &[&str], dry_run: bool) -> Result<Vec<Valu
     let path = path.to_string_lossy();
     let mut args = flags.to_vec();
     args.push(&path);
-    Ok(vec![cmd!((dry_run) "restorecon" &args ; json)?])
+    Ok(vec![run_dry("restorecon", &args, dry_run)?.into_json()])
 }
 
 /// Whether `systemctl is-enabled` reports `unit` as `enabled`.
 #[must_use]
 pub fn unit_enabled(unit: &str) -> bool {
-    cmd!("systemctl" ["is-enabled", unit]).is_ok_and(|result| result.stdout.trim() == "enabled")
+    run("systemctl", ["is-enabled", unit]).is_ok_and(|result| result.stdout.trim() == "enabled")
 }
 
 /// Tetra's drop-in for `unit` in `systemd_dir`
@@ -897,14 +878,45 @@ mod tests {
 
     #[test]
     fn dry_run_command_does_not_execute() {
-        let result = cmd!(DRY_RUN "definitely-not-a-real-command" ["arg"]).unwrap();
+        let result = run_dry("definitely-not-a-real-command", ["arg"], true).unwrap();
         assert_eq!(result.command, "definitely-not-a-real-command arg");
         assert!(result.dry_run);
         assert_eq!(result.status, None);
-        let result = cmd!((true) "definitely-not-a-real-command" ["arg"]).unwrap();
-        assert_eq!(result.command, "definitely-not-a-real-command arg");
-        assert!(result.dry_run);
-        assert_eq!(result.status, None);
+        assert_eq!(
+            result.clone().into_json(),
+            json!({
+                "command": "definitely-not-a-real-command arg",
+                "status": null,
+                "stdout": "",
+                "stderr": "",
+                "dry_run": true,
+            })
+        );
+        // A dry run has no stdout to parse.
+        let error = result.into_json_stdout().unwrap_err().to_string();
+        assert_eq!(error, "failed to parse command stdout as JSON");
+    }
+
+    #[test]
+    fn command_result_json_stdout_adds_data() {
+        let result = CommandResult {
+            command: "tool --json".into(),
+            status: Some(0),
+            stdout: r#"{"a":1}"#.into(),
+            stderr: String::new(),
+            dry_run: false,
+        };
+        assert_eq!(
+            result.into_json_stdout().unwrap(),
+            json!({
+                "command": "tool --json",
+                "status": 0,
+                "stdout": r#"{"a":1}"#,
+                "stderr": "",
+                "dry_run": false,
+                "data": { "a": 1 },
+            })
+        );
     }
 
     #[test]

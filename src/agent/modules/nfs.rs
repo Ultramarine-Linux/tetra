@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::prelude::*;
 
-use crate::agent::module_support::apply_selinux;
+use crate::agent::module_support::{apply_selinux, run_for};
 use crate::types::{DryRunRequest, NfsConfigRequest, NfsWriteConfigRequest};
 
 /// NFS module entry point registered under feature `nfs`.
@@ -77,13 +77,19 @@ actions!(Action [payload user] => {
         }))
     },
     Reload: DryRunRequest => {
-        cmd!((payload.dry_run) { &INFO, "reload", user } "exportfs" ["-ra"] json)
+        Ok(run_for(&INFO, "reload", user, "exportfs", ["-ra"], payload.dry_run)?.into_json())
     },
     Enable: DryRunRequest => {
-        cmd!((payload.dry_run) { &INFO, "enable", user } "systemctl" ["enable", "--now", "nfs-server.service"] json)
+        Ok(run_for(
+            &INFO, "enable", user,
+            "systemctl", ["enable", "--now", "nfs-server.service"], payload.dry_run,
+        )?.into_json())
     },
     Disable: DryRunRequest => {
-        crate::cmd!((payload.dry_run) { &INFO, "disable", user } "systemctl" ["disable", "--now", "nfs-server.service"] json)
+        Ok(run_for(
+            &INFO, "disable", user,
+            "systemctl", ["disable", "--now", "nfs-server.service"], payload.dry_run,
+        )?.into_json())
     }
 });
 

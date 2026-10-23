@@ -12,6 +12,7 @@
 
 use serde_json::json;
 
+use crate::agent::module_support::run_for;
 use crate::prelude::*;
 
 /// Marker type for the always-on settings module. It carries no state: all
@@ -64,7 +65,10 @@ actions!(Action [payload user] => {
         dry_run: bool,
     } => {
         validate_hostname(&payload.hostname)?;
-        crate::cmd!((payload.dry_run) { &INFO, "set_hostname", user } "hostnamectl" ["set-hostname", &payload.hostname] json)
+        Ok(run_for(
+            &INFO, "set_hostname", user,
+            "hostnamectl", ["set-hostname", &payload.hostname], payload.dry_run,
+        )?.into_json())
     },
     SetKeymap {
         /// X11 layout, such as `us` or `de` (comma-separated for several).
@@ -86,7 +90,7 @@ actions!(Action [payload user] => {
         if let Some(variant) = variant {
             args.extend(["", variant]);
         }
-        crate::cmd!((payload.dry_run) { &INFO, "set_keymap", user } "localectl" => &args ; json)
+        Ok(run_for(&INFO, "set_keymap", user, "localectl", &args, payload.dry_run)?.into_json())
     },
     SetLocale {
         /// System locale (`LANG`), such as `en_US.UTF-8`.
@@ -96,7 +100,10 @@ actions!(Action [payload user] => {
     } => {
         validate_locale(&payload.locale)?;
         let lang = format!("LANG={}", payload.locale);
-        crate::cmd!((payload.dry_run) { &INFO, "set_locale", user } "localectl" ["set-locale", &lang] json)
+        Ok(run_for(
+            &INFO, "set_locale", user,
+            "localectl", ["set-locale", &lang], payload.dry_run,
+        )?.into_json())
     },
     SetTimezone {
         /// IANA time zone, such as `Europe/Berlin` or `UTC`.
@@ -105,7 +112,10 @@ actions!(Action [payload user] => {
         dry_run: bool,
     } => {
         validate_timezone(&payload.timezone)?;
-        crate::cmd!((payload.dry_run) { &INFO, "set_timezone", user } "timedatectl" ["set-timezone", &payload.timezone] json)
+        Ok(run_for(
+            &INFO, "set_timezone", user,
+            "timedatectl", ["set-timezone", &payload.timezone], payload.dry_run,
+        )?.into_json())
     },
 });
 

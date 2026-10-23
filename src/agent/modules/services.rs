@@ -15,7 +15,7 @@
 use serde_json::json;
 
 use crate::agent::apps_account::{APPS_USER, AppsAccount};
-use crate::agent::module_support::positional;
+use crate::agent::module_support::{positional, run_for};
 use crate::prelude::*;
 
 use crate::types::{
@@ -82,7 +82,7 @@ actions!(Action [payload user] => {
             "--type=service",
             "--all",
         ], as_apps("list", user));
-        let result = crate::cmd!({ &INFO, "list", user } "systemctl" => &args)?;
+        let result = run_for(&INFO, "list", user, "systemctl", &args, false)?;
         Ok(json!({
             "command": result.command,
             "status": result.status,
@@ -99,7 +99,7 @@ actions!(Action [payload user] => {
             "status",
             positional("service", &payload.service)?,
         ], as_apps("status", user));
-        crate::cmd!({ &INFO, "status", user } "systemctl" => &args ; json)
+        Ok(run_for(&INFO, "status", user, "systemctl", &args, false)?.into_json())
     },
     Logs: ServiceLogsRequest => {
         // `journalctl -u <unit>` follows the unit's journal across
@@ -122,7 +122,7 @@ actions!(Action [payload user] => {
                 as_apps("logs", user),
             )
         };
-        crate::cmd!({ &INFO, "logs", user } "journalctl" => &args ; json)
+        Ok(run_for(&INFO, "logs", user, "journalctl", &args, false)?.into_json())
     },
     // `systemctl <verb> <service>` for the single-service mutations.
     Start: ServiceRequest => unit_verb("start", &payload, user),
@@ -132,7 +132,7 @@ actions!(Action [payload user] => {
     Disable: ServiceRequest => unit_verb("disable", &payload, user),
     DaemonReload: DaemonReloadRequest => {
         let args = payload.scope.command_args(["daemon-reload"]);
-        crate::cmd!((payload.dry_run) { &INFO, "daemon_reload", user } "systemctl" => &args ; json)
+        Ok(run_for(&INFO, "daemon_reload", user, "systemctl", &args, payload.dry_run)?.into_json())
     },
 });
 
@@ -146,7 +146,7 @@ fn unit_verb(verb: &str, payload: &ServiceRequest, user: Option<&str>) -> Result
     let args = payload
         .scope
         .command_args([verb, positional("service", &payload.service)?]);
-    crate::cmd!((payload.dry_run) { &INFO, verb, user } "systemctl" => &args ; json)
+    Ok(run_for(&INFO, verb, user, "systemctl", &args, payload.dry_run)?.into_json())
 }
 
 #[cfg(test)]

@@ -11,7 +11,9 @@ use serde_json::json;
 
 use crate::prelude::*;
 
-use crate::agent::module_support::{SelinuxOptions, apply_selinux, option_arg, positional};
+use crate::agent::module_support::{
+    SelinuxOptions, apply_selinux, option_arg, positional, run_for,
+};
 use std::process::Command;
 
 /// Storage module entry point registered under feature `storage`.
@@ -60,7 +62,10 @@ actions!(Action [payload user] => {
         #[serde(default)]
         dry_run: bool,
     } => {
-        let result = crate::cmd!({ &INFO, "status", user } "df" ["-h", positional("path", &payload.path.to_string_lossy())?] json)?;
+        let result = run_for(
+            &INFO, "status", user,
+            "df", ["-h", positional("path", &payload.path.to_string_lossy())?], false,
+        )?.into_json();
         Ok(json!({ "result": result, "dry_run": payload.dry_run, "zfs": discover_zfs() }))
     },
     Zfs => Ok(discover_zfs()),
@@ -81,7 +86,7 @@ actions!(Action [payload user] => {
         positional("source", &payload.source)?;
         positional("target", &payload.target)?;
         args.extend([payload.source, payload.target]);
-        let mount = crate::cmd!((payload.dry_run) { &INFO, "mount", user } "mount" => &args ; json)?;
+        let mount = run_for(&INFO, "mount", user, "mount", &args, payload.dry_run)?.into_json();
         let selinux = apply_selinux(payload.selinux.as_ref(), Some(&target), payload.dry_run)?;
         Ok(json!({ "mount": mount, "selinux": selinux }))
     },
@@ -89,7 +94,10 @@ actions!(Action [payload user] => {
         path: PathBuf,
         #[serde(default)]
         dry_run: bool,
-    } => crate::cmd!((payload.dry_run) { &INFO, "unmount", user } "umount" [positional("path", &payload.path.to_string_lossy())?] json),
+    } => Ok(run_for(
+        &INFO, "unmount", user,
+        "umount", [positional("path", &payload.path.to_string_lossy())?], payload.dry_run,
+    )?.into_json()),
     Configure {
         #[serde(default = "default_fstab_path")]
         fstab_path: PathBuf,

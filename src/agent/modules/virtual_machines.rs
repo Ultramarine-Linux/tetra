@@ -18,7 +18,7 @@
 use serde_json::json;
 
 use crate::agent::module_support::{
-    ModuleInfo, ModuleStatus, NamedPayload, positional,
+    ModuleInfo, ModuleStatus, NamedPayload, positional, run_for,
 };
 use crate::prelude::*;
 use crate::types::{VirtualMachineCreateRequest, VirtualMachineLogsRequest};
@@ -62,7 +62,7 @@ actions!(Action [payload user] => {
     // `list --all` includes powered-off domains, not just running ones.
     // `list` is a read and therefore never dry-run.
     List => {
-        let result = crate::cmd!({ &INFO, "list", user } "virsh" ["list", "--all"])?;
+        let result = run_for(&INFO, "list", user, "virsh", ["list", "--all"], false)?;
         let domains = parse_virsh_list(&result.stdout);
         Ok(json!({
             "command": result.command,
@@ -76,7 +76,10 @@ actions!(Action [payload user] => {
     // `list --all` includes powered-off domains, not just running ones.
     // `list` is a read and therefore never dry-run.
     Status: NamedPayload => {
-        let result = crate::cmd!({ &INFO, "status", user } "virsh" ["dominfo", positional("name", &payload.name)?])?;
+        let result = run_for(
+            &INFO, "status", user,
+            "virsh", ["dominfo", positional("name", &payload.name)?], false,
+        )?;
         let info = parse_virsh_dominfo(&result.stdout);
         Ok(json!({
             "command": result.command,
@@ -90,27 +93,47 @@ actions!(Action [payload user] => {
     // Logs come from the libvirtd unit journal, not `virsh`, since
     // virsh itself does not expose host-side daemon logs.
     Logs: VirtualMachineLogsRequest => {
-        crate::cmd!({ &INFO, "logs", user } "journalctl" [
-            "--no-pager",
-            "-u",
-            "libvirtd.service",
-            "-n",
-            &payload.lines.to_string()
-        ] json)
+        Ok(run_for(
+            &INFO, "logs", user,
+            "journalctl",
+            [
+                "--no-pager",
+                "-u",
+                "libvirtd.service",
+                "-n",
+                &payload.lines.to_string(),
+            ],
+            false,
+        )?.into_json())
     },
-    Start: NamedPayload => crate::cmd!((payload.dry_run) { &INFO, "start", user } "virsh" ["start", positional("name", &payload.name)?] ; json),
+    Start: NamedPayload => Ok(run_for(
+        &INFO, "start", user,
+        "virsh", ["start", positional("name", &payload.name)?], payload.dry_run,
+    )?.into_json()),
 
     // `stop` uses `shutdown` for a graceful guest-initiated shutdown
     // rather than `destroy` (hard power-off).
-    Stop: NamedPayload => crate::cmd!((payload.dry_run) { &INFO, "stop", user } "virsh" ["shutdown", positional("name", &payload.name)?] json),
+    Stop: NamedPayload => Ok(run_for(
+        &INFO, "stop", user,
+        "virsh", ["shutdown", positional("name", &payload.name)?], payload.dry_run,
+    )?.into_json()),
     // `restart` uses `reboot`, the guest-graceful equivalent.
-    Restart: NamedPayload => crate::cmd!((payload.dry_run) { &INFO, "restart", user } "virsh" ["reboot", positional("name", &payload.name)?] json),
+    Restart: NamedPayload => Ok(run_for(
+        &INFO, "restart", user,
+        "virsh", ["reboot", positional("name", &payload.name)?], payload.dry_run,
+    )?.into_json()),
     // `create` maps to `define`: register a persistent domain from the
     // given XML file. See the module docs for why we avoid `virsh create`.
-    Create: VirtualMachineCreateRequest  => crate::cmd!((payload.dry_run) { &INFO, "create", user } "virsh" ["define", positional("xml_path", &payload.xml_path)?] json),
+    Create: VirtualMachineCreateRequest  => Ok(run_for(
+        &INFO, "create", user,
+        "virsh", ["define", positional("xml_path", &payload.xml_path)?], payload.dry_run,
+    )?.into_json()),
     // `delete` maps to `undefine`: remove the domain registration. It
     // does not delete disk images by default.
-    Delete: NamedPayload => crate::cmd!((payload.dry_run) { &INFO, "delete", user } "virsh" ["undefine", positional("name", &payload.name)?] json),
+    Delete: NamedPayload => Ok(run_for(
+        &INFO, "delete", user,
+        "virsh", ["undefine", positional("name", &payload.name)?], payload.dry_run,
+    )?.into_json()),
 });
 
 /// Parses `virsh list --all` output into domain objects.

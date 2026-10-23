@@ -13,7 +13,7 @@
 //! `busctl` is on every systemd host and its `--json=short` output is easy
 //! to parse, so this needs no D-Bus library.
 
-use crate::agent::module_support::CommandResult;
+use crate::agent::module_support::{CommandResult, run};
 use crate::prelude::*;
 
 const SERVICE: &str = "org.freedesktop.NetworkManager";
@@ -36,7 +36,7 @@ const DELETE_NEW_CONNECTIONS: u32 = 0x02;
 fn busctl(args: &[&str]) -> Result<CommandResult> {
     let mut command = vec!["--json=short", "--allow-interactive-authorization=no"];
     command.extend_from_slice(args);
-    crate::cmd!("busctl" => command.as_slice())
+    run("busctl", command.as_slice())
 }
 
 /// Call `method` on the NetworkManager object.

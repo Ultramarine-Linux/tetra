@@ -37,7 +37,7 @@ use serde_json::json;
 use crate::prelude::*;
 
 use crate::agent::module_support::{
-    Commands, NoPayload, drop_in, install_drop_in, parse_action, unit_enabled,
+    Commands, NoPayload, drop_in, install_drop_in, parse_action, run, unit_enabled,
 };
 use crate::auth::{
     access::{AccessConfig, HTTPS_PORT},
@@ -499,13 +499,13 @@ fn cloudflared_disable(paths: &Paths, dry_run: bool) -> Result<Value> {
 }
 
 fn unit_active(unit: &str) -> bool {
-    crate::cmd!("systemctl" ["is-active", "--quiet", unit]).is_ok()
+    run("systemctl", ["is-active", "--quiet", unit]).is_ok()
 }
 
 fn status() -> Value {
     let mut tailscale = json!({ "enabled": unit_enabled(TAILSCALED), "serve": false, "funnel": false });
     if unit_active(TAILSCALED) {
-        if let Some(serve) = crate::cmd!("tailscale" ["serve", "status", "--json"])
+        if let Some(serve) = run("tailscale", ["serve", "status", "--json"])
             .ok()
             .and_then(|result| serde_json::from_str(&result.stdout).ok())
         {
@@ -541,7 +541,7 @@ fn serve_state(status: &Value) -> (bool, bool) {
 
 /// This node's `MagicDNS` name, if tailscaled is up and logged in.
 fn current_tailnet_hostname() -> Option<String> {
-    crate::cmd!("tailscale" ["status", "--json", "--self"])
+    run("tailscale", ["status", "--json", "--self"])
         .ok()
         .and_then(|result| serde_json::from_str(&result.stdout).ok())
         .and_then(|status: Value| tailnet_hostname(&status))

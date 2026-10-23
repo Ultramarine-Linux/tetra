@@ -40,7 +40,7 @@ use nix::{
 };
 use serde_json::json;
 
-use crate::agent::module_support::option_arg;
+use crate::agent::module_support::{option_arg, run_for};
 use crate::prelude::*;
 
 /// Group whose members are Tetra administrators (with `wheel`).
@@ -101,7 +101,7 @@ actions!(Action [payload user] => {
     Groups => Ok(json!({ "groups": parse_group(&read_file("/etc/group")?) })),
     Status { name: String } => {
         validate_name(&payload.name)?;
-        crate::cmd!({ &INFO, "status", user } "id" [&payload.name] json)
+        Ok(run_for(&INFO, "status", user, "id", [&payload.name], false)?.into_json())
     },
     Create {
         name: String,
@@ -122,7 +122,7 @@ actions!(Action [payload user] => {
         option_arg(&mut args, "--shell", payload.shell);
         option_arg(&mut args, "--home-dir", payload.home);
         args.push(payload.name);
-        crate::cmd!((payload.dry_run) { &INFO, "create", user } "useradd" => &args ; json)
+        Ok(run_for(&INFO, "create", user, "useradd", &args, payload.dry_run)?.into_json())
     },
     Update {
         name: String,
@@ -141,7 +141,7 @@ actions!(Action [payload user] => {
             args.extend(["--groups".into(), groups.join(",")]);
         }
         args.push(payload.name);
-        crate::cmd!((payload.dry_run) { &INFO, "update", user } "usermod" => &args ; json)
+        Ok(run_for(&INFO, "update", user, "usermod", &args, payload.dry_run)?.into_json())
     },
     Delete {
         name: String,
@@ -149,7 +149,7 @@ actions!(Action [payload user] => {
         dry_run: bool,
     } => {
         validate_name(&payload.name)?;
-        crate::cmd!((payload.dry_run) { &INFO, "delete", user } "userdel" [&payload.name] json)
+        Ok(run_for(&INFO, "delete", user, "userdel", [&payload.name], payload.dry_run)?.into_json())
     },
     SetPassword {
         name: String,
@@ -205,7 +205,10 @@ actions!(Action [payload user] => {
         dry_run: bool,
     } => {
         validate_name(&payload.name)?;
-        crate::cmd!((payload.dry_run) { &INFO, "add_admin", user } "usermod" ["--append", "--groups", ADMIN_GROUP, &payload.name] json)
+        Ok(run_for(
+            &INFO, "add_admin", user,
+            "usermod", ["--append", "--groups", ADMIN_GROUP, &payload.name], payload.dry_run,
+        )?.into_json())
     },
 });
 
