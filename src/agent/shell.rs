@@ -401,20 +401,26 @@ impl ShellServer {
         {
             stop(&mut pumps.output, false).await;
         }
-        if end.reason != ExitReason::ClientClosed {
-            let exit = ServerControl::Exit {
+        // The exit frame waits behind queued output, and both behind a
+        // dashboard that may have stopped reading: bound the whole, so the
+        // shell's slot is always given back.
+        let exit = if end.reason == ExitReason::ClientClosed {
+            None
+        } else {
+            serde_json::to_string(&ServerControl::Exit {
                 status: end.status,
                 reason: end.reason,
-            };
-            if let Ok(frame) = serde_json::to_string(&exit) {
+            })
+            .ok()
+        };
+        let close = async {
+            if let Some(frame) = exit {
                 outbox.send(Message::Text(frame.into())).await.ok();
             }
-        }
-        drop(outbox);
-        if tokio::time::timeout(CLOSE_GRACE, &mut writer)
-            .await
-            .is_err()
-        {
+            drop(outbox);
+            (&mut writer).await.ok();
+        };
+        if tokio::time::timeout(CLOSE_GRACE, close).await.is_err() {
             // The dashboard stopped reading; drop the connection.
             stop(&mut writer, false).await;
         }
@@ -1143,6 +1149,41 @@ mod tests {
         assert!(terminated.load(Ordering::SeqCst));
         let server = h.server.clone();
         until(|| server.open_shells() == 0).await;
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_that_stops_reading_does_not_keep_a_slot() {
+        let mut h = harness(fast());
+        let token = login(&h.host, "alice").await;
+        let ticket = ticket(&h.host, &token).await;
+        let mut socket = connect(&h.path).await;
+        assert!(open(&mut socket, &ticket).await.ok);
+        let shell = h.shells.recv().await.unwrap();
+        let terminated = Arc::clone(&shell.terminated);
+        // The shell writes until everything between it and the dashboard,
+        // which reads nothing more, is full.
+        let mut terminal = shell.terminal;
+        let flood = tokio::spawn(async move {
+            let chunk = vec![b'x'; 64 * 1024];
+            while terminal.write_all(&chunk).await.is_ok() {}
+        });
+        let mut stalled = 0;
+        while stalled < 3 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stalled = if flood.is_finished() { 0 } else { stalled + 1 };
+        }
+        request(&h.host, Some(&token), "session.logout", Value::Null).await;
+        let server = h.server.clone();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while server.open_shells() != 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the shell kept its slot");
+        assert!(terminated.load(Ordering::SeqCst));
+        flood.abort();
+        drop(socket);
     }
 
     #[tokio::test]
