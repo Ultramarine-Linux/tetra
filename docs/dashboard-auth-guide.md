@@ -258,10 +258,72 @@ back in `apps.update` keeps the stored secret.
 
 The Unix socket and the loopback-only development TCP listener use the same
 Tetra-issued session tokens and per-request authorization. Privileged actions
-are authorized from the user's admin status and grants. Web shell `sudo` still
-asks for the system password separately.
+are authorized from the user's admin status and grants. `sudo` in the web
+shell (section 10) still asks for the system password separately.
 
-## 10. OOBE flow
+## 10. Web shell
+
+The terminal page gives a signed-in user a shell on the host, as
+themselves. The dashboard does not start it and must not try to: it runs in
+a container without access to host processes. Tetra opens the PTY and runs
+the user's login shell; the dashboard pipes bytes between the browser's
+WebSocket and a second connection to Tetra's socket. Nothing else listens.
+
+```text
+browser (xterm.js) ⇄ dashboard WebSocket ⇄ dashboard server ⇄ /run/tetra/tetra.sock ⇄ Tetra ⇄ PTY ⇄ shell
+```
+
+1. When the user opens the terminal page, call `shell.ticket` with their
+   token on your normal connection → `{ticket, expires_at}`. The ticket is
+   for that user only, works once, and expires after 30 seconds, so ask for
+   it right before step 2 and never send it to the browser.
+2. Open a **new** WebSocket to the same socket
+   (`ws+unix:///run/tetra/tetra.sock`), one per terminal, wait for `hello`,
+   and send `shell.open` as its first request:
+
+   ```ts
+   const shell = new WebSocket("ws+unix:///run/tetra/tetra.sock");
+   shell.binaryType = "nodebuffer";
+   shell.once("message", () => { // hello
+     shell.send(JSON.stringify({
+       type: "request", id: crypto.randomUUID(), op: "shell.open",
+       params: { ticket, cols: term.cols, rows: term.rows },
+     }));
+   });
+   ```
+
+3. The next message is the `response`. If `ok` is `false`, Tetra closes the
+   connection: on `invalid_credentials` (the ticket expired or was used) get
+   a new ticket and try once more; on `unauthenticated` send the user to the
+   login page; on `limit_reached` say they have too many terminals open (4
+   per user, 16 on the server); otherwise show the message. If `ok` is
+   `true`, the connection is now the terminal:
+   - Browser → dashboard → Tetra: send what xterm.js gives you (`onData`,
+     encoded as UTF-8; `onBinary` as is) as **binary** messages, at most
+     1 MiB each (split larger pastes). Send
+     `{"type": "resize", "cols": …, "rows": …}` as a **text** message when the
+     terminal's size changes (xterm.js `onResize`).
+   - Tetra → dashboard → browser: write **binary** messages to the terminal
+     unchanged. A **text** message is `{"type": "exit", "status", "reason"}`:
+     show "session ended" (`exited`, with `status`), "you were logged out"
+     (`session_ended`) or "closed after 30 minutes without input"
+     (`idle_timeout`). Tetra closes the connection right after it.
+4. Pipe both ways without buffering more than a few messages: when the
+   browser is slow, stop reading from Tetra (back-pressure keeps the shell
+   waiting instead of filling memory). When the browser's WebSocket closes,
+   close the Tetra connection: that ends the shell. Close it, too, when the
+   user's dashboard session ends; Tetra also ends the shell by itself within
+   5 seconds of a logout, revocation or expiry.
+
+Never reuse a shell connection for requests, and never send `shell.open` on
+the shared request connection (`bad_request`). The `result` of `shell.open`
+has the `uid`, `username` and transient `unit` of the shell, and its
+`idle_timeout` in seconds, for display. Typing in the terminal keeps the
+user's session from expiring for inactivity. Opening and closing shells are
+recorded in the action log (module `shell`). Every signed-in user may open a
+shell; the setup session and the OOBE may not.
+
+## 11. OOBE flow
 
 The OOBE runs unprivileged as `ultramarine-oobe` on `127.0.0.1:6624`. Tetra
 puts it behind Caddy on port 6623 of every address (IPv4 and IPv6) with a

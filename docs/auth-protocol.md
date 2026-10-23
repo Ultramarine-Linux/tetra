@@ -116,6 +116,7 @@ without an `id`.
 | `action_failed` | The module action ran and failed; `message` has its error. |
 | `queue_full` | Tetra's command queue is full; retry after backoff. |
 | `reauth_required` | The operation adds or removes a way to log in and the session is more than 10 minutes old; log in again and retry. |
+| `limit_reached` | Too many web shells are open, for the user or on the host; close one first. |
 | `internal` | Tetra failed; details are in the journal only. |
 
 ## Who can log in
@@ -317,13 +318,16 @@ second factor itself.
 `admin.*` operations need an administrator.
 
 The action log (`admin.actions`) records every module action run through
-`module.dispatch` or by a remote controller, and the operations
+`module.dispatch` or by a remote controller, the operations
 `access.set`, `setup.complete`, `admin.grants_set`, `admin.sessions_revoke`,
 `launcher.set`, `launcher.remove` and `launcher.public_set` (as `module`
-and `action`, such as `admin` and `grants_set`). An entry is `{at, origin,
-client?, uid?, username?, host_id?, command_id, module, action, ok, error?}`.
-Requests refused before anything ran (`forbidden`, or `bad_request` for
-operations) are not recorded.
+and `action`, such as `admin` and `grants_set`), and web shells opening and
+closing (module `shell`, actions `open` and `close`, see
+[Web shell](#web-shell)). An entry is `{at, origin, client?, uid?, username?,
+host_id?, command_id, module, action, ok, error?, detail?}`; `detail` is text
+Tetra composes itself, such as a shell's unit and why it ended. Requests
+refused before anything ran (`forbidden`, or `bad_request` for operations,
+or a `shell.open` whose ticket is not accepted) are not recorded.
 
 ### Launcher
 
@@ -381,6 +385,109 @@ visibility) to `/var/lib/tetra-public/index.html` (`tetra agent-serve
 the route answers 404. Tetra regenerates the page whenever entries or the
 setting change, after `access.set`, and when it starts. The page loads nothing
 from other origins (its CSP allows only inline styles and `data:` images).
+
+### Web shell
+
+A signed-in user can open a terminal on the host, running their own login
+shell as themselves (never as root; `sudo` inside it asks for their password
+as usual). The dashboard runs in a container and never starts host
+processes: Tetra owns the PTY, and the dashboard only relays bytes between
+the browser and the socket. There is no other listener.
+
+| Op | Params | Result |
+| --- | --- | --- |
+| `shell.ticket` | | `{ticket, expires_at}` |
+| `shell.open` | `ticket, cols?, rows?` | see below; only as the first request of a new connection |
+
+**`shell.ticket`** (dashboard user sessions only) returns a single-use
+ticket for the caller's own account, bound to the session that asked (its
+id, UID and username). Tickets live in memory only, expire after 30 seconds
+and are gone once redeemed. Each user may have 16 pending; a 17th replaces
+their oldest (4096 in all). The setup session gets `forbidden`, the OOBE
+`wrong_client`. Every signed-in user may open a shell by default; it is
+listed as `shell.open` (`Authenticated`) in the authorization table so it
+can be restricted later. Remote controllers never get a shell: they do not
+use the socket's operations.
+
+**`shell.open`** `{ticket, cols?, rows?}` turns a connection into a shell.
+Open a new connection to the socket (dashboard only), wait for `hello`, and
+send it as the connection's first request:
+
+```json
+{ "type": "request", "id": "sh-1", "op": "shell.open",
+  "params": { "ticket": "…", "cols": 120, "rows": 40 } }
+```
+
+`cols` and `rows` default to 80 by 24 and must be between 1 and 1000. No
+token is needed: the ticket is the credential. Redeeming it uses it up, then
+checks its session again (still live, same account under the same name,
+the account may still log in and open a shell). Errors come back as a normal
+`response` and the connection is closed: `invalid_credentials` (unknown,
+expired or used ticket: ask for a new one), `unauthenticated` (the session
+has ended), `forbidden`, `wrong_client`, `bad_request`, `limit_reached` (4
+shells per user, 16 on the host) or `internal` (the shell did not start).
+`shell.open` anywhere else, such as on a connection that already carried a
+request, is `bad_request` and does not use the ticket up.
+
+On success Tetra answers
+
+```json
+{ "type": "response", "id": "sh-1", "ok": true,
+  "result": { "uid": 1000, "username": "alice",
+              "unit": "tetra-shell-1000-1a2b3c4d5e6f.service",
+              "cols": 120, "rows": 40, "idle_timeout": 1800 } }
+```
+
+and from then on the connection carries only the shell:
+
+- **Binary messages** are terminal bytes, both ways: what the user types to
+  Tetra, what the shell writes to the dashboard. An input message may be at
+  most 1 MiB (larger ones end the shell with `protocol_error`); split big
+  pastes.
+- **Text messages** are JSON control frames. From the dashboard,
+  `{"type": "resize", "cols": 120, "rows": 40}`. Text that is not a known,
+  valid control frame is ignored. From Tetra, once, just before it closes the
+  connection: `{"type": "exit", "status": 0, "reason": "exited"}`.
+  `status` is the shell's exit status when it exited by itself with one,
+  otherwise `null`. `reason` is `exited`, `session_ended` (logout,
+  revocation or expiry of the session, or its account may no longer log in
+  or open a shell), `idle_timeout` (nothing typed for 30 minutes) or
+  `protocol_error`.
+
+Closing the connection ends the shell. So does the end of its session, which
+Tetra checks every 5 seconds while the shell runs. Typing in the shell counts
+as using the session (`last_seen`), so a session does not expire while its
+shell is in use; the 12-hour limit still applies.
+
+How Tetra runs it: Tetra opens a PTY pair itself and runs
+
+```text
+systemd-run --quiet --pty --collect --service-type=exec --send-sighup
+    --expand-environment=no --unit=tetra-shell-<uid>-<random>
+    --uid=<uid> -p PAMName=tetra-shell -p WorkingDirectory=-~
+    -p TimeoutStopSec=10s --setenv=TERM=xterm-256color -- <login shell> -l
+```
+
+with the PTY as its controlling terminal, in a new session, with an empty
+environment apart from `PATH`, `TERM` and `LANG`. The shell runs in its own
+transient service with systemd's clean environment (`HOME`, `USER`, `SHELL`
+and `TERM`; nothing of Tetra's, such as `LISTEN_FDS`), in the user's home
+directory, with the user's groups. The PAM service `tetra-shell`
+(`pam/tetra-shell`, installed as `/etc/pam.d/tetra-shell`; `agent-serve
+--shell-pam-service` picks another) runs the account stack (`pam_nologin`,
+expiry) and the session stack, like a console login: the user's SELinux
+context, the audit `loginuid`, limits, and a logind session with
+`XDG_RUNTIME_DIR`, so `systemctl --user` and rootless Podman work. Its auth
+stack is `pam_deny`; systemd never runs it. Resizes reach the shell through
+systemd-run (`SIGWINCH`). When the shell ends for any other reason than
+exiting, Tetra stops the unit (`SIGTERM` and `SIGHUP` to everything in it,
+`SIGKILL` after 10 seconds) and hangs up systemd-run, which hangs up the
+shell's terminal. As with SSH, processes the user deliberately detached from
+the shell elsewhere (`systemd-run --user`, `loginctl enable-linger`) are not
+stopped. Output waits when the dashboard reads
+slower than the shell writes, so neither side buffers without bound. If
+Tetra stops, systemd kills its systemd-run processes, which hangs up every
+shell.
 
 ### Access and setup completion
 
@@ -527,6 +634,8 @@ action that passes authorization is recorded in the action log.
   every action) may run everything.
 - **Other users** have `launcher: view` by default (the Services page: the
   apps shared with them), plus their grants. `manage` implies `view`.
+- **Every signed-in user** may open their own [web shell](#web-shell)
+  (`shell.open` in the table is `Authenticated`); the setup session may not.
 - **The setup session** may run only the module actions the OOBE needs, each
   named individually (list in `src/auth/authz.rs`, `SETUP_ALLOWED`):
   `agent.capabilities`; `settings.set_hostname/set_keymap/set_locale/set_timezone`;
@@ -555,6 +664,7 @@ action that passes authorization is recorded in the action log.
 | Page | `view` | `manage` (grantable) | Administrator only |
 | --- | --- | --- | --- |
 | `launcher` (default) | `launcher.list/get` | — | `launcher.set/remove/public_get/public_set` |
+| — (any signed-in user) | `shell.open` (`shell.ticket`): the user's own shell | — | — |
 | `system_services` | `services.list/status/logs` (systemd units and their journal; not a default, grant it explicitly) | — | start, stop, restart, enable, disable, daemon_reload |
 | `apps` | `apps.list/get` (`get` shows secret values as `********`), `quadlets.list/validate/list_files`, `recipes.context_inline` | — | apps create/update/remove, quadlets read (unit files hold app secrets)/write/delete/install, `recipes.render/context` (read paths as root), `recipes.render_inline` (templates can loop for a very long time) |
 | `containers` | `podman.containers/inspect/images/volumes/networks/logs` (as `ultramarine-apps` by default; `inspect` hides environment values) | — | podman start/stop/restart/remove, `inspect` with `show_env` |

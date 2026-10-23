@@ -16,12 +16,13 @@ tetra/
 │   ├── catalog.rs        # Recipe engine (YAML → Tera → Quadlet units)
 │   ├── types.rs          # Shared module payload types (serde)
 │   ├── auth/             # Login, sessions, authorization (see auth-protocol.md)
-│   │   ├── service.rs    # AuthService: every local-socket operation
+│   │   ├── service/      # AuthService: every local-socket operation (one file per area; shell_ops.rs: shell.ticket)
 │   │   ├── api.rs        # Request/response/error types
 │   │   ├── accounts.rs   # Login eligibility and admin groups
 │   │   ├── pam.rs        # PAM password verification
 │   │   ├── totp.rs, recovery.rs, passkey.rs  # Second factor and passkeys
 │   │   ├── sessions.rs   # Session tokens
+│   │   ├── shell.rs      # Web shell tickets
 │   │   ├── users.rs      # Per-user credential records (auth/users/<uid>.json)
 │   │   ├── authz.rs      # Permission table, grants, setup allowlist
 │   │   ├── access.rs     # access.json, WebAuthn relying party, dashboard site
@@ -51,6 +52,9 @@ tetra/
 │       ├── local_socket.rs     # Local Unix socket listener (production)
 │       ├── local_protocol.rs   # Session protocol frames for local clients
 │       ├── peer.rs             # SO_PEERCRED client identification
+│       ├── shell.rs            # Web shell: a local connection that became a terminal
+│       ├── shell/frames.rs     # Shell stream control frames
+│       ├── shell/pty.rs        # PTY + systemd-run --pty, behind PtySpawner
 │       ├── transport.rs        # Outbound endpoint/TLS configuration (wss:// only)
 │       ├── websocket.rs        # Outbound WSS control-plane client
 │       ├── dev_listener.rs     # Dev-only loopback TCP listener
@@ -308,6 +312,15 @@ token, and `auth::AuthService` authenticates and authorizes it. See
 - `local_socket.rs` — socket activation, fallback bind, accept loop.
 - `peer.rs` — maps the peer UID to the dashboard or the OOBE.
 - `local_protocol.rs` — `hello`, `request` and `response` frames.
+- `shell.rs`, `shell/` — web shells. A connection whose first request is
+  `shell.open` (with a ticket from `shell.ticket`) becomes a terminal: Tetra
+  opens a PTY, runs the user's login shell as that user through
+  `systemd-run --pty` (`PAMName=tetra-shell`), and pipes binary messages to
+  and from the PTY, with JSON `resize` and `exit` control frames. The
+  dashboard only relays bytes; no other listener is involved. Shells end with
+  their session, after 30 minutes without input, or when the connection
+  closes, and are limited to 4 per user and 16 per host. See
+  [auth-protocol.md](auth-protocol.md#web-shell).
 
 ### Outbound WSS (remote control)
 
@@ -365,7 +378,9 @@ session token; the local socket identifies the client from its peer
 credentials. Every module action is authorized from the user's admin status
 and grants (`auth::authz`). Unprivileged actions run as the session user via
 `runuser` (or as `ultramarine-apps`, with `run_as: apps` or the module's
-default); privileged ones as root. See [auth-protocol.md](auth-protocol.md).
+default); privileged ones as root. A web shell always runs as the session's
+user, in its own transient unit; elevation is `sudo` inside it. See
+[auth-protocol.md](auth-protocol.md).
 
 ## User apps and the apps account
 
@@ -435,6 +450,9 @@ content.
 - Tokio accepts connections concurrently, and the local socket handles
   requests concurrently (login, sessions and other non-module operations do
   not wait for the queue).
+- Web shells never touch the queue: each runs on its own connection task,
+  with one task per direction pumping bytes and a supervisor that checks the
+  session every 5 seconds.
 - A single queue worker serializes module commands and runs each one on the
   blocking pool, so long-running module actions never block the async
   transports.
@@ -442,6 +460,10 @@ content.
 ## Testing
 
 - Unit tests live next to the code they test (`#[cfg(test)]` modules).
+  The web shell's stream runs over a real socket against a fake
+  `PtySpawner` (`agent::shell::pty::FakeSpawner`); the real systemd shell
+  test is `#[ignore]`d (it needs root:
+  `sudo TETRA_TEST_SHELL_USER=alice cargo test -- --ignored real_systemd`).
 - Integration tests in `tests/` use the fakes in `tetra::auth::testing` (the
   `testing` feature, enabled for them through `dev-dependencies`), with shared
   helpers in `tests/common/mod.rs`:
@@ -452,6 +474,7 @@ content.
   - `auth_launcher.rs` — launcher visibility, `launcher.can_access`, the public page.
   - `auth_setup.rs` — the setup code, setup session and completion.
   - `auth_oobe.rs` — the OOBE flow: setup allowlist, `access.set`, throttle, handoff.
+  - `auth_shell.rs` — web shell tickets: single use, expiry, binding to the session and account, the session checks of a running shell.
   - `remote_enrollment.rs` — `tetra enroll`/`unenroll`, the mTLS session and certificate renewal, against an in-process controller (runs the real binary).
 - The `agent-dispatch` CLI is the easiest way to exercise a module manually:
 

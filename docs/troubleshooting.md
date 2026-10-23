@@ -267,6 +267,32 @@ refuses. Tetra then rolls back by itself, which a Tetra restart inside the
 window delays until Tetra is back. List checkpoints as above; one left by
 another tool rolls back or expires on its own.
 
+## Web shell
+
+### `shell.open` fails with `internal`, or the terminal closes right away
+
+The journal of `tetra.service` has the reason (`failed to start a web
+shell`), and the shell's own unit has the rest:
+
+```sh
+journalctl -u tetra.service -g "web shell"
+journalctl -t systemd -g tetra-shell     # or: journalctl -u 'tetra-shell-*'
+```
+
+- `/etc/pam.d/tetra-shell` is missing: PAM then falls back to
+  `/etc/pam.d/other`, which denies, and the unit fails with "PAM failed".
+  Install `pam/tetra-shell` there, or point `agent-serve
+  --shell-pam-service` (`TETRA_SHELL_PAM_SERVICE`) at another service such
+  as `login`.
+- `/run/nologin` exists (during boot or shutdown): `pam_nologin` refuses
+  every user but root, and web shells are never root's.
+- The account's login shell is not an absolute path, or the account may no
+  longer log in (locked, expired): Tetra refuses before starting anything.
+
+Shells that are running show up as `tetra-shell-<uid>-<random>.service`
+(`systemctl list-units 'tetra-shell-*'`) and as logind sessions
+(`loginctl`). `systemctl stop` on the unit ends one.
+
 ## Logging and debugging
 
 ### Where Tetra logs

@@ -239,7 +239,8 @@ cargo run -- agent-connect --config examples/transport.json --host-id myhost \
 state under `/var/lib/tetra` (root only). The service does not bind a TCP port.
 `systemd/tetra-setup-code.service` shows the first-boot setup code on the
 console until setup completes. `pam/ultramarine-dashboard` is the PAM service
-used for dashboard passwords and belongs in `/etc/pam.d`.
+used for dashboard passwords and `pam/tetra-shell` the one web shells run
+(`agent-serve --shell-pam-service`); both belong in `/etc/pam.d`.
 
 `systemd/tetra.sysusers.conf` creates the `tetra` group with the fixed GID
 **241**, chosen from Fedora's system range (201–999) outside the 0–200 range
