@@ -192,7 +192,10 @@ fn redact_env(result: &mut Value) {
             env.iter_mut().for_each(redact);
         }
         // Quadlet passes `Environment=` as `--env KEY=VALUE`.
-        if let Some(args) = config.get_mut("CreateCommand").and_then(Value::as_array_mut) {
+        if let Some(args) = config
+            .get_mut("CreateCommand")
+            .and_then(Value::as_array_mut)
+        {
             let mut value_follows = false;
             for arg in &mut *args {
                 let flag = arg.as_str().unwrap_or_default();
@@ -254,7 +257,10 @@ mod tests {
         let mut result = serde_json::json!({ "stdout": data.to_string(), "data": data });
         redact_env(&mut result);
         let shown = result.to_string();
-        assert!(!shown.contains("hunter2") && !shown.contains("s3cret"), "{shown}");
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("s3cret"),
+            "{shown}"
+        );
         assert_eq!(
             result["data"][0]["Config"]["Env"],
             serde_json::json!(["PATH=********", "DB_PASSWORD=********", "EMPTY"])
@@ -262,8 +268,15 @@ mod tests {
         assert_eq!(
             result["data"][0]["Config"]["CreateCommand"],
             serde_json::json!([
-                "/usr/bin/podman", "run", "--env", "DB_PASSWORD=********",
-                "-e", "TOKEN=********", "--env=KEY=********", "--name", "db",
+                "/usr/bin/podman",
+                "run",
+                "--env",
+                "DB_PASSWORD=********",
+                "-e",
+                "TOKEN=********",
+                "--env=KEY=********",
+                "--name",
+                "db",
             ])
         );
     }

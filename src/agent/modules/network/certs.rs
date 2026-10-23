@@ -32,7 +32,9 @@ pub struct PemFile {
 
 impl std::fmt::Debug for PemFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PemFile").field("path", &self.path).finish_non_exhaustive()
+        f.debug_struct("PemFile")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
     }
 }
 
@@ -70,7 +72,10 @@ pub fn write(files: &[PemFile]) -> Result<Vec<PathBuf>> {
     let mut written = Vec::new();
     let mut prepared = Vec::new();
     for file in files {
-        let dir = file.path.parent().context("certificate path has no parent")?;
+        let dir = file
+            .path
+            .parent()
+            .context("certificate path has no parent")?;
         if !prepared.contains(&dir) {
             if let Some(parent) = dir.parent() {
                 crate::auth::store::private_dir(parent)?;
@@ -118,8 +123,8 @@ pub fn prune(dir: &Path, keyfile: Option<&[u8]>) {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt as _;
     use serde_json::json;
+    use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
 
@@ -148,16 +153,31 @@ mod tests {
         assert_eq!(files.len(), 2);
         let ca = settings.ca_cert.clone().unwrap();
         let key = settings.private_key.clone().unwrap();
-        assert!(ca.starts_with(&*dir.join("ca-cert-").to_string_lossy()), "{ca}");
-        assert!(Path::new(&key).extension().is_some_and(|extension| extension == "pem"));
-        assert_eq!(settings.client_cert.as_deref(), Some("/etc/pki/tls/certs/client.pem"));
+        assert!(
+            ca.starts_with(&*dir.join("ca-cert-").to_string_lossy()),
+            "{ca}"
+        );
+        assert!(
+            Path::new(&key)
+                .extension()
+                .is_some_and(|extension| extension == "pem")
+        );
+        assert_eq!(
+            settings.client_cert.as_deref(),
+            Some("/etc/pki/tls/certs/client.pem")
+        );
         assert!(!format!("{settings:?} {files:?}").contains("S3CRET"));
 
         assert_eq!(write(&files).unwrap().len(), 2);
         assert_eq!(fs::read_to_string(&key).unwrap(), KEY);
         for path in [Path::new(&key), &dir, &root.path().join("802-1x")] {
             let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, if path.is_dir() { 0o700 } else { 0o600 }, "{}", path.display());
+            assert_eq!(
+                mode,
+                if path.is_dir() { 0o700 } else { 0o600 },
+                "{}",
+                path.display()
+            );
         }
         // Writing the same contents again changes nothing.
         assert_eq!(write(&files).unwrap(), Vec::<PathBuf>::new());

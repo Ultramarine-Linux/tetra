@@ -119,9 +119,14 @@ impl Reach {
     /// help a remote administrator whose packets go through a gateway the
     /// change dropped (a manual profile without one, or a mistyped one).
     fn kept_in(&self, now: &Self) -> bool {
-        now.addresses.iter().any(|address| self.addresses.contains(address))
+        now.addresses
+            .iter()
+            .any(|address| self.addresses.contains(address))
             && (self.gateways.is_empty()
-                || now.gateways.iter().any(|gateway| self.gateways.contains(gateway)))
+                || now
+                    .gateways
+                    .iter()
+                    .any(|gateway| self.gateways.contains(gateway)))
     }
 }
 
@@ -149,7 +154,11 @@ struct Pending {
 
 impl Pending {
     const fn rollback_by(&self) -> &'static str {
-        if self.checkpoint.is_some() { "networkmanager" } else { "tetra" }
+        if self.checkpoint.is_some() {
+            "networkmanager"
+        } else {
+            "tetra"
+        }
     }
 
     fn shown(&self) -> Value {
@@ -210,7 +219,10 @@ impl From<&Pending> for Saved {
             interface: change.interface.clone(),
             path: change.path.clone(),
             uuid: change.uuid.clone(),
-            previous: change.previous.as_ref().map(|previous| STANDARD.encode(previous)),
+            previous: change
+                .previous
+                .as_ref()
+                .map(|previous| STANDARD.encode(previous)),
             previously_active: change.previously_active.clone(),
             certs: change.certs.clone(),
             written: change.written.clone(),
@@ -226,7 +238,9 @@ impl TryFrom<Saved> for Pending {
         let remaining = Duration::from_secs(saved.rollback_at.saturating_sub(unix_now()));
         Ok(Self {
             token: saved.token,
-            rollback_at: Instant::now().checked_add(remaining).unwrap_or_else(Instant::now),
+            rollback_at: Instant::now()
+                .checked_add(remaining)
+                .unwrap_or_else(Instant::now),
             checkpoint: saved.checkpoint,
             interface: saved.interface,
             path: saved.path,
@@ -290,7 +304,8 @@ impl Shared {
     /// read is logged and removed: NetworkManager still holds its
     /// checkpoint, if it had one.
     fn load(&self) -> Option<Pending> {
-        let loaded = store::read::<Saved>(&self.state).and_then(|saved| saved.map(Pending::try_from).transpose());
+        let loaded = store::read::<Saved>(&self.state)
+            .and_then(|saved| saved.map(Pending::try_from).transpose());
         loaded.unwrap_or_else(|error| {
             eprintln!(
                 "discarding the pending network change in `{}`: {error:#}",
@@ -345,7 +360,11 @@ impl SafeApply {
         grace: Duration,
     ) -> Self {
         Self {
-            shared: Arc::new(Shared { host, pending: Mutex::default(), state }),
+            shared: Arc::new(Shared {
+                host,
+                pending: Mutex::default(),
+                state,
+            }),
             recovered: AtomicBool::new(false),
             rollback_after,
             settle_timeout,
@@ -493,10 +512,14 @@ impl SafeApply {
         // Give the caller the full time to confirm, counted from now.
         undo.rollback_at = after(self.rollback_after);
         if let Some(checkpoint) = &undo.checkpoint
-            && let Err(error) = self.host().checkpoint_adjust(checkpoint, self.rollback_after)
+            && let Err(error) = self
+                .host()
+                .checkpoint_adjust(checkpoint, self.rollback_after)
         {
             eprintln!("failed to extend NetworkManager checkpoint {checkpoint}: {error:#}");
-            undo.rollback_at = created.checked_add(self.rollback_after).unwrap_or(undo.rollback_at);
+            undo.rollback_at = created
+                .checked_add(self.rollback_after)
+                .unwrap_or(undo.rollback_at);
         }
         self.shared.save(&undo);
         let response = json!({
@@ -527,7 +550,10 @@ impl SafeApply {
     /// most, settling 10), and a change that needs confirmation gets the
     /// full time again once applied.
     fn arm_checkpoint(&self, change: &mut Pending) {
-        match self.host().checkpoint_create(&change.interface, self.rollback_after) {
+        match self
+            .host()
+            .checkpoint_create(&change.interface, self.rollback_after)
+        {
             Ok(checkpoint) => change.checkpoint = Some(checkpoint),
             Err(error) => eprintln!(
                 "warning: no NetworkManager checkpoint for {} ({error:#}); Tetra will roll the \
@@ -548,8 +574,12 @@ impl SafeApply {
     /// Errs, after finishing the rollback, when NetworkManager already
     /// rolled the change back (applying it outlasted the checkpoint).
     fn commit(&self, change: &Pending, created: Instant) -> Result<bool> {
-        let Some(checkpoint) = &change.checkpoint else { return Ok(true) };
-        let Err(error) = self.host().checkpoint_destroy(checkpoint) else { return Ok(true) };
+        let Some(checkpoint) = &change.checkpoint else {
+            return Ok(true);
+        };
+        let Err(error) = self.host().checkpoint_destroy(checkpoint) else {
+            return Ok(true);
+        };
         if !self.checkpoint_gone(checkpoint) {
             eprintln!(
                 "failed to destroy NetworkManager checkpoint {checkpoint}; the change needs \
@@ -621,7 +651,9 @@ impl SafeApply {
     /// Errs when a change to `path` awaits confirmation.
     pub fn ensure_settled(&self, path: &Path) -> Result<()> {
         ensure!(
-            self.lock_pending().as_ref().is_none_or(|change| change.path != path),
+            self.lock_pending()
+                .as_ref()
+                .is_none_or(|change| change.path != path),
             "`{}` has a network change awaiting confirmation; confirm it or wait for it to roll back",
             path.display()
         );
@@ -696,7 +728,11 @@ impl SafeApply {
     /// later when NetworkManager rolls it back, to finish that.
     fn timer_delay(&self, change: &Pending) -> Duration {
         let remaining = change.rollback_at.saturating_duration_since(Instant::now());
-        if change.checkpoint.is_some() { remaining.saturating_add(self.grace) } else { remaining }
+        if change.checkpoint.is_some() {
+            remaining.saturating_add(self.grace)
+        } else {
+            remaining
+        }
     }
 
     fn arm_rollback(&self, token: String, delay: Duration) {
@@ -761,7 +797,9 @@ fn finish_rollback(host: &dyn NetworkHost, change: &Pending) -> Result<()> {
     let on_disk = read_keyfile(&change.path)?;
     // NetworkManager rewrites a profile it restores, so the change's own
     // keyfile still being there means it was not restored.
-    let untouched = on_disk.as_deref().is_some_and(|keyfile| digest(keyfile) == change.written);
+    let untouched = on_disk
+        .as_deref()
+        .is_some_and(|keyfile| digest(keyfile) == change.written);
     match &change.previous {
         // Byte for byte, so the certificates it names are kept when pruning.
         Some(previous) if on_disk.as_ref() != Some(previous) => {
@@ -838,11 +876,15 @@ fn digest(keyfile: &[u8]) -> String {
 
 /// `duration` from now.
 fn after(duration: Duration) -> Instant {
-    Instant::now().checked_add(duration).unwrap_or_else(Instant::now)
+    Instant::now()
+        .checked_add(duration)
+        .unwrap_or_else(Instant::now)
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs())
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// A NetworkManager stand-in for tests, shared with the parent module's.
@@ -932,7 +974,10 @@ pub(super) mod fake {
 
         /// NetworkManager's timeouts fire: every checkpoint rolls back.
         pub fn expire_checkpoints(&self) {
-            let paths: Vec<_> = lock(&self.checkpoints).iter().map(|cp| cp.path.clone()).collect();
+            let paths: Vec<_> = lock(&self.checkpoints)
+                .iter()
+                .map(|cp| cp.path.clone())
+                .collect();
             for path in paths {
                 // Tetra's timer may have rolled it back meanwhile.
                 self.restore(&path).ok();
@@ -1027,7 +1072,9 @@ pub(super) mod fake {
             if self.fail_every_activation.load(Ordering::Relaxed)
                 || lock(&self.fail_uuid).as_deref() == Some(uuid)
             {
-                bail!("Error: Connection activation failed: Secrets were required, but not provided");
+                bail!(
+                    "Error: Connection activation failed: Secrets were required, but not provided"
+                );
             }
             *lock(&self.active) = Some(uuid.to_owned());
             Ok(())
@@ -1036,7 +1083,9 @@ pub(super) mod fake {
         fn deactivate(&self, uuid: &str) -> Result<()> {
             lock(&self.calls).push(format!("down {uuid}"));
             ensure!(
-                lock(&self.active).take_if(|active| active == uuid).is_some(),
+                lock(&self.active)
+                    .take_if(|active| active == uuid)
+                    .is_some(),
                 "Error: '{uuid}' is not an active connection"
             );
             Ok(())
@@ -1068,7 +1117,9 @@ pub(super) mod fake {
         fn checkpoint_adjust(&self, checkpoint: &str, _timeout: Duration) -> Result<()> {
             lock(&self.checkpoint_calls).push("adjust".to_owned());
             ensure!(
-                lock(&self.checkpoints).iter().any(|cp| cp.path == checkpoint),
+                lock(&self.checkpoints)
+                    .iter()
+                    .any(|cp| cp.path == checkpoint),
                 "checkpoint {checkpoint} does not exist"
             );
             Ok(())
@@ -1085,7 +1136,10 @@ pub(super) mod fake {
         }
 
         fn checkpoints(&self) -> Result<Vec<String>> {
-            Ok(lock(&self.checkpoints).iter().map(|cp| cp.path.clone()).collect())
+            Ok(lock(&self.checkpoints)
+                .iter()
+                .map(|cp| cp.path.clone())
+                .collect())
         }
     }
 }
@@ -1111,8 +1165,20 @@ mod tests {
         )
     }
 
-    fn change<'a>(interface: &'a str, path: &'a Path, uuid: &'a str, contents: &'a [u8]) -> Change<'a> {
-        Change { interface, path, uuid, contents, certs: None, pem_files: &[] }
+    fn change<'a>(
+        interface: &'a str,
+        path: &'a Path,
+        uuid: &'a str,
+        contents: &'a [u8],
+    ) -> Change<'a> {
+        Change {
+            interface,
+            path,
+            uuid,
+            contents,
+            certs: None,
+            pem_files: &[],
+        }
     }
 
     fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -1165,9 +1231,7 @@ mod tests {
         host.after_activate(&["198.51.100.4"]);
         let apply = safe_apply(&host, Duration::from_millis(100), dir.path());
 
-        let response = apply
-            .apply(&change("eth0", &path, "same", b"new"))
-            .unwrap();
+        let response = apply.apply(&change("eth0", &path, "same", b"new")).unwrap();
         assert_eq!(response["confirmation_required"], true);
         assert!(response["confirmation_token"].as_str().is_some());
         assert_eq!(fs::read(&path).unwrap(), b"new");
@@ -1191,14 +1255,15 @@ mod tests {
         host.after_activate(&[]);
         let apply = safe_apply(&host, Duration::from_millis(50), dir.path());
 
-        let response = apply
-            .apply(&change("eth0", &path, "new", b"new"))
-            .unwrap();
+        let response = apply.apply(&change("eth0", &path, "new", b"new")).unwrap();
         assert_eq!(response["confirmation_required"], true);
 
         wait_until(|| !path.exists());
         wait_until(|| host.calls().len() == 4);
-        assert_eq!(host.calls(), ["load", "up new", "delete new", "up cloud-init"]);
+        assert_eq!(
+            host.calls(),
+            ["load", "up new", "delete new", "up cloud-init"]
+        );
     }
 
     #[test]
@@ -1211,9 +1276,7 @@ mod tests {
         host.after_activate(&[]);
         let apply = safe_apply(&host, Duration::from_millis(20), dir.path());
 
-        apply
-            .apply(&change("eth0", &path, "u", b"new"))
-            .unwrap();
+        apply.apply(&change("eth0", &path, "u", b"new")).unwrap();
 
         wait_until(|| host.calls().len() == 4);
         assert_eq!(host.calls(), ["load", "up u", "load", "down u"]);
@@ -1229,9 +1292,7 @@ mod tests {
         host.after_activate(&["192.0.2.99"]);
         let apply = safe_apply(&host, Duration::from_millis(200), dir.path());
 
-        let response = apply
-            .apply(&change("eth0", &path, "u", b"new"))
-            .unwrap();
+        let response = apply.apply(&change("eth0", &path, "u", b"new")).unwrap();
         let token = response["confirmation_token"].as_str().unwrap();
 
         apply.confirm("wrong").unwrap_err();
@@ -1252,9 +1313,7 @@ mod tests {
         host.after_activate(&[]);
         let apply = safe_apply(&host, Duration::from_millis(20), dir.path());
 
-        let response = apply
-            .apply(&change("eth0", &path, "u", b"new"))
-            .unwrap();
+        let response = apply.apply(&change("eth0", &path, "u", b"new")).unwrap();
         let token = response["confirmation_token"].as_str().unwrap().to_owned();
 
         wait_until(|| lock(&apply.shared.pending).is_none());
@@ -1275,9 +1334,15 @@ mod tests {
             .apply_or_revert(&change("wlan0", &path, "new", b"new"))
             .unwrap_err();
 
-        assert!(format!("{error:#}").contains("Secrets were required"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("Secrets were required"),
+            "{error:#}"
+        );
         assert!(!path.exists());
-        assert_eq!(host.calls(), ["load", "up new", "delete new", "up ethernet"]);
+        assert_eq!(
+            host.calls(),
+            ["load", "up new", "delete new", "up ethernet"]
+        );
         assert!(lock(&apply.shared.pending).is_none());
     }
 
@@ -1297,7 +1362,10 @@ mod tests {
         assert_eq!(host.calls(), ["load", "up same", "load", "up same"]);
         // Bringing the old profile back failed too; both are reported.
         let message = format!("{error:#}");
-        assert!(message.contains("undoing the change failed too"), "{message}");
+        assert!(
+            message.contains("undoing the change failed too"),
+            "{message}"
+        );
         assert!(message.contains("Secrets were required"), "{message}");
     }
 
@@ -1349,9 +1417,14 @@ mod tests {
         host.after_activate(&[]);
         let apply = safe_apply(&host, Duration::from_secs(60), dir.path());
 
-        let error = apply.apply(&change("eth0", &path, "u", b"new")).unwrap_err();
+        let error = apply
+            .apply(&change("eth0", &path, "u", b"new"))
+            .unwrap_err();
 
-        assert!(format!("{error:#}").contains("Secrets were required"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("Secrets were required"),
+            "{error:#}"
+        );
         assert_eq!(fs::read(&path).unwrap(), b"old");
         assert!(lock(&apply.shared.pending).is_none());
     }
@@ -1425,13 +1498,19 @@ mod tests {
         let path = dir.path().join("eth0.nmconnection");
         let certs = dir.path().join("certs");
         let old_certs = certs::write(&pem_files(&certs)).unwrap();
-        let old = old_certs.iter().map(|cert| cert.display().to_string()).join("\n");
+        let old = old_certs
+            .iter()
+            .map(|cert| cert.display().to_string())
+            .join("\n");
         fs::write(&path, &old).unwrap();
         let host = FakeHost::with(&["192.0.2.10"], Some("u"));
         host.fail_relabel_of(&path);
 
         let error = safe_apply(&host, Duration::from_secs(60), dir.path())
-            .apply(&Change { certs: Some(&certs), ..change("eth0", &path, "u", b"new") })
+            .apply(&Change {
+                certs: Some(&certs),
+                ..change("eth0", &path, "u", b"new")
+            })
             .unwrap_err();
 
         assert!(format!("{error:#}").contains("restorecon"), "{error:#}");
@@ -1481,16 +1560,24 @@ mod tests {
 
         assert_eq!(response["confirmation_required"], true);
         assert_eq!(response["rollback_by"], "networkmanager");
-        assert_eq!(response["checkpoint"], "/org/freedesktop/NetworkManager/Checkpoint/1");
+        assert_eq!(
+            response["checkpoint"],
+            "/org/freedesktop/NetworkManager/Checkpoint/1"
+        );
         assert_eq!(host.checkpoint_calls(), ["create", "adjust"]);
         assert_eq!(host.held_checkpoints(), 1);
         let state = state(dir.path());
-        assert_eq!(fs::metadata(&state).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let saved: Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
         assert_eq!(saved["token"], response["confirmation_token"]);
         assert_eq!(saved["checkpoint"], response["checkpoint"]);
 
-        apply.confirm(response["confirmation_token"].as_str().unwrap()).unwrap();
+        apply
+            .confirm(response["confirmation_token"].as_str().unwrap())
+            .unwrap();
 
         assert_eq!(host.checkpoint_calls(), ["create", "adjust", "destroy"]);
         assert_eq!(host.held_checkpoints(), 0);
@@ -1535,7 +1622,10 @@ mod tests {
             .apply_or_revert(&change("wlan0", &path, "new", b"new"))
             .unwrap_err();
 
-        assert!(format!("{error:#}").contains("the change was undone"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("the change was undone"),
+            "{error:#}"
+        );
         assert!(!path.exists());
         assert_eq!(host.checkpoint_calls(), ["create", "rollback"]);
         assert_eq!(host.calls(), ["load", "up new"]);
@@ -1624,8 +1714,13 @@ mod tests {
         let response = apply.apply(&change("eth0", &path, "same", b"new")).unwrap();
         host.restart();
 
-        assert_eq!(apply.pending()["pending"]["confirmation_token"], response["confirmation_token"]);
-        apply.confirm(response["confirmation_token"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            apply.pending()["pending"]["confirmation_token"],
+            response["confirmation_token"]
+        );
+        apply
+            .confirm(response["confirmation_token"].as_str().unwrap())
+            .unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"new");
         assert_eq!(host.calls(), ["load", "up same"]);
@@ -1649,7 +1744,9 @@ mod tests {
         host.expire_checkpoints();
         thread::sleep(Duration::from_millis(40));
 
-        let error = apply.confirm(response["confirmation_token"].as_str().unwrap()).unwrap_err();
+        let error = apply
+            .confirm(response["confirmation_token"].as_str().unwrap())
+            .unwrap_err();
 
         assert!(error.to_string().contains("already rolled back"), "{error}");
         assert_eq!(fs::read(&path).unwrap(), b"old");
@@ -1664,7 +1761,9 @@ mod tests {
         fs::write(state(dir.path()), "{not json").unwrap();
         let host = FakeHost::with(&[], None);
 
-        assert!(safe_apply(&host, Duration::from_secs(60), dir.path()).pending()["pending"].is_null());
+        assert!(
+            safe_apply(&host, Duration::from_secs(60), dir.path()).pending()["pending"].is_null()
+        );
         assert!(!state(dir.path()).exists());
     }
 }

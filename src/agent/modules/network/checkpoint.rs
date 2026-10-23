@@ -60,7 +60,12 @@ pub fn create(interface: &str, timeout_secs: u32) -> Result<String> {
     let result = call(
         "CheckpointCreate",
         "aouu",
-        &["1", &device, &timeout_secs.to_string(), &DELETE_NEW_CONNECTIONS.to_string()],
+        &[
+            "1",
+            &device,
+            &timeout_secs.to_string(),
+            &DELETE_NEW_CONNECTIONS.to_string(),
+        ],
     )
     .context("failed to create a NetworkManager checkpoint")?;
     let checkpoint = object_path(&result.stdout)?;
@@ -91,8 +96,12 @@ pub fn rollback(checkpoint: &str) -> Result<()> {
 /// Restart `checkpoint`'s timeout: it now rolls back `timeout_secs` from now.
 pub fn adjust_timeout(checkpoint: &str, timeout_secs: u32) -> Result<()> {
     validate(checkpoint)?;
-    call("CheckpointAdjustRollbackTimeout", "ou", &[checkpoint, &timeout_secs.to_string()])
-        .map(drop)
+    call(
+        "CheckpointAdjustRollbackTimeout",
+        "ou",
+        &[checkpoint, &timeout_secs.to_string()],
+    )
+    .map(drop)
 }
 
 /// Every checkpoint NetworkManager holds.
@@ -104,7 +113,11 @@ pub fn list() -> Result<Vec<String>> {
         .as_array()
         .context("`Checkpoints` is not an array")?
         .iter()
-        .map(|path| path.as_str().map(str::to_owned).context("checkpoint path is not a string"))
+        .map(|path| {
+            path.as_str()
+                .map(str::to_owned)
+                .context("checkpoint path is not a string")
+        })
         .collect()
 }
 
@@ -135,7 +148,9 @@ fn object_path(stdout: &str) -> Result<String> {
 /// `NM_ROLLBACK_RESULT_OK`.
 fn rollback_failures(stdout: &str) -> Result<Vec<String>> {
     let value: Value = serde_json::from_str(stdout).context("failed to parse `busctl` output")?;
-    let results = value["data"][0].as_object().context("rollback returned no results")?;
+    let results = value["data"][0]
+        .as_object()
+        .context("rollback returned no results")?;
     Ok(results
         .iter()
         .filter(|(_, result)| result.as_u64() != Some(0))
@@ -167,10 +182,17 @@ mod tests {
 
     #[test]
     fn reports_devices_that_did_not_roll_back() {
-        assert!(rollback_failures(r#"{"type":"a{su}","data":[{"/d/2":0}]}"#).unwrap().is_empty());
+        assert!(
+            rollback_failures(r#"{"type":"a{su}","data":[{"/d/2":0}]}"#)
+                .unwrap()
+                .is_empty()
+        );
         let failed =
             rollback_failures(r#"{"type":"a{su}","data":[{"/d/2":0,"/d/3":1,"/d/4":3}]}"#).unwrap();
-        assert_eq!(failed, ["/d/3 (the device no longer exists)", "/d/4 (it failed)"]);
+        assert_eq!(
+            failed,
+            ["/d/3 (the device no longer exists)", "/d/4 (it failed)"]
+        );
     }
 
     #[test]

@@ -239,7 +239,10 @@ fn validate_name(name: &str) -> Result<()> {
 /// `chpasswd` line.
 fn validate_password_hash(hash: &str) -> Result<()> {
     ensure!(
-        !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_graphic() && byte != b':'),
+        !hash.is_empty()
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && byte != b':'),
         "password_hash must be a crypt(3) hash: printable ASCII without spaces or `:`"
     );
     Ok(())
@@ -247,7 +250,10 @@ fn validate_password_hash(hash: &str) -> Result<()> {
 
 /// Validate key lines and join them into an `authorized_keys` file.
 fn authorized_keys(keys: &[String]) -> Result<String> {
-    ensure!(keys.len() <= MAX_KEYS, "at most {MAX_KEYS} keys are accepted");
+    ensure!(
+        keys.len() <= MAX_KEYS,
+        "at most {MAX_KEYS} keys are accepted"
+    );
     let mut contents = String::new();
     for key in keys {
         let key = key.trim();
@@ -289,8 +295,13 @@ fn write_authorized_keys(home: &Path, uid: Uid, gid: Gid, contents: &[u8]) -> Re
         Ok(()) | Err(Errno::EEXIST) => {}
         Err(error) => return Err(error).context("failed to create `.ssh`"),
     }
-    let ssh_fd = openat(&home_fd, ".ssh", directory | OFlag::O_NOFOLLOW, Mode::empty())
-        .with_context(|| format!("`{}/.ssh` is not a directory", home.display()))?;
+    let ssh_fd = openat(
+        &home_fd,
+        ".ssh",
+        directory | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .with_context(|| format!("`{}/.ssh` is not a directory", home.display()))?;
     fchown(&ssh_fd, Some(uid), Some(gid)).context("failed to chown `.ssh`")?;
     fchmod(&ssh_fd, Mode::from_bits_truncate(0o700)).context("failed to chmod `.ssh`")?;
 
@@ -443,7 +454,10 @@ mod tests {
             }
             .handle(None)
             .unwrap_err();
-            assert!(error.to_string().contains("password_hash"), "{bad:?}: {error}");
+            assert!(
+                error.to_string().contains("password_hash"),
+                "{bad:?}: {error}"
+            );
         }
         validate_password_hash("!$6$rounds=5000$salt$hash").unwrap();
     }
@@ -503,7 +517,10 @@ mod tests {
                     None,
                 )
                 .unwrap_err();
-            assert!(error.to_string().contains("not a valid"), "{action}: {error}");
+            assert!(
+                error.to_string().contains("not a valid"),
+                "{action}: {error}"
+            );
         }
         let set_password = serde_json::json!({
             "name": "--help", "password_hash": "$y$x", "dry_run": true
@@ -587,7 +604,12 @@ mod tests {
         std::os::unix::fs::symlink(&target, home.path().join(".ssh/authorized_keys")).unwrap();
         let path = write_authorized_keys(home.path(), uid, gid, b"key\n").unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
-        assert!(!fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert!(
+            !fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), "key\n");
     }
 

@@ -272,7 +272,9 @@ fn validate_upstream(upstream: &str) -> Result<String> {
     // `[scheme://]host:port[/...]`: the port is required, and may not be one
     // that would expose Caddy's admin API or the OOBE to anyone who can
     // reach the new site (`reverse_proxy.write` is grantable).
-    let authority = upstream.split_once("://").map_or(upstream, |(_, rest)| rest);
+    let authority = upstream
+        .split_once("://")
+        .map_or(upstream, |(_, rest)| rest);
     let authority = authority.split('/').next().unwrap_or_default();
     let port = authority
         .rsplit_once(':')
@@ -389,7 +391,8 @@ pub fn migrate_legacy_sites(legacy_dir: &Path, config_dir: &Path) -> Result<Vec<
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
-            return Err(error).with_context(|| format!("failed to read `{}`", legacy_dir.display()));
+            return Err(error)
+                .with_context(|| format!("failed to read `{}`", legacy_dir.display()));
         }
     };
     let mut moved = Vec::new();
@@ -646,7 +649,12 @@ mod tests {
 
     #[test]
     fn upstreams_need_one_host_and_an_unreserved_port() {
-        for ok in ["127.0.0.1:8080", "[::1]:8080", "localhost:3000", "http://app.lan:80/"] {
+        for ok in [
+            "127.0.0.1:8080",
+            "[::1]:8080",
+            "localhost:3000",
+            "http://app.lan:80/",
+        ] {
             validate_upstream(ok).unwrap();
         }
         for bad in [
@@ -764,7 +772,10 @@ mod tests {
             tls: DashboardTls::Dns {
                 provider: "powerdns",
                 fields: vec![
-                    ("server_url", DnsValue::Literal("https://ns.example.com".into())),
+                    (
+                        "server_url",
+                        DnsValue::Literal("https://ns.example.com".into()),
+                    ),
                     ("api_token", DnsValue::Env("TETRA_DNS_API_TOKEN".into())),
                 ],
             },
@@ -844,16 +855,30 @@ mod tests {
         let legacy = dir.path().join("tetra-sites");
         let sites = dir.path().join("Caddyfile.d");
         let site = |domain: &str| {
-            SiteMetadata::new(domain, "127.0.0.1:8080", true).unwrap().render().unwrap()
+            SiteMetadata::new(domain, "127.0.0.1:8080", true)
+                .unwrap()
+                .render()
+                .unwrap()
         };
         // Missing: nothing to do.
-        assert_eq!(migrate_legacy_sites(&legacy, &sites).unwrap(), Vec::<PathBuf>::new());
+        assert_eq!(
+            migrate_legacy_sites(&legacy, &sites).unwrap(),
+            Vec::<PathBuf>::new()
+        );
         fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join("app_example_com.caddy"), site("app.example.com")).unwrap();
+        fs::write(
+            legacy.join("app_example_com.caddy"),
+            site("app.example.com"),
+        )
+        .unwrap();
         // The operator's own files stay, and so does a site whose new name
         // is taken.
         fs::write(legacy.join("mine.caddy"), "mine.example.com {\n}\n").unwrap();
-        fs::write(legacy.join("taken_example_com.caddy"), site("taken.example.com")).unwrap();
+        fs::write(
+            legacy.join("taken_example_com.caddy"),
+            site("taken.example.com"),
+        )
+        .unwrap();
         fs::create_dir_all(&sites).unwrap();
         fs::write(sites.join("taken_example_com.caddyfile"), "operator's\n").unwrap();
 
@@ -862,7 +887,10 @@ mod tests {
         assert!(!legacy.join("app_example_com.caddy").exists());
         assert!(legacy.join("mine.caddy").exists());
         assert!(legacy.join("taken_example_com.caddy").exists());
-        assert_eq!(fs::read_to_string(sites.join("taken_example_com.caddyfile")).unwrap(), "operator's\n");
+        assert_eq!(
+            fs::read_to_string(sites.join("taken_example_com.caddyfile")).unwrap(),
+            "operator's\n"
+        );
         // `list` sees them in its directory, which is where `agent-serve`
         // migrates to: `DEFAULT_CONFIG_DIR` unless a request names another.
         let listed = ReverseProxyModule
@@ -873,7 +901,10 @@ mod tests {
         let default: List = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(default.config_dir, Path::new(DEFAULT_CONFIG_DIR));
         // Once moved, there is nothing left to do.
-        assert_eq!(migrate_legacy_sites(&legacy, &sites).unwrap(), Vec::<PathBuf>::new());
+        assert_eq!(
+            migrate_legacy_sites(&legacy, &sites).unwrap(),
+            Vec::<PathBuf>::new()
+        );
     }
 
     #[test]

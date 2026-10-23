@@ -35,9 +35,16 @@ const MAX_KEYFILE_BYTES: u64 = 1024 * 1024;
 /// file (a symlink, directory, FIFO, ...).
 pub fn validate_keyfile_path(dir: &Path, path: &Path) -> Result<PathBuf> {
     let display = path.display();
-    ensure!(path.is_absolute(), "keyfile path `{display}` must be absolute");
     ensure!(
-        !path.as_os_str().as_encoded_bytes().windows(2).any(|w| w == b".."),
+        path.is_absolute(),
+        "keyfile path `{display}` must be absolute"
+    );
+    ensure!(
+        !path
+            .as_os_str()
+            .as_encoded_bytes()
+            .windows(2)
+            .any(|w| w == b".."),
         "keyfile path `{display}` must not contain `..`"
     );
     // `components()` silently drops `.` and repeated or trailing slashes, so
@@ -74,10 +81,16 @@ fn validate_file_name(name: &str) -> Result<()> {
     let stem = name
         .strip_suffix(KEYFILE_EXTENSION)
         .with_context(|| format!("keyfile `{name}` must end in `{KEYFILE_EXTENSION}`"))?;
-    ensure!(!stem.is_empty(), "keyfile `{name}` needs a name before the extension");
+    ensure!(
+        !stem.is_empty(),
+        "keyfile `{name}` needs a name before the extension"
+    );
     // NetworkManager ignores hidden files; Tetra's own temporary files are
     // hidden, so never let a payload address one.
-    ensure!(!stem.starts_with('.'), "keyfile `{name}` must not be hidden");
+    ensure!(
+        !stem.starts_with('.'),
+        "keyfile `{name}` must not be hidden"
+    );
     ensure!(
         !name.chars().any(char::is_control),
         "keyfile name must not contain control characters"
@@ -96,9 +109,7 @@ fn ensure_regular_or_missing(path: &Path) -> Result<()> {
             Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to inspect `{}`", path.display()))
-        }
+        Err(error) => Err(error).with_context(|| format!("failed to inspect `{}`", path.display())),
     }
 }
 
@@ -124,7 +135,10 @@ pub fn read_keyfile(path: &Path) -> Result<Option<Vec<u8>>> {
     let metadata = file.metadata()?;
     ensure!(metadata.is_file(), "`{display}` is not a regular file");
     ensure!(metadata.nlink() == 1, "`{display}` has other hard links");
-    ensure!(metadata.len() <= MAX_KEYFILE_BYTES, "`{display}` is too large");
+    ensure!(
+        metadata.len() <= MAX_KEYFILE_BYTES,
+        "`{display}` is too large"
+    );
     let mut contents = Vec::new();
     file.take(MAX_KEYFILE_BYTES)
         .read_to_end(&mut contents)
@@ -219,7 +233,12 @@ mod tests {
         validate_keyfile_path(dir.path(), &link).unwrap_err();
         validate_keyfile_path(dir.path(), &subdir).unwrap_err();
         // Even when called directly, reads refuse to follow the link.
-        assert!(read_keyfile(&link).unwrap_err().to_string().contains("symlink"));
+        assert!(
+            read_keyfile(&link)
+                .unwrap_err()
+                .to_string()
+                .contains("symlink")
+        );
     }
 
     #[test]
@@ -246,7 +265,10 @@ mod tests {
 
         let mode = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        assert_eq!(read_keyfile(&path).unwrap().unwrap(), b"[connection]\nid=eth0\n");
+        assert_eq!(
+            read_keyfile(&path).unwrap().unwrap(),
+            b"[connection]\nid=eth0\n"
+        );
         // No temporary files are left behind.
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
 

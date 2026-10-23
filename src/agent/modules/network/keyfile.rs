@@ -216,7 +216,9 @@ pub fn validate(request: &mut NetworkConfigureRequest, cert_roots: &CertRoots<'_
 /// `.` nor containing `..`: safe as an argument, file name and keyfile value.
 fn is_plain_name(value: &str, max: usize) -> bool {
     (1..=max).contains(&value.len())
-        && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         && !value.starts_with(['-', '.'])
         && !value.contains("..")
 }
@@ -302,7 +304,10 @@ fn validate_domain(section: &str, domain: &str) -> Result<()> {
                 && !label.ends_with('-')
                 && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         });
-    ensure!(valid, "{section}.domain_suffix_match `{domain}` is not a domain name");
+    ensure!(
+        valid,
+        "{section}.domain_suffix_match `{domain}` is not a domain name"
+    );
     Ok(())
 }
 
@@ -339,7 +344,10 @@ pub(super) fn validate_8021x(
         validate_domain(section, domain)?;
         // Only these methods check the server's certificate.
         ensure!(
-            matches!(wired.eap, EapMethod::Tls | EapMethod::Peap | EapMethod::Ttls),
+            matches!(
+                wired.eap,
+                EapMethod::Tls | EapMethod::Peap | EapMethod::Ttls
+            ),
             "{section}.domain_suffix_match is only used with tls, peap and ttls"
         );
     }
@@ -396,7 +404,11 @@ fn validate_family<M: Method, A: Family>(config: &IpConfig<M, A>) -> Result<bool
             config.addresses.len() <= MAX_ADDRESSES,
             "{label}.addresses allows at most {MAX_ADDRESSES} entries"
         );
-        for IpAddressConfig { address, prefix_length } in &config.addresses {
+        for IpAddressConfig {
+            address,
+            prefix_length,
+        } in &config.addresses
+        {
             ensure!(
                 (1..=A::MAX_PREFIX).contains(prefix_length),
                 "{label} prefix_length for {address} must be between 1 and {}",
@@ -410,7 +422,10 @@ fn validate_family<M: Method, A: Family>(config: &IpConfig<M, A>) -> Result<bool
         }
         ensure_unique(config.addresses.iter().map(|a| a.address), label, "address")?;
         if let Some(gateway) = config.gateway {
-            ensure!(is_unicast(gateway.ip()), "{label}.gateway {gateway} is not a usable gateway");
+            ensure!(
+                is_unicast(gateway.ip()),
+                "{label}.gateway {gateway} is not a usable gateway"
+            );
             ensure!(
                 config.addresses.iter().all(|a| a.address != gateway),
                 "{label}.gateway {gateway} is one of the host's own addresses"
@@ -462,7 +477,11 @@ fn is_unicast(address: IpAddr) -> bool {
     )
 }
 
-fn ensure_unique<A: Family>(values: impl Iterator<Item = A>, label: &str, what: &str) -> Result<()> {
+fn ensure_unique<A: Family>(
+    values: impl Iterator<Item = A>,
+    label: &str,
+    what: &str,
+) -> Result<()> {
     let mut seen = HashSet::new();
     for value in values {
         ensure!(seen.insert(value), "{label} {what} {value} is listed twice");
@@ -486,7 +505,14 @@ fn render_keyfile(request: &NetworkConfigureRequest, uuid: &str, redact: bool) -
     let mut out = String::new();
     // Writing to a `String` cannot fail.
     let _ok: std::fmt::Result = (|| {
-        render_connection(&mut out, "configure", connection_name(request), uuid, "ethernet", &request.interface)?;
+        render_connection(
+            &mut out,
+            "configure",
+            connection_name(request),
+            uuid,
+            "ethernet",
+            &request.interface,
+        )?;
         writeln!(out, "[ethernet]")?;
         writeln!(out)?;
         if let Some(wired) = &request.wired_8021x {
@@ -519,7 +545,11 @@ pub(super) fn render_connection(
 }
 
 /// The `[ipv4]` and `[ipv6]` sections, which end the profile.
-pub(super) fn render_ip(out: &mut String, ipv4: &Ipv4Config, ipv6: &Ipv6Config) -> std::fmt::Result {
+pub(super) fn render_ip(
+    out: &mut String,
+    ipv4: &Ipv4Config,
+    ipv6: &Ipv6Config,
+) -> std::fmt::Result {
     render_family(out, ipv4)?;
     writeln!(out)?;
     render_family(out, ipv6)
@@ -624,8 +654,13 @@ fn render_family<M: Method, A: Family>(
 ) -> std::fmt::Result {
     writeln!(out, "[{}]", A::LABEL)?;
     writeln!(out, "method={}", config.method.keyword())?;
-    for (index, IpAddressConfig { address, prefix_length }) in
-        (1_usize..).zip(&config.addresses)
+    for (
+        index,
+        IpAddressConfig {
+            address,
+            prefix_length,
+        },
+    ) in (1_usize..).zip(&config.addresses)
     {
         writeln!(out, "address{index}={address}/{prefix_length}")?;
     }
@@ -698,12 +733,19 @@ mod tests {
 
     /// Roots no path is under.
     fn no_roots() -> CertRoots<'static> {
-        CertRoots { pki: Path::new("/nonexistent"), tetra: Path::new("/nonexistent"), profile: "eth0" }
+        CertRoots {
+            pki: Path::new("/nonexistent"),
+            tetra: Path::new("/nonexistent"),
+            profile: "eth0",
+        }
     }
 
     /// `store` as the host's certificate store.
     fn roots(store: &Path) -> CertRoots<'_> {
-        CertRoots { pki: store, ..no_roots() }
+        CertRoots {
+            pki: store,
+            ..no_roots()
+        }
     }
 
     fn rendered(value: Value) -> String {
@@ -748,9 +790,11 @@ mod tests {
             "ipv4": { "method": "auto", "dns": ["1.1.1.1", "9.9.9.9"] },
             "ipv6": { "method": "link-local" }
         }));
-        assert!(keyfile.ends_with(
-            "[ipv4]\nmethod=auto\ndns=1.1.1.1;9.9.9.9;\n\n[ipv6]\nmethod=link-local\n"
-        ));
+        assert!(
+            keyfile.ends_with(
+                "[ipv4]\nmethod=auto\ndns=1.1.1.1;9.9.9.9;\n\n[ipv6]\nmethod=link-local\n"
+            )
+        );
     }
 
     #[test]
@@ -841,7 +885,10 @@ mod tests {
     #[test]
     fn dual_stack_auto_is_the_default() {
         let keyfile = rendered(json!({ "interface": "eth0" }));
-        assert_eq!(keyfile, header("eth0") + "[ipv4]\nmethod=auto\n\n[ipv6]\nmethod=auto\n");
+        assert_eq!(
+            keyfile,
+            header("eth0") + "[ipv4]\nmethod=auto\n\n[ipv6]\nmethod=auto\n"
+        );
     }
 
     #[test]
@@ -898,8 +945,14 @@ mod tests {
                 "ipv4": section(v4, "10.0.0.2", 24),
                 "ipv6": section(v6, "2001:db8::2", 64),
             }));
-            assert!(keyfile.contains(&format!("[ipv4]\nmethod={v4}\n")), "{keyfile}");
-            assert!(keyfile.contains(&format!("[ipv6]\nmethod={v6}\n")), "{keyfile}");
+            assert!(
+                keyfile.contains(&format!("[ipv4]\nmethod={v4}\n")),
+                "{keyfile}"
+            );
+            assert!(
+                keyfile.contains(&format!("[ipv6]\nmethod={v6}\n")),
+                "{keyfile}"
+            );
         }
     }
 
@@ -1044,7 +1097,16 @@ mod tests {
 
     #[test]
     fn rejects_bad_interface_and_profile_names() {
-        for interface in ["", "../etc", "eth0/x", "-eth0", ".", "a-very-long-interface-name", "eth 0", "eth0\n"] {
+        for interface in [
+            "",
+            "../etc",
+            "eth0/x",
+            "-eth0",
+            ".",
+            "a-very-long-interface-name",
+            "eth 0",
+            "eth0\n",
+        ] {
             rejection(json!({ "interface": interface }));
         }
         for name in ["", "..", ".hidden", "a/b", "a..b", "with space", "x\ny"] {
@@ -1094,17 +1156,20 @@ mod tests {
 
     #[test]
     fn wired_8021x_tls_uses_certificates() {
-        let keyfile = render(&request(json!({
-            "interface": "eth0",
-            "wired_8021x": {
-                "eap": "tls",
-                "identity": "host.example.com",
-                "ca_cert": "/etc/pki/8021x/ca.pem",
-                "client_cert": "/etc/pki/8021x/client.pem",
-                "private_key": "/etc/pki/8021x/client.key",
-                "private_key_password": "keypass"
-            }
-        })), UUID);
+        let keyfile = render(
+            &request(json!({
+                "interface": "eth0",
+                "wired_8021x": {
+                    "eap": "tls",
+                    "identity": "host.example.com",
+                    "ca_cert": "/etc/pki/8021x/ca.pem",
+                    "client_cert": "/etc/pki/8021x/client.pem",
+                    "private_key": "/etc/pki/8021x/client.key",
+                    "private_key_password": "keypass"
+                }
+            })),
+            UUID,
+        );
         assert!(keyfile.contains(
             "[802-1x]\neap=tls;\nidentity=host.example.com\nca-cert=/etc/pki/8021x/ca.pem\n\
              client-cert=/etc/pki/8021x/client.pem\nprivate-key=/etc/pki/8021x/client.key\n\
@@ -1135,16 +1200,22 @@ mod tests {
 
     #[test]
     fn wired_8021x_tls_key_without_a_password_needs_none() {
-        let keyfile = render(&request(json!({
-            "interface": "eth0",
-            "wired_8021x": {
-                "eap": "tls",
-                "identity": "host.example.com",
-                "client_cert": "/etc/pki/8021x/client.pem",
-                "private_key": "/etc/pki/8021x/client.key"
-            }
-        })), UUID);
-        assert!(keyfile.contains("private-key=/etc/pki/8021x/client.key\nprivate-key-password-flags=4\n"));
+        let keyfile = render(
+            &request(json!({
+                "interface": "eth0",
+                "wired_8021x": {
+                    "eap": "tls",
+                    "identity": "host.example.com",
+                    "client_cert": "/etc/pki/8021x/client.pem",
+                    "private_key": "/etc/pki/8021x/client.key"
+                }
+            })),
+            UUID,
+        );
+        assert!(
+            keyfile
+                .contains("private-key=/etc/pki/8021x/client.key\nprivate-key-password-flags=4\n")
+        );
     }
 
     #[test]
@@ -1158,13 +1229,16 @@ mod tests {
         }));
         assert!(keyfile.contains("domain-suffix-match=radius.example.com\nsystem-ca-certs=true\n"));
         // With a CA of its own, that CA is the one the server is checked against.
-        let keyfile = render(&request(json!({
-            "interface": "eth0",
-            "wired_8021x": {
-                "eap": "peap", "identity": "bob", "password": "x",
-                "ca_cert": "/etc/pki/ca.pem", "domain_suffix_match": "radius.example.com"
-            }
-        })), UUID);
+        let keyfile = render(
+            &request(json!({
+                "interface": "eth0",
+                "wired_8021x": {
+                    "eap": "peap", "identity": "bob", "password": "x",
+                    "ca_cert": "/etc/pki/ca.pem", "domain_suffix_match": "radius.example.com"
+                }
+            })),
+            UUID,
+        );
         assert!(!keyfile.contains("system-ca-certs"));
     }
 
@@ -1179,7 +1253,13 @@ mod tests {
         let alias = store.path().join("alias.pem");
         std::os::unix::fs::symlink(&ca, &alias).unwrap();
         let fifo = store.path().join("fifo.pem");
-        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
         let check = |path: &Path| {
             validate(
                 &mut request(json!({
@@ -1192,7 +1272,13 @@ mod tests {
 
         check(Path::new(&ca)).unwrap();
         check(&alias).unwrap();
-        for path in [&secret, &escape, &fifo, &store.path().join("missing.pem"), store.path()] {
+        for path in [
+            &secret,
+            &escape,
+            &fifo,
+            &store.path().join("missing.pem"),
+            store.path(),
+        ] {
             let error = check(path).unwrap_err().to_string();
             assert!(error.contains("must be a regular file under"), "{error}");
         }
@@ -1206,10 +1292,17 @@ mod tests {
         let tetra = store.path().join("tetra");
         for profile in ["eth0", "eth1"] {
             fs::create_dir_all(tetra.join(profile)).unwrap();
-            fs::write(tetra.join(profile).join("ca-cert.pem"), "-----BEGIN CERTIFICATE-----\n")
-                .unwrap();
+            fs::write(
+                tetra.join(profile).join("ca-cert.pem"),
+                "-----BEGIN CERTIFICATE-----\n",
+            )
+            .unwrap();
         }
-        let roots = CertRoots { pki: store.path(), tetra: &tetra, profile: "eth0" };
+        let roots = CertRoots {
+            pki: store.path(),
+            tetra: &tetra,
+            profile: "eth0",
+        };
         let check = |path: &Path| {
             validate(
                 &mut request(json!({
@@ -1222,7 +1315,9 @@ mod tests {
 
         check(Path::new(&ca)).unwrap();
         check(&tetra.join("eth0/ca-cert.pem")).unwrap();
-        let error = check(&tetra.join("eth1/ca-cert.pem")).unwrap_err().to_string();
+        let error = check(&tetra.join("eth1/ca-cert.pem"))
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("another profile's directory"), "{error}");
         // Nor through a symlink, or a file directly in Tetra's store.
         let alias = store.path().join("alias.pem");
@@ -1244,8 +1339,15 @@ mod tests {
         fs::write(&real, "-----BEGIN CERTIFICATE-----\n").unwrap();
         let alias = store.path().join("alias.pem");
         std::os::unix::fs::symlink(&real, &alias).unwrap();
-        let roots = CertRoots { pki: store.path(), tetra: &tetra, profile: "eth0" };
-        let real = fs::canonicalize(&real).unwrap().to_string_lossy().into_owned();
+        let roots = CertRoots {
+            pki: store.path(),
+            tetra: &tetra,
+            profile: "eth0",
+        };
+        let real = fs::canonicalize(&real)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
 
         for path in [
             alias.to_string_lossy().into_owned(),
@@ -1256,7 +1358,10 @@ mod tests {
                 "wired_8021x": { "eap": "peap", "identity": "bob", "password": "x", "ca_cert": path }
             }));
             validate(&mut request, &roots).unwrap();
-            assert!(render(&request, UUID).contains(&format!("\nca-cert={real}\n")), "{path}");
+            assert!(
+                render(&request, UUID).contains(&format!("\nca-cert={real}\n")),
+                "{path}"
+            );
         }
     }
 
@@ -1292,7 +1397,10 @@ mod tests {
             let error = rejection(json!({ "interface": "eth0", "wired_8021x": wired }));
             assert!(!error.contains("y=z"), "{error}");
             // Nor any certificate or key contents.
-            assert!(!error.contains("no end") && !error.contains("AAAA"), "{error}");
+            assert!(
+                !error.contains("no end") && !error.contains("AAAA"),
+                "{error}"
+            );
         }
     }
 
@@ -1300,7 +1408,10 @@ mod tests {
     fn reads_existing_uuid_from_connection_section_only() {
         let keyfile = b"[connection]\nid=eth0\nuuid=0B0C3A52-4F43-4B6B-9A54-2D1B0F5E8C11\n\n[ipv4]\nuuid=nope\n";
         assert_eq!(existing_uuid(keyfile).as_deref(), Some(UUID));
-        assert_eq!(existing_uuid(b"[ipv4]\nuuid=0b0c3a52-4f43-4b6b-9a54-2d1b0f5e8c11\n"), None);
+        assert_eq!(
+            existing_uuid(b"[ipv4]\nuuid=0b0c3a52-4f43-4b6b-9a54-2d1b0f5e8c11\n"),
+            None
+        );
         assert_eq!(existing_uuid(b"[connection]\nuuid=garbage\n"), None);
     }
 

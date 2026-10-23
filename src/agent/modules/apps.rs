@@ -465,7 +465,6 @@ fn validate_app_unit_filename(filename: &str) -> Result<()> {
     Ok(())
 }
 
-
 fn validate_companion_filename(filename: &str) -> Result<()> {
     ensure!(
         !filename.ends_with('/')
@@ -565,10 +564,17 @@ impl AppBundle {
     fn write_manifest(&self, manifest: &AppManifest, dry_run: bool) -> Result<PathBuf> {
         let path = resolve_under(&self.dir, APP_MANIFEST)?;
         if !dry_run {
-            let contents = serde_json::to_vec_pretty(manifest)
-                .context("failed to serialize app manifest")?;
+            let contents =
+                serde_json::to_vec_pretty(manifest).context("failed to serialize app manifest")?;
             // Holds the app's values, secrets included.
-            write_owned(&self.dir, APP_MANIFEST, &contents, PRIVATE_MODE, false, self.owner.as_ref())?;
+            write_owned(
+                &self.dir,
+                APP_MANIFEST,
+                &contents,
+                PRIVATE_MODE,
+                false,
+                self.owner.as_ref(),
+            )?;
         }
         Ok(path)
     }
@@ -658,12 +664,26 @@ impl AppBundle {
 
         for unit in units {
             // Units can carry secrets (`Environment=MYSQL_PASSWORD=...`).
-            write_owned(&self.base_dir, &unit.filename, unit.contents.as_bytes(), unit.kind.mode(), dry_run, self.owner.as_ref())?;
+            write_owned(
+                &self.base_dir,
+                &unit.filename,
+                unit.contents.as_bytes(),
+                unit.kind.mode(),
+                dry_run,
+                self.owner.as_ref(),
+            )?;
             outcome.units.push(unit.filename.clone());
         }
         for companion in companions {
             // Containers read companions through bind mounts.
-            write_owned(&self.dir, &companion.filename, companion.contents.as_bytes(), companion.kind.mode(), dry_run, self.owner.as_ref())?;
+            write_owned(
+                &self.dir,
+                &companion.filename,
+                companion.contents.as_bytes(),
+                companion.kind.mode(),
+                dry_run,
+                self.owner.as_ref(),
+            )?;
             outcome.files.push(companion.filename.clone());
         }
         Ok(outcome)
@@ -725,9 +745,7 @@ fn secrets(manifest: &AppManifest) -> impl Fn(&str) -> bool + use<> {
         .ok()
         .map(|recipe| recipe.secret_keys().map(str::to_owned).collect());
     let stored = manifest.secret_keys.clone();
-    move |key| {
-        stored.contains(key) || current.as_ref().is_none_or(|current| current.contains(key))
-    }
+    move |key| stored.contains(key) || current.as_ref().is_none_or(|current| current.contains(key))
 }
 
 /// Hide secrets in a manifest shown to the Apps page: the values of secret
@@ -1113,9 +1131,10 @@ resources:
         // The account is prepared before its manager is used.
         let account = response["account"].as_array().unwrap();
         assert!(
-            account
-                .iter()
-                .any(|op| op["command"].as_str().unwrap().starts_with("systemctl start user@")),
+            account.iter().any(|op| op["command"]
+                .as_str()
+                .unwrap()
+                .starts_with("systemctl start user@")),
             "{account:?}"
         );
         assert!(account.iter().all(|op| op["dry_run"] == true));
@@ -1142,7 +1161,10 @@ resources:
             .collect();
         assert_eq!(
             commands,
-            ["systemctl daemon-reload", "systemctl start demo-web.service"]
+            [
+                "systemctl daemon-reload",
+                "systemctl start demo-web.service"
+            ]
         );
         assert_eq!(response["account"], json!([]));
         assert_eq!(response["owner"], "root");
@@ -1223,7 +1245,10 @@ resources:
             ".local/share/tetra/quadlets/demo/site/index.html",
             ".local/share/tetra/quadlets/demo/app.json",
         ] {
-            assert!(chowned.iter().any(|entry| entry == path), "{path}: {chowned:?}");
+            assert!(
+                chowned.iter().any(|entry| entry == path),
+                "{path}: {chowned:?}"
+            );
         }
         let mode = |path: &Path| {
             use std::os::unix::fs::PermissionsExt;
@@ -1475,7 +1500,10 @@ resources:
         create["recipe"] = json!(recipe);
         create["templates"] = templates;
         let created = dispatch("create", create).unwrap();
-        let password = created["app"]["values"]["db_password"].as_str().unwrap().to_owned();
+        let password = created["app"]["values"]["db_password"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         assert_eq!(password.len(), 32);
 
         let unit = base.path().join("demo-web.container");
@@ -1516,7 +1544,10 @@ resources:
         update["values"] = got["app"]["values"].clone();
         update["values"]["bundle_dir"] = json!(files.path().join("demo"));
         dispatch("update", update).unwrap();
-        assert!(read().contains(&password), "the secret became the placeholder");
+        assert!(
+            read().contains(&password),
+            "the secret became the placeholder"
+        );
     }
 
     #[test]
@@ -1541,7 +1572,10 @@ resources:
         let shown = get();
         assert_eq!(shown["app"]["values"]["token"], "********");
         assert!(!shown.to_string().contains("hunter2"));
-        assert!(!shown.to_string().contains("hunter3"), "the recipe's secret default");
+        assert!(
+            !shown.to_string().contains("hunter3"),
+            "the recipe's secret default"
+        );
 
         // A later recipe calls it a plain string; the stored value stays hidden.
         dispatch(

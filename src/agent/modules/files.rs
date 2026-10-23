@@ -90,7 +90,9 @@ mod tests {
         let fifo = dir.path().join("fifo");
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
         // Neither blocks on the FIFO.
-        Read(FileReadRequest { path: fifo.clone() }).handle(None).unwrap_err();
+        Read(FileReadRequest { path: fifo.clone() })
+            .handle(None)
+            .unwrap_err();
         Write(FileWriteRequest {
             path: fifo,
             contents: "x".into(),
@@ -99,8 +101,16 @@ mod tests {
         })
         .handle(None)
         .unwrap_err();
-        Read(FileReadRequest { path: "/dev/zero".into() }).handle(None).unwrap_err();
-        Read(FileReadRequest { path: dir.path().into() }).handle(None).unwrap_err();
+        Read(FileReadRequest {
+            path: "/dev/zero".into(),
+        })
+        .handle(None)
+        .unwrap_err();
+        Read(FileReadRequest {
+            path: dir.path().into(),
+        })
+        .handle(None)
+        .unwrap_err();
 
         let path = dir.path().join("managed.conf");
         fs::write(&path, "a much longer old value\n").unwrap();

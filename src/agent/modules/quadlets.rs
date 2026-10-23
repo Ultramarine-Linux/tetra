@@ -648,10 +648,24 @@ mod tests {
         let files = home.join(".local/share/tetra/quadlets/site");
         create_dir_owned(&base, false, Some(&owner)).unwrap();
         create_dir_owned(&files, false, Some(&owner)).unwrap();
-        write_owned(&base, "site.container", b"[Container]\n", UNIT_MODE, false, Some(&owner))
-            .unwrap();
-        write_owned(&files, "nginx/default.conf", b"server {}\n", COMPANION_MODE, false, Some(&owner))
-            .unwrap();
+        write_owned(
+            &base,
+            "site.container",
+            b"[Container]\n",
+            UNIT_MODE,
+            false,
+            Some(&owner),
+        )
+        .unwrap();
+        write_owned(
+            &files,
+            "nginx/default.conf",
+            b"server {}\n",
+            COMPANION_MODE,
+            false,
+            Some(&owner),
+        )
+        .unwrap();
         let chowned = chowned.lock().unwrap().clone();
         for path in [
             ".config/containers/systemd",
@@ -660,7 +674,10 @@ mod tests {
             ".local/share/tetra/quadlets/site/nginx",
             ".local/share/tetra/quadlets/site/nginx/default.conf",
         ] {
-            assert!(chowned.iter().any(|chowned| chowned == path), "{path}: {chowned:?}");
+            assert!(
+                chowned.iter().any(|chowned| chowned == path),
+                "{path}: {chowned:?}"
+            );
         }
         let mode = |path: &Path| {
             use std::os::unix::fs::PermissionsExt as _;
@@ -672,8 +689,15 @@ mod tests {
         // A dry run neither writes nor gives anything away.
         let before = chowned.len();
         let (dry_owner, dry_chowned) = crate::agent::apps_account::tests::recording_owner(&home);
-        write_owned(&base, "other.container", b"[Container]\n", UNIT_MODE, true, Some(&dry_owner))
-            .unwrap();
+        write_owned(
+            &base,
+            "other.container",
+            b"[Container]\n",
+            UNIT_MODE,
+            true,
+            Some(&dry_owner),
+        )
+        .unwrap();
         assert!(!base.join("other.container").exists());
         assert!(dry_chowned.lock().unwrap().is_empty());
         assert!(before > 0);

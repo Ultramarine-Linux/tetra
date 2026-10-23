@@ -229,7 +229,9 @@ fn connect_wifi(
     let seen = if payload.dry_run {
         None
     } else {
-        scan(&payload.interface)?.into_iter().find(|network| network.ssid == payload.ssid)
+        scan(&payload.interface)?
+            .into_iter()
+            .find(|network| network.ssid == payload.ssid)
     };
     let key_management = if seen.as_ref().is_some_and(|network| network.sae_only) {
         wifi::KeyManagement::Sae
@@ -240,7 +242,11 @@ fn connect_wifi(
     let hidden = payload.hidden || (!payload.dry_run && seen.is_none());
     // Without a scan, a dry run cannot know whether the network takes SAE,
     // so it only checks the password against SAE's wider rules.
-    let checked_as = if payload.dry_run { wifi::KeyManagement::Sae } else { key_management };
+    let checked_as = if payload.dry_run {
+        wifi::KeyManagement::Sae
+    } else {
+        key_management
+    };
     let name = wifi::connection_name(&payload.interface);
     let mut request = payload.clone();
     wifi::validate(&mut request, checked_as, &cert_roots(certs_dir, &name))?;
@@ -307,7 +313,11 @@ fn configure(
 /// `certs_dir`, the one Tetra keeps PEM contents in (inside it, except in
 /// tests).
 fn cert_roots<'a>(certs_dir: &'a Path, profile: &'a str) -> keyfile::CertRoots<'a> {
-    keyfile::CertRoots { pki: Path::new(keyfile::PKI_DIR), tetra: certs_dir, profile }
+    keyfile::CertRoots {
+        pki: Path::new(keyfile::PKI_DIR),
+        tetra: certs_dir,
+        profile,
+    }
 }
 
 /// A connection profile `configure` or `connect_wifi` writes.
@@ -331,7 +341,11 @@ impl Profile {
             .as_deref()
             .and_then(keyfile::existing_uuid)
             .unwrap_or_else(keyfile::new_uuid);
-        Ok(Self { path, uuid, certs: certs_dir.join(name) })
+        Ok(Self {
+            path,
+            uuid,
+            certs: certs_dir.join(name),
+        })
     }
 
     /// Point `settings`' PEM contents at the files they are stored as,
@@ -378,8 +392,8 @@ impl Profile {
 
 fn get_config(payload: &NetworkConfigRequest, dir: &Path) -> Result<Value> {
     let path = validate_keyfile_path(dir, &payload.path)?;
-    let contents = read_keyfile(&path)?
-        .with_context(|| format!("`{}` does not exist", path.display()))?;
+    let contents =
+        read_keyfile(&path)?.with_context(|| format!("`{}` does not exist", path.display()))?;
     let contents = String::from_utf8(contents)
         .with_context(|| format!("`{}` is not valid UTF-8", path.display()))?;
     Ok(json!({ "path": path, "contents": contents }))
@@ -389,8 +403,12 @@ fn set_config(payload: &NetworkWriteConfigRequest, dir: &Path) -> Result<Value> 
     let path = validate_keyfile_path(dir, &payload.path)?;
     // The keyfile always gets its default label; letting a caller choose
     // other paths or types would turn this into a root-run `semanage`.
-    if let Some(SelinuxOptions { path: label_path, path_pattern, context_type, .. }) =
-        &payload.selinux
+    if let Some(SelinuxOptions {
+        path: label_path,
+        path_pattern,
+        context_type,
+        ..
+    }) = &payload.selinux
     {
         ensure!(
             label_path.is_none() && path_pattern.is_none() && context_type.is_none(),
@@ -411,7 +429,6 @@ fn set_config(payload: &NetworkWriteConfigRequest, dir: &Path) -> Result<Value> 
         "selinux": selinux,
     }))
 }
-
 
 /// Where the kernel lists network interfaces.
 const SYSFS_NET: &str = "/sys/class/net";
@@ -435,7 +452,9 @@ enum InterfaceKind {
 /// (`/sys/class/net/<interface>`). Missing attributes count as absent.
 fn interface_kind(dir: &Path) -> InterfaceKind {
     let uevent = fs::read_to_string(dir.join("uevent")).unwrap_or_default();
-    let devtype = uevent.lines().find_map(|line| line.strip_prefix("DEVTYPE="));
+    let devtype = uevent
+        .lines()
+        .find_map(|line| line.strip_prefix("DEVTYPE="));
     if devtype == Some("wlan") || dir.join("wireless").exists() || dir.join("phy80211").exists() {
         return InterfaceKind::Wifi;
     }
@@ -499,8 +518,12 @@ impl NetworkHost for NetworkManagerHost {
     fn default_gateways(&self, interface: &str) -> Result<Vec<IpAddr>> {
         let mut gateways = Vec::new();
         for family in ["-4", "-6"] {
-            let result =
-                run("ip", ["-json", family, "route", "show", "default", "dev", interface])?;
+            let result = run(
+                "ip",
+                [
+                    "-json", family, "route", "show", "default", "dev", interface,
+                ],
+            )?;
             let routes: Value = serde_json::from_str(&result.stdout)
                 .context("failed to parse `ip -json route show` output")?;
             gateways.extend(
@@ -669,7 +692,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(response["written"], false);
-        assert_eq!(response["selinux"][0]["command"], format!("restorecon -v {}", path.display()));
+        assert_eq!(
+            response["selinux"][0]["command"],
+            format!("restorecon -v {}", path.display())
+        );
         assert_eq!(fs::read_to_string(path).unwrap(), "[connection]\nid=old\n");
     }
 
@@ -690,7 +716,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let response = get_config(&NetworkConfigRequest { path }, dir.path()).unwrap();
         assert_eq!(response["contents"], "[connection]\nid=eth0\n");
     }
@@ -763,12 +792,18 @@ mod tests {
         }))
         .unwrap();
 
-        let response = configure(&payload, dir.path(), &dir.path().join("certs"), &SAFE_APPLY).unwrap();
+        let response =
+            configure(&payload, dir.path(), &dir.path().join("certs"), &SAFE_APPLY).unwrap();
 
-        assert_eq!(response["path"], dir.path().join("eth0.nmconnection").to_str().unwrap());
+        assert_eq!(
+            response["path"],
+            dir.path().join("eth0.nmconnection").to_str().unwrap()
+        );
         assert_eq!(response["applied"], false);
         let keyfile = response["keyfile"].as_str().unwrap();
-        assert!(keyfile.contains("[ipv6]\nmethod=manual\naddress1=2001:db8::2/64\ngateway=fe80::1\n"));
+        assert!(
+            keyfile.contains("[ipv6]\nmethod=manual\naddress1=2001:db8::2/64\ngateway=fe80::1\n")
+        );
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
@@ -782,7 +817,8 @@ mod tests {
         }))
         .unwrap();
 
-        let response = configure(&payload, dir.path(), &dir.path().join("certs"), &SAFE_APPLY).unwrap();
+        let response =
+            configure(&payload, dir.path(), &dir.path().join("certs"), &SAFE_APPLY).unwrap();
 
         let keyfile = response["keyfile"].as_str().unwrap();
         assert!(keyfile.contains("[802-1x]\neap=peap;\nidentity=alice\npassword=<redacted>\n"));
@@ -813,14 +849,26 @@ mod tests {
         let apply = test_apply(&host, dir.path());
         let request = wifi_request("Home", "wifi-S3CRET-pass");
 
-        let response =
-            connect_wifi(&request, dir.path(), &dir.path().join("certs"), &apply, &|_| Ok(seen("Home", true))).unwrap();
+        let response = connect_wifi(
+            &request,
+            dir.path(),
+            &dir.path().join("certs"),
+            &apply,
+            &|_| Ok(seen("Home", true)),
+        )
+        .unwrap();
 
         let path = dir.path().join("wifi-wlan0.nmconnection");
         let keyfile = fs::read_to_string(&path).unwrap();
-        assert!(keyfile.contains("key-mgmt=sae\npsk=wifi-S3CRET-pass\n"), "{keyfile}");
+        assert!(
+            keyfile.contains("key-mgmt=sae\npsk=wifi-S3CRET-pass\n"),
+            "{keyfile}"
+        );
         assert!(!keyfile.contains("hidden"));
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(!response.to_string().contains("S3CRET"), "{response}");
         assert_eq!(response["ssid"], "Home");
         assert_eq!(response["security"], "wpa-personal");
@@ -829,9 +877,13 @@ mod tests {
 
         // Reconnecting keeps the profile; a network missing from the scan
         // is probed for as hidden, with WPA-PSK.
-        let again = connect_wifi(&wifi_request("Attic", "another-pass"), dir.path(), &dir.path().join("certs"), &apply, &|_| {
-            Ok(seen("Home", false))
-        })
+        let again = connect_wifi(
+            &wifi_request("Attic", "another-pass"),
+            dir.path(),
+            &dir.path().join("certs"),
+            &apply,
+            &|_| Ok(seen("Home", false)),
+        )
         .unwrap();
         assert_eq!(again["uuid"], uuid);
         let keyfile = fs::read_to_string(&path).unwrap();
@@ -865,12 +917,19 @@ mod tests {
         let mut request = wifi_request("Home", "wifi-S3CRET-pass");
         request.interface = "../wlan0".into();
 
-        let error = connect_wifi(&request, dir.path(), &dir.path().join("certs"), &SAFE_APPLY, &|_| {
-            panic!("scanned an invalid interface")
-        })
+        let error = connect_wifi(
+            &request,
+            dir.path(),
+            &dir.path().join("certs"),
+            &SAFE_APPLY,
+            &|_| panic!("scanned an invalid interface"),
+        )
         .unwrap_err();
 
-        assert!(error.to_string().contains("not a valid interface name"), "{error}");
+        assert!(
+            error.to_string().contains("not a valid interface name"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -881,13 +940,20 @@ mod tests {
         fs::create_dir_all(other.parent().unwrap()).unwrap();
         fs::write(&other, PEM_CA).unwrap();
         let mut request = enterprise_request();
-        let WifiSecurity::WpaEnterprise(settings) = &mut request.security else { unreachable!() };
+        let WifiSecurity::WpaEnterprise(settings) = &mut request.security else {
+            unreachable!()
+        };
         settings.ca_cert = Some(other.to_string_lossy().into_owned());
 
-        let error = connect_wifi(&request, dir.path(), &certs, &SAFE_APPLY, &|_| Ok(Vec::new()))
-            .unwrap_err();
+        let error = connect_wifi(&request, dir.path(), &certs, &SAFE_APPLY, &|_| {
+            Ok(Vec::new())
+        })
+        .unwrap_err();
 
-        assert!(error.to_string().contains("another profile's directory"), "{error}");
+        assert!(
+            error.to_string().contains("another profile's directory"),
+            "{error}"
+        );
         assert!(!dir.path().join("wifi-wlan0.nmconnection").exists());
     }
 
@@ -943,21 +1009,36 @@ mod tests {
         let host = FakeHost::with(&[], None);
         let apply = test_apply(&host, dir.path());
 
-        let response =
-            connect_wifi(&enterprise_request(), dir.path(), &certs, &apply, &|_| Ok(Vec::new()))
-                .unwrap();
+        let response = connect_wifi(&enterprise_request(), dir.path(), &certs, &apply, &|_| {
+            Ok(Vec::new())
+        })
+        .unwrap();
 
         let keyfile = fs::read_to_string(dir.path().join("wifi-wlan0.nmconnection")).unwrap();
         let profile_certs = certs.join("wifi-wlan0");
         let key = fs::read_dir(&profile_certs)
             .unwrap()
             .map(|entry| entry.unwrap().path())
-            .find(|path| path.file_name().unwrap().to_string_lossy().starts_with("private-key-"))
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("private-key-")
+            })
             .unwrap();
         assert_eq!(fs::read_to_string(&key).unwrap(), PEM_KEY);
-        assert_eq!(fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(fs::metadata(&profile_certs).unwrap().permissions().mode() & 0o777, 0o700);
-        assert!(keyfile.contains(&format!("private-key={}\n", key.display())), "{keyfile}");
+        assert_eq!(
+            fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&profile_certs).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(
+            keyfile.contains(&format!("private-key={}\n", key.display())),
+            "{keyfile}"
+        );
         assert!(keyfile.contains("domain-suffix-match=radius.example.com\n"));
         assert!(keyfile.contains("private-key-password=key-S3CRET-pass\n"));
         assert!(!keyfile.contains("BEGIN"));
@@ -967,9 +1048,13 @@ mod tests {
 
         // Switching to a network without certificates removes them once the
         // change settles.
-        connect_wifi(&wifi_request("Home", "another-pass"), dir.path(), &certs, &apply, &|_| {
-            Ok(Vec::new())
-        })
+        connect_wifi(
+            &wifi_request("Home", "another-pass"),
+            dir.path(),
+            &certs,
+            &apply,
+            &|_| Ok(Vec::new()),
+        )
         .unwrap();
         assert!(!profile_certs.exists());
     }
@@ -982,9 +1067,10 @@ mod tests {
         host.fail_every_activation();
         let apply = test_apply(&host, dir.path());
 
-        let error =
-            connect_wifi(&enterprise_request(), dir.path(), &certs, &apply, &|_| Ok(Vec::new()))
-                .unwrap_err();
+        let error = connect_wifi(&enterprise_request(), dir.path(), &certs, &apply, &|_| {
+            Ok(Vec::new())
+        })
+        .unwrap_err();
 
         assert!(!format!("{error:#}").contains("S3CRET"));
         assert!(!certs.join("wifi-wlan0").exists());
@@ -1011,7 +1097,10 @@ mod tests {
 
         let keyfile = response["keyfile"].as_str().unwrap();
         assert!(
-            keyfile.contains(&format!("ca-cert={}", certs.join("eth0/ca-cert-").display())),
+            keyfile.contains(&format!(
+                "ca-cert={}",
+                certs.join("eth0/ca-cert-").display()
+            )),
             "{keyfile}"
         );
         assert!(keyfile.contains("domain-suffix-match=example.com\n"));
@@ -1031,14 +1120,23 @@ mod tests {
             }))
             .unwrap();
 
-            let response = connect_wifi(&request, dir.path(), &dir.path().join("certs"), &SAFE_APPLY, &|_| {
-                panic!("dry run scanned")
-            })
+            let response = connect_wifi(
+                &request,
+                dir.path(),
+                &dir.path().join("certs"),
+                &SAFE_APPLY,
+                &|_| panic!("dry run scanned"),
+            )
             .unwrap();
 
             assert_eq!(response["applied"], false);
             assert!(response["note"].as_str().unwrap().contains("key-mgmt=sae"));
-            assert!(response["keyfile"].as_str().unwrap().contains("psk=<redacted>"));
+            assert!(
+                response["keyfile"]
+                    .as_str()
+                    .unwrap()
+                    .contains("psk=<redacted>")
+            );
             assert!(!response.to_string().contains("S3CRET"));
             assert!(!dir.path().join("wifi-wlan0.nmconnection").exists());
         }
@@ -1059,7 +1157,8 @@ mod tests {
         }))
         .unwrap();
 
-        let response = configure(&payload, dir.path(), &dir.path().join("certs"), &SAFE_APPLY).unwrap();
+        let response =
+            configure(&payload, dir.path(), &dir.path().join("certs"), &SAFE_APPLY).unwrap();
 
         assert_eq!(response["uuid"], "0b0c3a52-4f43-4b6b-9a54-2d1b0f5e8c11");
     }
@@ -1101,7 +1200,13 @@ mod tests {
                 fs::create_dir_all(dir.join(entry)).unwrap();
             }
         };
-        iface("wlan0", "1", "DEVTYPE=wlan\n", true, &["wireless", "phy80211"]);
+        iface(
+            "wlan0",
+            "1",
+            "DEVTYPE=wlan\n",
+            true,
+            &["wireless", "phy80211"],
+        );
         iface("enp1s0", "1", "", true, &[]);
         iface("veth0", "1", "", false, &[]);
         iface("wwan0", "1", "DEVTYPE=wwan\n", true, &[]);
@@ -1133,8 +1238,22 @@ mod tests {
             "addr_info": [{ "local": "::1", "prefixlen": 128 }]
         }]));
         let interfaces = read_interfaces(&net, &addresses).unwrap();
-        let names: Vec<_> = interfaces.iter().map(|i| i["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["br0", "enp1s0", "lo", "tailscale0", "veth0", "wlan0", "wwan0"]);
+        let names: Vec<_> = interfaces
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "br0",
+                "enp1s0",
+                "lo",
+                "tailscale0",
+                "veth0",
+                "wlan0",
+                "wwan0"
+            ]
+        );
         let by_name = |name: &str| interfaces.iter().find(|i| i["name"] == name).unwrap();
         assert_eq!(by_name("lo")["type"], "other");
         assert_eq!(by_name("lo")["operstate"], "up");
