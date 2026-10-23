@@ -1323,7 +1323,9 @@ impl AuthService {
             use crate::agent::modules::reverse_proxy::SETUP_SITE_FILE;
             let site = self.inner.config.caddy_sites_dir.join(SETUP_SITE_FILE);
             if self.inner.setup.is_complete() && site.exists() {
-                eprintln!("setup handoff: setup is complete but the OOBE's site remains; finishing");
+                eprintln!(
+                    "setup handoff: setup is complete but the OOBE's site remains; finishing"
+                );
                 if let Err(error) = self.finish_handoff() {
                     eprintln!("setup handoff: failed to finish: {error:#}");
                 }

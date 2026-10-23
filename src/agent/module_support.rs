@@ -149,7 +149,11 @@ pub struct NoPayload {}
 /// # Errors
 /// Errs on an unknown action or a payload the action does not accept.
 pub fn parse_action<T: serde::de::DeserializeOwned>(action: &str, payload: Value) -> Result<T> {
-    let payload = if payload.is_null() { json!({}) } else { payload };
+    let payload = if payload.is_null() {
+        json!({})
+    } else {
+        payload
+    };
     Ok(serde_json::from_value(json!({ action: payload }))?)
 }
 
@@ -782,7 +786,10 @@ mod tests {
         .to_string();
         assert!(error.contains("`sh <secret>` failed"), "{error}");
         assert!(error.contains("nope"), "{error}");
-        assert!(!error.contains("hunter2") && !error.contains("cat"), "{error}");
+        assert!(
+            !error.contains("hunter2") && !error.contains("cat"),
+            "{error}"
+        );
 
         let result =
             run_command_with_input("definitely-not-a-real-command", &[], b"x", display(), true)

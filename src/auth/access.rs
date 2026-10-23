@@ -487,8 +487,7 @@ mod tests {
         // Nor may the dashboard listen where Caddy or the setup does.
         for port in [0, 80, 2019, SETUP_PORT, SETUP_UPSTREAM_PORT] {
             moved.dashboard_upstream = Some(format!("127.0.0.1:{port}"));
-            let error =
-                AccessConfig::from_request(&moved, DEFAULT_DASHBOARD_UPSTREAM).unwrap_err();
+            let error = AccessConfig::from_request(&moved, DEFAULT_DASHBOARD_UPSTREAM).unwrap_err();
             assert!(
                 error
                     .to_string()

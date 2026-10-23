@@ -203,10 +203,14 @@ mod tests {
         assert!(Action::from_payload("ping", json!("")).is_err());
         assert!(Action::from_payload("ping", json!([1])).is_err());
         // A payload whose fields all have defaults may be left out.
-        let response = Action::from_payload("stop", Value::Null).unwrap().handle(None);
+        let response = Action::from_payload("stop", Value::Null)
+            .unwrap()
+            .handle(None);
         assert_eq!(response.unwrap(), false);
         assert!(Action::from_payload("echo", Value::Null).is_err());
-        let response = Action::from_payload("echo", json!({ "value": 7 })).unwrap().handle(None);
+        let response = Action::from_payload("echo", json!({ "value": 7 }))
+            .unwrap()
+            .handle(None);
         assert_eq!(response.unwrap(), 7);
     }
 }

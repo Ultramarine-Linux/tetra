@@ -632,7 +632,14 @@ async fn a_restart_finishes_a_handoff_its_timer_did_not() {
 
     // Setup completes, but the timer never runs (say, the host reboots).
     host.accounts.add("admin", 1001, &["wheel"]);
-    ok(&host.service, Oobe, Some(&token), "setup.complete", json!({})).await;
+    ok(
+        &host.service,
+        Oobe,
+        Some(&token),
+        "setup.complete",
+        json!({}),
+    )
+    .await;
     assert!(site.exists());
     host.host.clear();
     host.restart().unwrap().resume_handoff();
@@ -777,7 +784,12 @@ async fn a_failed_oobe_stop_keeps_the_site_so_a_restart_retries() {
     host.host.fail(oobe);
     host.host.clear();
     let handoff = host.service.complete_setup_from_console().unwrap();
-    assert!(handoff.oobe_error.unwrap().contains("ultramarine-server-oobe.service"));
+    assert!(
+        handoff
+            .oobe_error
+            .unwrap()
+            .contains("ultramarine-server-oobe.service")
+    );
     // The site marks the handoff as unfinished, so Caddy is left alone.
     assert!(site.exists());
     assert!(!host.host.calls().iter().any(|call| call.contains("caddy")));

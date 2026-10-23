@@ -573,7 +573,10 @@ fn migrate_legacy_proxy_sites() {
                 eprintln!("failed to reload Caddy: {error:#}");
             }
         }
-        Err(error) => eprintln!("failed to move the reverse_proxy sites of `{}`: {error:#}", legacy.display()),
+        Err(error) => eprintln!(
+            "failed to move the reverse_proxy sites of `{}`: {error:#}",
+            legacy.display()
+        ),
     }
 }
 
