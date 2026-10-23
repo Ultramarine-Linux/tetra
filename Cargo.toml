@@ -74,6 +74,7 @@ tokio = { version = "1", features = [
     "io-util",
     "macros",
     "net",
+    "process",
     "rt-multi-thread",
     "signal",
     "sync",
@@ -97,6 +98,7 @@ totp-rs = { version = "6", features = ["gen_secret", "otpauth"] }
 webauthn-rs = { version = "0.5", features = ["conditional-ui"] }
 
 [dev-dependencies]
+nix = { version = "0.31", features = ["term"] }
 # Integration tests use the fakes in `tetra::auth::testing`.
 tetra = { path = ".", default-features = false, features = ["testing"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }

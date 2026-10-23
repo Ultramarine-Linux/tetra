@@ -21,6 +21,7 @@ use tetra::{
         peer::{self, PeerPolicy},
         queue::{DEFAULT_QUEUE_CAPACITY, DispatchQueue},
         remote,
+        shell::{self, ShellServer},
         transport::TransportConfig,
         websocket::WebSocketAgentConfig,
     },
@@ -228,6 +229,11 @@ struct DaemonArgs {
     /// PAM service used to verify dashboard passwords.
     #[arg(long, default_value = tetra_pam::DEFAULT_SERVICE)]
     pam_service: String,
+
+    /// PAM service the web shell's sessions run (account and session
+    /// stacks), as the transient unit's `PAMName=`.
+    #[arg(long, env = "TETRA_SHELL_PAM_SERVICE", default_value = shell::pty::DEFAULT_PAM_SERVICE)]
+    shell_pam_service: String,
 
     /// Caddy site directory where `access.set` writes the dashboard site
     /// (terra-caddy's Caddyfile imports `Caddyfile.d/*.caddyfile`).
@@ -638,6 +644,7 @@ async fn run_daemon(cli: DaemonArgs, listener: Listener) -> Result<()> {
     let server = LocalServer {
         auth: auth.clone(),
         host_fingerprint,
+        shells: ShellServer::system(cli.shell_pam_service),
     };
     apps_account::check_apps_account();
     let serve = match listener {

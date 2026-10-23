@@ -33,6 +33,7 @@ pub mod modules;
 pub mod peer;
 pub mod queue;
 pub mod remote;
+pub mod shell;
 pub mod transport;
 pub mod websocket;
 

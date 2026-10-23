@@ -11,6 +11,9 @@
 //! one `response` per request, matched by `id`. Requests run concurrently, so
 //! one slow PAM check does not hold up other users of a shared connection;
 //! responses may arrive out of order.
+//!
+//! A connection whose first request is `shell.open` becomes a web shell
+//! instead ([`super::shell`]) and carries nothing else.
 
 use std::sync::Arc;
 
@@ -32,6 +35,8 @@ use crate::auth::{
     api::{ApiError, ErrorCode, PROTOCOL_VERSION, Request, Response},
     sessions::ClientKind,
 };
+
+use super::shell::{ShellServer, is_shell_open};
 
 /// Largest WebSocket message or frame a client may send (file writes
 /// included). Tungstenite's default is 64 MiB, per in-flight request.
@@ -78,6 +83,8 @@ pub enum ClientFrame {
 pub struct LocalServer {
     pub auth: AuthService,
     pub host_fingerprint: String,
+    /// Web shells, for connections that start with `shell.open`.
+    pub shells: ShellServer,
 }
 
 impl LocalServer {
@@ -128,6 +135,33 @@ impl LocalServer {
         })?)
         .await?;
 
+        // The first request decides what the connection is: `shell.open`
+        // turns it into a shell stream, anything else makes it a request
+        // connection for good.
+        let mut first = None;
+        while let Some(message) = source.next().await {
+            match message? {
+                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+                Message::Close(_) => break,
+                message => {
+                    first = Some(message);
+                    break;
+                }
+            }
+        }
+        let Some(first) = first else {
+            sink.close().await.ok();
+            return Ok(());
+        };
+        if let Ok(ClientFrame::Request(request)) = parse(&first)
+            && is_shell_open(&request)
+        {
+            return self
+                .shells
+                .serve(&self.auth, client, request, sink, source)
+                .await;
+        }
+
         let (sender, mut outbox) = mpsc::channel::<ServerFrame>(MAX_IN_FLIGHT);
         let writer = tokio::spawn(async move {
             while let Some(frame) = outbox.recv().await {
@@ -138,12 +172,19 @@ impl LocalServer {
         });
 
         let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
-        while let Some(message) = source.next().await {
-            let frame = match message? {
-                Message::Text(text) => serde_json::from_str::<ClientFrame>(&text),
-                Message::Binary(bytes) => serde_json::from_slice::<ClientFrame>(&bytes),
+        let mut next = Some(first);
+        loop {
+            let message = match next.take() {
+                Some(message) => message,
+                None => match source.next().await {
+                    Some(message) => message?,
+                    None => break,
+                },
+            };
+            let frame = match message {
                 Message::Close(_) => break,
                 Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+                message => parse(&message),
             };
             let ClientFrame::Request(request) = match frame {
                 Ok(frame) => frame,
@@ -167,6 +208,14 @@ impl LocalServer {
     }
 }
 
-fn text(frame: &ServerFrame) -> Result<Message> {
+/// A client frame from a text or binary message.
+fn parse(message: &Message) -> serde_json::Result<ClientFrame> {
+    match message {
+        Message::Text(text) => serde_json::from_str(text),
+        message => serde_json::from_slice(&message.clone().into_data()),
+    }
+}
+
+pub(crate) fn text(frame: &ServerFrame) -> Result<Message> {
     Ok(Message::Text(serde_json::to_string(frame)?.into()))
 }

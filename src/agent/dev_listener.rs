@@ -158,6 +158,7 @@ mod tests {
         let server = LocalServer {
             auth: host.service.clone(),
             host_fingerprint: "fingerprint".into(),
+            shells: crate::agent::shell::ShellServer::system("tetra-shell".into()),
         };
         let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let address = listener.local_addr().unwrap();

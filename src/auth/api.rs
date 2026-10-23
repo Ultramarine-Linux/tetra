@@ -90,6 +90,8 @@ pub enum ErrorCode {
     /// The operation changes how the user logs in and the session is older
     /// than the re-authentication window: log in again, then retry.
     ReauthRequired,
+    /// Too many of something are open (web shells); close one first.
+    LimitReached,
     Internal,
 }
 

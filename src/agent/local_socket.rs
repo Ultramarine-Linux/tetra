@@ -209,6 +209,10 @@ mod tests {
         let server = LocalServer {
             auth: host.service.clone(),
             host_fingerprint: "fingerprint".into(),
+            shells: crate::agent::shell::ShellServer::new(
+                std::sync::Arc::new(crate::agent::shell::pty::FakeSpawner::new().0),
+                crate::agent::shell::ShellLimits::default(),
+            ),
         };
         let peers = PeerPolicy {
             dashboard: PeerMatch::Uid(dashboard),
