@@ -168,7 +168,9 @@ pub fn verify_images(resources: &[RenderedResource], allow_unpinned: bool) -> Re
                 "PodmanArgs" | "GlobalArgs" if !value.is_empty() => {
                     bail!("raw Podman arguments are unsupported by the pinned image policy")
                 }
-                "Mount" if value.contains("image") => {
+                // Only `type=image` mounts pull an image; bind mounts of a
+                // path that happens to contain "image" are fine.
+                "Mount" if value.split(',').any(|option| option.trim() == "type=image") => {
                     bail!("image mounts are unsupported by the pinned image policy")
                 }
                 "Yaml" if section == "Kube" => {

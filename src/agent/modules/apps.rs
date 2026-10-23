@@ -1190,6 +1190,8 @@ resources:
         let outcome = bundle.install(&resources, None, false).unwrap();
         assert_eq!(outcome.units, ["demo-web.container"]);
         let manifest = AppManifest {
+            source: None,
+            allow_unpinned_images: false,
             version: MANIFEST_VERSION,
             name: "demo".into(),
             scope: AppScope::Apps,
