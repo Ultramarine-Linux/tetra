@@ -19,6 +19,12 @@ use super::{AgentCommand, AgentResponse};
 #[derive(Default)]
 pub struct Dispatcher {
     modules: BTreeMap<String, Box<dyn Mod>>,
+    session_revocation: Option<SessionRevocation>,
+}
+
+struct SessionRevocation {
+    users: crate::auth::users::UserStore,
+    accounts: std::sync::Arc<dyn crate::auth::accounts::AccountSource>,
 }
 
 impl Dispatcher {
@@ -34,7 +40,25 @@ impl Dispatcher {
     pub fn full() -> Self {
         let mut dispatcher = Self::default();
         super::modules::register_all(&mut dispatcher);
-        dispatcher
+        dispatcher.with_session_revocation(
+            crate::auth::users::UserStore::new(
+                PathBuf::from(crate::auth::service::DEFAULT_STATE_DIR).join("auth/users"),
+            ),
+            std::sync::Arc::new(crate::auth::accounts::SystemAccounts::default()),
+        )
+    }
+
+    /// Invalidate sessions after successful account password changes/deletions.
+    /// The epoch is persisted under the user store lock and checked on every
+    /// authenticated request, including by a daemon in another process.
+    #[must_use]
+    pub fn with_session_revocation(
+        mut self,
+        users: crate::auth::users::UserStore,
+        accounts: std::sync::Arc<dyn crate::auth::accounts::AccountSource>,
+    ) -> Self {
+        self.session_revocation = Some(SessionRevocation { users, accounts });
+        self
     }
 
     /// Builder-style registration: `Dispatcher::new().with_module(Foo).with_module(Bar)`.
@@ -57,7 +81,7 @@ impl Dispatcher {
     /// gets a well-formed response, never a panic.
     #[must_use]
     pub fn dispatch(&self, mut command: AgentCommand) -> AgentResponse {
-        match self.try_dispatch(&mut command) {
+        match self.dispatch_and_revoke(&mut command) {
             Ok(payload) => AgentResponse::ok(command.id, payload),
             Err(error) => AgentResponse::error(command.id, error.to_string()),
         }
@@ -68,6 +92,41 @@ impl Dispatcher {
     #[must_use]
     pub fn capabilities(&self) -> Vec<ModuleInfo> {
         self.modules.values().map(|module| module.info()).collect()
+    }
+
+    fn dispatch_and_revoke(&self, command: &mut AgentCommand) -> Result<Value> {
+        command.validate()?;
+        let revoker = self.session_revocation.as_ref().filter(|_| {
+            command.module == "users"
+                && matches!(command.action.as_str(), "set_password" | "delete")
+                && command.payload.get("dry_run").and_then(Value::as_bool) != Some(true)
+        });
+        // Resolve before userdel removes the account. Store only this identity,
+        // not the credential-bearing payload, across module execution.
+        let account = match revoker {
+            Some(revoker) => command
+                .payload
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|name| revoker.accounts.by_name(name))
+                .transpose()?
+                .flatten(),
+            None => None,
+        };
+        let result = self.try_dispatch(command)?;
+        if let (Some(revoker), Some(account)) = (revoker, account) {
+            revoker
+                .users
+                .update(account.uid, &account.name, |record| {
+                    record.session_epoch = record
+                        .session_epoch
+                        .checked_add(1)
+                        .context("session epoch exhausted")?;
+                    Ok(())
+                })
+                .context("account changed but session invalidation failed")?;
+        }
+        Ok(result)
     }
 
     fn try_dispatch(&self, command: &mut AgentCommand) -> Result<Value> {

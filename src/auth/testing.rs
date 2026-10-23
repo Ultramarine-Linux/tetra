@@ -315,7 +315,10 @@ impl TestHost {
         let clock = Arc::new(ManualClock::new(TEST_EPOCH));
         let host = Arc::new(RecordingHost::default());
         let queue = crate::agent::queue::DispatchQueue::spawn(
-            customize(config.dispatcher()),
+            customize(config.dispatcher().with_session_revocation(
+                super::users::UserStore::new(config.auth_dir().join("users")),
+                Arc::clone(&accounts) as _,
+            )),
             crate::agent::queue::DEFAULT_QUEUE_CAPACITY,
         );
         let service = super::AuthService::new(
@@ -378,7 +381,10 @@ impl TestHost {
                 host: Arc::clone(&self.host) as _,
             },
             crate::agent::queue::DispatchQueue::spawn(
-                self.config.dispatcher(),
+                self.config.dispatcher().with_session_revocation(
+                    super::users::UserStore::new(self.config.auth_dir().join("users")),
+                    Arc::clone(&self.accounts) as _,
+                ),
                 crate::agent::queue::DEFAULT_QUEUE_CAPACITY,
             ),
         )

@@ -346,6 +346,85 @@ async fn files_cannot_be_granted_and_config_dir_is_admin_only() {
     }
 }
 
+#[tokio::test]
+async fn dispatch_outside_auth_invalidates_live_and_persisted_sessions() {
+    use std::sync::Arc;
+    use tetra::{
+        agent::{AgentCommand, queue::DispatchQueue},
+        auth::users::UserStore,
+    };
+    for (action, queued) in [
+        ("set_password", false),
+        ("delete", false),
+        ("set_password", true),
+        ("delete", true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path());
+        let token = login(&host.service, "alice").await;
+        // Simulate agent-dispatch: a separate store/cache instance, while the
+        // daemon keeps its live session store. The same dispatcher also serves
+        // remote commands through the queue.
+        let dispatcher = tetra::agent::Dispatcher::new()
+            .with_module(StubUsers)
+            .with_session_revocation(
+                UserStore::new(host.config.auth_dir().join("users")),
+                Arc::clone(&host.accounts) as _,
+            );
+        let command = |dry_run| AgentCommand {
+            id: "external".into(),
+            module: "users".into(),
+            action: action.into(),
+            payload: json!({"name":"alice", "password_hash":"$6$x", "dry_run":dry_run}),
+            signature: None,
+            user: None,
+        };
+        let mut failed = command(false);
+        failed.payload["fail"] = json!(true);
+        assert!(!dispatcher.dispatch(failed).ok);
+        assert!(
+            UserStore::new(host.config.auth_dir().join("users"))
+                .get(1000, "alice")
+                .unwrap()
+                .is_none()
+        );
+        assert!(dispatcher.dispatch(command(true)).ok);
+        ok(
+            &host.service,
+            Dashboard,
+            Some(&token),
+            "session.info",
+            json!({}),
+        )
+        .await;
+        if queued {
+            let queue = DispatchQueue::spawn(dispatcher, 4);
+            assert!(queue.dispatch(command(false)).await.unwrap().ok);
+        } else {
+            assert!(dispatcher.dispatch(command(false)).ok);
+        }
+        fails(
+            &host.service,
+            Dashboard,
+            Some(&token),
+            "session.info",
+            json!({}),
+            ErrorCode::Unauthenticated,
+        )
+        .await;
+        let restarted = host.restart().unwrap();
+        fails(
+            &restarted,
+            Dashboard,
+            Some(&token),
+            "session.info",
+            json!({}),
+            ErrorCode::Unauthenticated,
+        )
+        .await;
+    }
+}
+
 /// A `users` module that succeeds without touching the host.
 struct StubUsers;
 
@@ -364,15 +443,16 @@ impl tetra::agent::modules::Mod for StubUsers {
     fn handle(
         &self,
         action: &str,
-        _payload: serde_json::Value,
+        payload: serde_json::Value,
         _user: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(payload.get("fail") != Some(&json!(true)), "stub failure");
         Ok(json!({ "action": action }))
     }
 }
 
 #[tokio::test]
-async fn a_new_password_ends_the_accounts_other_sessions() {
+async fn a_new_password_ends_all_account_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let host = tetra::auth::testing::TestHost::with_dispatcher(dir.path(), |dispatcher| {
         dispatcher.with_module(StubUsers)
@@ -434,7 +514,7 @@ async fn a_new_password_ends_the_accounts_other_sessions() {
     )
     .await;
 
-    // Changing one's own password keeps the session it was changed from.
+    // The dispatcher invalidates all sessions, including the caller's own.
     ok(
         &host.service,
         Dashboard,
@@ -443,12 +523,13 @@ async fn a_new_password_ends_the_accounts_other_sessions() {
         set_password("admin", false),
     )
     .await;
-    ok(
+    fails(
         &host.service,
         Dashboard,
         Some(&admin),
         "session.info",
         json!({}),
+        ErrorCode::Unauthenticated,
     )
     .await;
     fails(

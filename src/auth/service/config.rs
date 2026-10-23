@@ -66,7 +66,10 @@ impl AuthConfig {
     /// directories (remote access and updates) using these paths.
     #[must_use]
     pub fn dispatcher(&self) -> crate::agent::Dispatcher {
-        let dispatcher = crate::agent::Dispatcher::full();
+        let dispatcher = crate::agent::Dispatcher::full().with_session_revocation(
+            crate::auth::users::UserStore::new(self.auth_dir().join("users")),
+            std::sync::Arc::new(crate::auth::accounts::SystemAccounts::default()),
+        );
         #[cfg(feature = "updates")]
         let dispatcher = {
             use crate::agent::modules::updates::{Paths, UpdatesModule};

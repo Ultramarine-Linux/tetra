@@ -63,19 +63,6 @@ impl AuthService {
         }
     }
 
-    /// End the sessions of `name` other than the caller's own: after a new
-    /// password or a deleted account ([`sessions_to_end`]).
-    fn end_sessions_of(&self, caller: &Caller, name: &str) {
-        let revoked = self.inner.sessions.revoke(|session| {
-            session.username.as_deref() == Some(name) && session.id != caller.session.id
-        });
-        match revoked {
-            Ok(0) => {}
-            Ok(count) => eprintln!("ended {count} session(s) of `{name}`"),
-            Err(error) => eprintln!("failed to end the sessions of `{name}`: {error:#}"),
-        }
-    }
-
     /// Run `p` through the dispatch queue for `caller`. The checks before
     /// and the bookkeeping after it read and write the stores, so they run
     /// on the blocking pool; no store lock is held while waiting.
@@ -119,7 +106,6 @@ impl AuthService {
                 ),
             }));
         }
-        let end_sessions = sessions_to_end(&p);
         let user = match &caller.principal {
             Principal::User { username, .. } => Some(username.clone()),
             _ => None,
@@ -164,11 +150,6 @@ impl AuthService {
             {
                 this.record_setup_account(&caller.session.id, &name)?;
             }
-            if response.ok
-                && let Some(name) = end_sessions
-            {
-                this.end_sessions_of(&caller, &name);
-            }
             if response.ok {
                 Ok(response.payload.unwrap_or(Value::Null))
             } else {
@@ -180,24 +161,6 @@ impl AuthService {
         })
         .await?
     }
-}
-
-/// The account whose sessions a successful `p` ends: the one
-/// `users.set_password` or `users.delete` (not a dry run) names.
-fn sessions_to_end(p: &DispatchParams) -> Option<String> {
-    let ends = matches!(
-        (p.module.as_str(), p.action.as_str()),
-        ("users", "set_password" | "delete")
-    );
-    let dry_run = p.payload.get("dry_run").and_then(Value::as_bool) == Some(true);
-    (ends && !dry_run)
-        .then(|| {
-            p.payload
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .flatten()
 }
 
 #[derive(Debug, Deserialize)]

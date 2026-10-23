@@ -131,9 +131,14 @@ An account can log in when all of these hold, checked on every login
 - PAM's account stack (`/etc/pam.d/ultramarine-dashboard`) accepts it.
 
 Locking, deleting or renaming an account ends its sessions on the next
-request. A successful `users.set_password` or `users.delete` through
-`module.dispatch` (not a dry run) also ends every session of the named
-account right away, except the caller's own.
+request. A successful `users.set_password` or `users.delete` (not a dry run)
+invalidates every session of the named account, including the caller’s own.
+The dispatcher bumps the account’s persisted session epoch under its store
+lock, so this applies equally to local `module.dispatch`, remote controller
+commands and `agent-dispatch` in another process. Existing sessions and shell
+keepalives fail on their next authorization check. Failed commands and dry
+runs do not change the epoch; a failure to persist invalidation is reported
+as an action failure even though the account command already succeeded.
 
 ## Sessions
 
