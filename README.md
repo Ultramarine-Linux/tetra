@@ -287,9 +287,11 @@ and Tetra refuses it as a dashboard user. Packaging:
 - **SELinux.** A home under `/var/lib` gets none of the `HOME_DIR` rules that
   label rootless storage in `/home`, so Tetra adds `semanage fcontext -a -e
   /var/lib/containers/storage
-  /var/lib/ultramarine-apps/.local/share/containers/storage` (and
-  `restorecon -R`) unless `file_contexts.subs` already has it. Images may
-  apply the same rule at build time instead.
+  /var/lib/ultramarine-apps/.local/share/containers/storage` unless
+  `file_contexts.subs` already has it, creates the storage and relabels it
+  with `restorecon -R`, once (recorded in
+  `/var/lib/tetra/apps-storage-labels`). Images may apply the same rule at
+  build time instead.
 - `agent-serve` logs a warning when the account is missing or its UID/GID is
   not 242 (`usermod -u 242 -g 242` fixes it; files in the home must then be
   re-owned).

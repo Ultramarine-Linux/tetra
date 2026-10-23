@@ -25,7 +25,7 @@ use std::{os::fd::BorrowedFd, path::Component, sync::Arc};
 
 use nix::unistd::User;
 
-use crate::agent::module_support::Commands;
+use crate::agent::{module_support::Commands, tree::Tree};
 use crate::prelude::*;
 
 /// The account user apps run as.
@@ -45,6 +45,10 @@ const DATA_DIR: &str = ".local/share/tetra/quadlets";
 const STORAGE_DIR: &str = ".local/share/containers/storage";
 /// Rootful storage, whose labels the account's storage gets.
 const SYSTEM_STORAGE: &str = "/var/lib/containers/storage";
+/// Records that the account's storage got [`SYSTEM_STORAGE`]'s labels (the
+/// equivalence rule was added and `restorecon` succeeded). Root's, unlike
+/// anything in the account's home.
+const STORAGE_LABELS_STAMP: &str = "/var/lib/tetra/apps-storage-labels";
 
 /// Directories that are never the account's home: handing one to the
 /// account would give it the system.
@@ -207,15 +211,21 @@ impl AppsAccount {
     ///    (`loginctl enable-linger`), then `systemctl start user@<uid>`, so
     ///    the manager is up before Tetra talks to it;
     /// 3. on SELinux hosts, the labels of rootful storage for the account's
-    ///    storage (`semanage fcontext -a -e`, then `restorecon`).
+    ///    storage (`semanage fcontext -a -e`, then `restorecon -R`, see
+    ///    [`label_storage`](Self::label_storage)).
     ///
     /// Each step is skipped when the host already has it, so this is cheap
-    /// to repeat.
+    /// to repeat. Directories made in the home are handed to `owner`.
     ///
     /// # Errors
     /// Fails when a host file cannot be read, no free subordinate range is
-    /// left, or a command fails.
-    pub fn provision(&self, host: &HostPaths, commands: &mut Commands<'_>) -> Result<()> {
+    /// left, the home is refused, or a command fails.
+    pub fn provision(
+        &self,
+        host: &HostPaths,
+        owner: Option<Owner>,
+        commands: &mut Commands<'_>,
+    ) -> Result<()> {
         let mut usermod = Vec::new();
         for (flag, path) in [
             ("--add-subuids", &host.subuid),
@@ -247,15 +257,50 @@ impl AppsAccount {
         commands.run("systemctl", &["start", &manager])?;
 
         if let Some(subs) = &host.selinux_subs {
-            let storage = self.storage_dir();
-            let storage = storage.to_string_lossy();
-            if !has_equivalence(&read_or_empty(subs)?, &storage, SYSTEM_STORAGE) {
-                commands.run(
-                    "semanage",
-                    &["fcontext", "-a", "-e", SYSTEM_STORAGE, &storage],
-                )?;
-                commands.run("restorecon", &["-R", &storage])?;
-            }
+            self.label_storage(subs, &host.storage_labels_stamp, owner, commands)?;
+        }
+        Ok(())
+    }
+
+    /// Give the account's storage the labels of rootful storage, unless
+    /// `stamp` records that this was done: add the equivalence rule to the
+    /// policy (unless `subs` already has it), create the storage (rootless
+    /// Podman would only make it on first use, and `restorecon` fails on a
+    /// missing path), relabel it with `restorecon -R`, and write `stamp`.
+    /// The stamp, not the rule, decides, so a relabel that failed is
+    /// retried on the next converge. A dry run only plans the commands.
+    fn label_storage(
+        &self,
+        subs: &Path,
+        stamp: &Path,
+        owner: Option<Owner>,
+        commands: &mut Commands<'_>,
+    ) -> Result<()> {
+        check_home(&self.home)?;
+        let storage = self.storage_dir();
+        let storage_arg = storage
+            .to_str()
+            .with_context(|| format!("`{}` is not valid UTF-8", storage.display()))?;
+        let labeled = format!("{storage_arg} {SYSTEM_STORAGE}\n");
+        // Unreadable (missing, or not root on a dry run) means not done yet.
+        if fs::read_to_string(stamp).is_ok_and(|contents| contents == labeled) {
+            return Ok(());
+        }
+        if !has_equivalence(&read_or_empty(subs)?, storage_arg, SYSTEM_STORAGE) {
+            commands.run(
+                "semanage",
+                &["fcontext", "-a", "-e", SYSTEM_STORAGE, storage_arg],
+            )?;
+        }
+        if !commands.dry_run() {
+            Tree::new(&storage, Some(&self.home), owner).create_dir(&storage)?;
+        }
+        commands.run("restorecon", &["-R", storage_arg])?;
+        if !commands.dry_run() {
+            let dir = stamp
+                .parent()
+                .with_context(|| format!("`{}` has no directory", stamp.display()))?;
+            Tree::trusted(dir).write(stamp, labeled.as_bytes(), 0o644)?;
         }
         Ok(())
     }
@@ -307,6 +352,8 @@ pub struct HostPaths {
     /// The policy's local file-context equivalences (`semanage fcontext
     /// -a -e`), or `None` on a host without SELinux.
     pub selinux_subs: Option<PathBuf>,
+    /// Where Tetra records that the account's storage was labeled.
+    pub storage_labels_stamp: PathBuf,
 }
 
 impl HostPaths {
@@ -323,6 +370,7 @@ impl HostPaths {
                     .join(selinux_policy_type())
                     .join("contexts/files/file_contexts.subs")
             }),
+            storage_labels_stamp: PathBuf::from(STORAGE_LABELS_STAMP),
         }
     }
 }
@@ -501,7 +549,6 @@ pub(crate) mod tests {
 
     /// An owner whose chown records the paths it was asked to give away,
     /// relative to `home`.
-    #[cfg(feature = "quadlets")]
     pub fn recording_owner(home: &Path) -> (Owner, Arc<std::sync::Mutex<Vec<String>>>) {
         let chowned = Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = Arc::clone(&chowned);
@@ -604,6 +651,7 @@ pub(crate) mod tests {
             subgid: dir.join("subgid"),
             linger_dir: dir.join("linger"),
             selinux_subs: selinux.then(|| dir.join("file_contexts.subs")),
+            storage_labels_stamp: dir.join("tetra/apps-storage-labels"),
         }
     }
 
@@ -616,14 +664,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn provisions_subids_linger_and_labels_once() {
+    fn plans_subids_linger_and_labels() {
         let dir = tempfile::tempdir().unwrap();
         let host = host(dir.path(), true);
         fs::write(&host.subuid, "cypress:524288:65536\n").unwrap();
         let account = AppsAccount::expected();
 
         let mut commands = Commands::fake(true, "");
-        account.provision(&host, &mut commands).unwrap();
+        account.provision(&host, None, &mut commands).unwrap();
         assert_eq!(
             planned(&commands),
             [
@@ -635,33 +683,125 @@ pub(crate) mod tests {
                 "restorecon -R /var/lib/ultramarine-apps/.local/share/containers/storage",
             ]
         );
-
-        // A host that already has everything only gets the manager started.
-        fs::write(&host.subuid, "ultramarine-apps:589824:65536\n").unwrap();
-        fs::write(&host.subgid, "242:524288:65536\n").unwrap();
-        fs::create_dir_all(&host.linger_dir).unwrap();
-        fs::write(host.linger_dir.join(APPS_USER), "").unwrap();
-        fs::write(
-            host.selinux_subs.as_ref().unwrap(),
-            "/var/lib/ultramarine-apps/.local/share/containers/storage /var/lib/containers/storage\n",
-        )
-        .unwrap();
-        let mut commands = Commands::fake(false, "");
-        account.provision(&host, &mut commands).unwrap();
-        assert_eq!(planned(&commands), ["systemctl start user@242.service"]);
+        // A dry run changes nothing.
+        assert!(!host.storage_labels_stamp.exists());
 
         // Without SELinux there is nothing to label.
         let mut commands = Commands::fake(true, "");
         let mut host = host;
         host.selinux_subs = None;
-        fs::write(&host.subgid, "").unwrap();
-        account.provision(&host, &mut commands).unwrap();
+        account.provision(&host, None, &mut commands).unwrap();
         assert_eq!(
             planned(&commands),
             [
-                "usermod --add-subgids 524288-589823 ultramarine-apps",
+                "usermod --add-subuids 589824-655359 --add-subgids 524288-589823 ultramarine-apps",
+                "loginctl enable-linger ultramarine-apps",
                 "systemctl start user@242.service",
             ]
+        );
+    }
+
+    #[test]
+    fn labels_the_storage_until_a_relabel_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path(), true);
+        fs::write(&host.subuid, "ultramarine-apps:589824:65536\n").unwrap();
+        fs::write(&host.subgid, "242:524288:65536\n").unwrap();
+        fs::create_dir_all(&host.linger_dir).unwrap();
+        fs::write(host.linger_dir.join(APPS_USER), "").unwrap();
+        let home = dir.path().join("apps");
+        let (owner, chowned) = recording_owner(&home);
+        let account = AppsAccount {
+            home,
+            ..AppsAccount::expected()
+        };
+        let storage = account.storage_dir();
+        let semanage = format!(
+            "semanage fcontext -a -e /var/lib/containers/storage {}",
+            storage.display()
+        );
+        let restorecon = format!("restorecon -R {}", storage.display());
+        // `restorecon` fails on a missing path, as the real one does.
+        let runner = |failing: bool| {
+            let storage = storage.clone();
+            move |program: &str, args: &[&str]| {
+                let command = crate::agent::module_support::command_display(program, args);
+                ensure!(
+                    program != "restorecon" || (storage.is_dir() && !failing),
+                    "`{command}` failed"
+                );
+                Ok(crate::agent::module_support::CommandResult {
+                    command,
+                    status: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    dry_run: false,
+                })
+            }
+        };
+
+        // The rule is added and the storage made (and handed over) before
+        // the relabel; the relabel fails, so nothing is recorded.
+        let mut commands = Commands::with_runner(false, runner(true));
+        account
+            .provision(&host, Some(owner.clone()), &mut commands)
+            .unwrap_err();
+        assert_eq!(
+            planned(&commands),
+            ["systemctl start user@242.service", &semanage, &restorecon]
+        );
+        assert!(storage.is_dir());
+        assert_eq!(
+            *chowned.lock().unwrap(),
+            [
+                "",
+                ".local",
+                ".local/share",
+                ".local/share/containers",
+                ".local/share/containers/storage"
+            ]
+        );
+        assert!(!host.storage_labels_stamp.exists());
+
+        // The rule is there now, but the storage still needs its labels.
+        fs::write(
+            host.selinux_subs.as_ref().unwrap(),
+            format!("{} /var/lib/containers/storage\n", storage.display()),
+        )
+        .unwrap();
+        let mut commands = Commands::with_runner(false, runner(false));
+        account
+            .provision(&host, Some(owner.clone()), &mut commands)
+            .unwrap();
+        assert_eq!(
+            planned(&commands),
+            ["systemctl start user@242.service", &restorecon]
+        );
+        assert_eq!(
+            fs::read_to_string(&host.storage_labels_stamp).unwrap(),
+            format!("{} /var/lib/containers/storage\n", storage.display())
+        );
+
+        // Done once, then never again.
+        let mut commands = Commands::with_runner(false, runner(true));
+        account
+            .provision(&host, Some(owner.clone()), &mut commands)
+            .unwrap();
+        assert_eq!(planned(&commands), ["systemctl start user@242.service"]);
+
+        // A stamp for another storage does not count.
+        fs::write(
+            &host.storage_labels_stamp,
+            "/elsewhere /var/lib/containers/storage\n",
+        )
+        .unwrap();
+        let mut commands = Commands::with_runner(false, runner(false));
+        account
+            .provision(&host, Some(owner), &mut commands)
+            .unwrap();
+        assert_eq!(
+            planned(&commands),
+            ["systemctl start user@242.service", &restorecon]
         );
     }
 
@@ -687,6 +827,24 @@ pub(crate) mod tests {
         for home in [APPS_HOME, "/var/lib/apps", "/srv/apps", "/home/apps"] {
             check_home(Path::new(home)).unwrap();
         }
+
+        // Nothing is labeled in a refused home.
+        let dir = tempfile::tempdir().unwrap();
+        let account = AppsAccount {
+            home: PathBuf::from("/"),
+            ..AppsAccount::expected()
+        };
+        let mut commands = Commands::fake(true, "");
+        fs::write(dir.path().join("subuid"), "242:589824:65536\n").unwrap();
+        fs::write(dir.path().join("subgid"), "242:589824:65536\n").unwrap();
+        account
+            .provision(&host(dir.path(), true), None, &mut commands)
+            .unwrap_err();
+        assert!(
+            !planned(&commands)
+                .iter()
+                .any(|command| command.starts_with("semanage"))
+        );
     }
 
     #[test]

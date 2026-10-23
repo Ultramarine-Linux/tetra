@@ -483,8 +483,9 @@ directory at creation. Two things still run `restorecon` on paths in the
 home, as root: the `selinux` options of `quadlets.write`/`install` and
 `apps.create`/`update` (an administrator's request), and the one-time
 `restorecon -R` of the account's container storage in
-`AppsAccount::provision`. `restorecon` resolves the path's directories with
-`realpath(3)` and walks a tree with `fts` (`FTS_PHYSICAL | FTS_NOCHDIR`),
+`AppsAccount::provision` (which first creates the storage through `Tree`,
+and records success in `/var/lib/tetra/apps-storage-labels`). `restorecon`
+resolves the path's directories with `realpath(3)` and walks a tree with `fts` (`FTS_PHYSICAL | FTS_NOCHDIR`),
 relabeling each entry by its full path, so it does not follow a symlink
 it finds, but a directory swapped for a symlink while it runs could have it
 relabel a file elsewhere to the label the policy gives the home's path.
@@ -518,6 +519,7 @@ Default mutable paths (bootc-friendly):
 | `/var/lib/tetra/secrets/`  | Credentials for other services, sealed with `systemd-creds`. |
 | `/var/lib/tetra/remote/`   | Remote-control client key, certificate, server CA and controller record (root-only). |
 | `/var/lib/tetra/quadlets/` | Companion files and `app.json` manifests of system-scope apps. |
+| `/var/lib/tetra/apps-storage-labels` | Records that the apps account's container storage got the labels of rootful storage. |
 | `/var/lib/ultramarine-apps/` | Home of the apps account: apps-scope Quadlets (`.config/containers/systemd`), bundles (`.local/share/tetra/quadlets`) and rootless Podman storage, owned by the account. |
 | `/run/tetra/`              | The socket, the setup code for the console, short-lived files. |
 

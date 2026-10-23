@@ -986,12 +986,15 @@ skipping what is already there:
    `/var/lib/systemd/linger/ultramarine-apps` exists (the packaged
    `tetra.tmpfiles.conf` creates it), then `systemctl start user@242.service`,
    so the account's manager is running before Tetra talks to it.
-3. On SELinux hosts, unless the policy's `file_contexts.subs` already has it:
-   `semanage fcontext -a -e /var/lib/containers/storage
-   /var/lib/ultramarine-apps/.local/share/containers/storage` and `restorecon
-   -R` on it, so rootless storage gets the labels of rootful storage (a home
-   under `/var/lib` gets none of the `HOME_DIR` rules that label rootless
-   storage in `/home`).
+3. On SELinux hosts, unless `/var/lib/tetra/apps-storage-labels` records
+   that it was done: `semanage fcontext -a -e /var/lib/containers/storage
+   /var/lib/ultramarine-apps/.local/share/containers/storage` (skipped when
+   the policy's `file_contexts.subs` already has it), creating that
+   directory (owned by the account) and `restorecon -R` on it, so rootless
+   storage gets the labels of rootful storage (a home under `/var/lib` gets
+   none of the `HOME_DIR` rules that label rootless storage in `/home`). The
+   record is written only once `restorecon` succeeds, so a failed relabel
+   is retried on the next converge.
 
 The account must exist (`systemd-sysusers`); converging in apps scope fails
 otherwise. Rootless containers cannot publish ports below 1024 unless the

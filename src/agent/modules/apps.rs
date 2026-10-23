@@ -69,7 +69,7 @@ use serde_json::json;
 use serde_norway::Value as YamlValue;
 
 use crate::actions;
-use crate::agent::apps_account::{AppsAccount, HostPaths};
+use crate::agent::apps_account::{AppsAccount, HostPaths, Owner};
 use crate::agent::module_support::{Commands, ModuleInfo, ModuleStatus, apply_selinux, safe_join};
 use crate::agent::modules::Mod;
 use crate::agent::modules::quadlets::{
@@ -438,7 +438,11 @@ fn prepare_account(scope: AppScope, dry_run: bool) -> Result<Vec<Value>> {
         AppsAccount::require()?
     };
     let mut commands = Commands::new(dry_run);
-    account.provision(&HostPaths::system(), &mut commands)?;
+    account.provision(
+        &HostPaths::system(),
+        Owner::for_apps(dry_run)?,
+        &mut commands,
+    )?;
     Ok(commands.done)
 }
 
