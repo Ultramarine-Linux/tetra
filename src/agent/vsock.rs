@@ -70,6 +70,10 @@ impl VsockAgentConfig {
             let (stream, peer) = listener
                 .accept()
                 .context("failed to accept vsock connection")?;
+            // Idle peers must not pin a thread forever.
+            let timeout = Some(std::time::Duration::from_secs(30));
+            stream.set_read_timeout(timeout)?;
+            stream.set_write_timeout(timeout)?;
             let dispatcher = Arc::clone(dispatcher);
             let max_command_bytes = self.max_command_bytes;
             let peer = peer.as_vsock_address().map_or_else(

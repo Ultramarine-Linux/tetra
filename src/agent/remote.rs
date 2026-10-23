@@ -94,9 +94,11 @@ where
     Ok(())
 }
 
-/// The connection the daemon should run for `config` and the enrollment in
-/// `enrollment_dir`, logging (and treating as disabled) a remote section that
-/// is enabled but incomplete or an unreadable enrollment.
+/// The connection the daemon should run.
+///
+/// Built from `config` and the enrollment in `enrollment_dir`; a remote
+/// section that is enabled but incomplete, or an unreadable enrollment, is
+/// logged and treated as disabled.
 #[must_use]
 pub fn connection_from(
     config: &RuntimeConfig,

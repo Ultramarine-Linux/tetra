@@ -10,12 +10,11 @@
 
 use std::{
     fs::OpenOptions,
-    io::{Read as _, Write as _},
+    io::Read as _,
     os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
     path::Component,
 };
 
-use rand::RngExt as _;
 
 use crate::prelude::*;
 
@@ -142,33 +141,7 @@ pub fn write_keyfile(path: &Path, contents: &[u8]) -> Result<()> {
         u64::try_from(contents.len()).is_ok_and(|len| len <= MAX_KEYFILE_BYTES),
         "keyfile contents are too large"
     );
-    let dir = path.parent().context("keyfile path has no parent")?;
-    let mut suffix = [0_u8; 8];
-    rand::rng().fill(&mut suffix[..]);
-    let temporary = dir.join(format!(
-        ".tetra-{}.tmp",
-        suffix.iter().map(|byte| format!("{byte:02x}")).join("")
-    ));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)
-            .with_context(|| format!("failed to create `{}`", temporary.display()))?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)
-            .with_context(|| format!("failed to replace `{}`", path.display()))?;
-        // Persist the rename itself so the profile survives a crash or reboot.
-        fs::File::open(dir).and_then(|dir| dir.sync_all())?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _removed: io::Result<()> = fs::remove_file(&temporary);
-    }
-    result
+    crate::auth::store::replace(path, contents, 0o600)
 }
 
 /// Remove a validated keyfile; a missing file is not an error.
@@ -176,12 +149,7 @@ pub fn write_keyfile(path: &Path, contents: &[u8]) -> Result<()> {
 /// # Errors
 /// Errs when the path exists but cannot be removed.
 pub fn remove_keyfile(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => {
-            Err(error).with_context(|| format!("failed to remove `{}`", path.display()))
-        }
-        _ => Ok(()),
-    }
+    crate::auth::store::remove(path)
 }
 
 #[cfg(test)]

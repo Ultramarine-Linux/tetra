@@ -125,12 +125,7 @@ fn rename(from: &Path, to: &Path) -> Result<()> {
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => {
-            Err(error).with_context(|| format!("failed to remove `{}`", path.display()))
-        }
-        _ => Ok(()),
-    }
+    crate::auth::store::remove(path)
 }
 
 /// Validity window of a client certificate, in Unix seconds.
@@ -143,9 +138,10 @@ pub struct Lifetime {
 impl Lifetime {
     /// Read the leaf certificate's validity from the PEM file at `path`.
     pub fn read(path: &Path) -> Result<Self> {
+        use rustls::pki_types::{CertificateDer, pem::PemObject as _};
         let pem = fs::read(path)
             .with_context(|| format!("failed to read client certificate `{}`", path.display()))?;
-        let leaf = rustls_pemfile::certs(&mut pem.as_slice())
+        let leaf = CertificateDer::pem_slice_iter(&pem)
             .next()
             .context("client certificate PEM is empty")?
             .context("failed to parse client certificate PEM")?;

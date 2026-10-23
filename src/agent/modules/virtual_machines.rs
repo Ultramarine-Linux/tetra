@@ -15,7 +15,9 @@
 //! `list` and `status` additionally parse virsh's text output into stable
 //! `domains` / `domain` JSON fields so callers do not have to.
 
-use crate::agent::module_support::{ModuleInfo, ModuleStatus, NamedPayload, handle_metadata};
+use crate::agent::module_support::{
+    ModuleInfo, ModuleStatus, NamedPayload, positional,
+};
 use crate::prelude::*;
 use crate::types::{VirtualMachineCreateRequest, VirtualMachineLogsRequest};
 
@@ -50,10 +52,6 @@ impl Mod for VirtualMachinesModule {
     }
 
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
-        // Delegate `capabilities`/`plan` to the shared metadata handler first.
-        if let Some(response) = handle_metadata(INFO, action, &payload) {
-            return Ok(response);
-        }
         Action::from_payload(action, payload)?.handle(user)
     }
 }
@@ -76,7 +74,7 @@ actions!(Action [payload user] => {
     // `list --all` includes powered-off domains, not just running ones.
     // `list` is a read and therefore never dry-run.
     Status: NamedPayload => {
-        let result = crate::cmd!({ &INFO, "status", user } "virsh" ["dominfo", &payload.name])?;
+        let result = crate::cmd!({ &INFO, "status", user } "virsh" ["dominfo", positional("name", &payload.name)?])?;
         let info = parse_virsh_dominfo(&result.stdout);
         Ok(jsonf! {
             result.command,
@@ -98,19 +96,19 @@ actions!(Action [payload user] => {
             &payload.lines.to_string()
         ] json)
     },
-    Start: NamedPayload => crate::cmd!((payload.dry_run) { &INFO, "start", user } "virsh" ["start", &payload.name] ; json),
+    Start: NamedPayload => crate::cmd!((payload.dry_run) { &INFO, "start", user } "virsh" ["start", positional("name", &payload.name)?] ; json),
 
     // `stop` uses `shutdown` for a graceful guest-initiated shutdown
     // rather than `destroy` (hard power-off).
-    Stop: NamedPayload => crate::cmd!((payload.dry_run) { &INFO, "stop", user } "virsh" ["shutdown", &payload.name] json),
+    Stop: NamedPayload => crate::cmd!((payload.dry_run) { &INFO, "stop", user } "virsh" ["shutdown", positional("name", &payload.name)?] json),
     // `restart` uses `reboot`, the guest-graceful equivalent.
-    Restart: NamedPayload => crate::cmd!((payload.dry_run) { &INFO, "restart", user } "virsh" ["reboot", &payload.name] json),
+    Restart: NamedPayload => crate::cmd!((payload.dry_run) { &INFO, "restart", user } "virsh" ["reboot", positional("name", &payload.name)?] json),
     // `create` maps to `define`: register a persistent domain from the
     // given XML file. See the module docs for why we avoid `virsh create`.
-    Create: VirtualMachineCreateRequest  => crate::cmd!((payload.dry_run) { &INFO, "create", user } "virsh" ["define", &payload.xml_path] json),
+    Create: VirtualMachineCreateRequest  => crate::cmd!((payload.dry_run) { &INFO, "create", user } "virsh" ["define", positional("xml_path", &payload.xml_path)?] json),
     // `delete` maps to `undefine`: remove the domain registration. It
     // does not delete disk images by default.
-    Delete: NamedPayload => crate::cmd!((payload.dry_run) { &INFO, "delete", user } "virsh" ["undefine", &payload.name] json),
+    Delete: NamedPayload => crate::cmd!((payload.dry_run) { &INFO, "delete", user } "virsh" ["undefine", positional("name", &payload.name)?] json),
 });
 
 /// Parses `virsh list --all` output into domain objects.

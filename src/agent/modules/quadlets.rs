@@ -28,7 +28,7 @@
 //! independently to each.
 //!
 //! Scope is selected per request via `scope: "user" | "system"` (default
-//! `user`). Every action also accepts optional `base_dir` / `files_base_dir`
+//! `system`). Every action also accepts optional `base_dir` / `files_base_dir`
 //! overrides, which is what makes the protocol testable without touching
 //! real system paths.
 //!
@@ -36,7 +36,9 @@
 //! `systemctl daemon-reload`; the caller does that through the separate
 //! `services` module's `daemon_reload` action once writes are confirmed.
 
-use crate::agent::module_support::{SelinuxOptions, apply_selinux, safe_join};
+use crate::agent::module_support::{
+    SelinuxOptions, apply_selinux, resolve_under, safe_join, write_under,
+};
 use crate::prelude::*;
 
 /// Agent module backing the `quadlets` feature. See the module-level docs
@@ -72,15 +74,15 @@ const INFO: ModuleInfo = ModuleInfo {
 const QUADLET_EXTENSIONS: &[&str] = &["container", "kube", "network", "pod", "volume"];
 
 /// Which Podman/systemd tree a request targets. `User` resolves to the
-/// invoking user's `~/.config/containers/systemd` and `~/.local/share/tetra`
+/// agent's `~/.config/containers/systemd` and `~/.local/share/tetra`
 /// data root; `System` resolves to `/etc/containers/systemd` and
-/// `/var/lib/tetra/quadlets`. Defaults to `User` because the agent normally
-/// runs under the owner's account rather than as root.
+/// `/var/lib/tetra/quadlets`. Defaults to `System`, like `apps`: the agent
+/// runs as a root system service, which has no `$HOME`.
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum QuadletScope {
-    #[default]
     User,
+    #[default]
     System,
 }
 
@@ -139,7 +141,7 @@ actions!(Action [payload user] => {
         #[serde(default)]
         scope: QuadletScope,
     } => {
-        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope)?;
+        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope, user)?;
         Ok(jsonf! { base_dir, "files": QuadletFile::list(&base_dir)? })
     },
     ListFiles {
@@ -148,8 +150,8 @@ actions!(Action [payload user] => {
         #[serde(default)]
         scope: QuadletScope,
     } => {
-        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope)?;
-        let files_base_dir = quadlet_files_base_dir(payload.files_base_dir, payload.scope, None)?;
+        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope, user)?;
+        let files_base_dir = quadlet_files_base_dir(payload.files_base_dir, payload.scope, None, user)?;
         let mut files = ManagedFile::list(&base_dir)?;
         files.extend(list_companion_files(&files_base_dir)?);
         // Quadlet entries first, then companions, each group sorted by filename.
@@ -172,24 +174,14 @@ actions!(Action [payload user] => {
         #[serde(default)]
         dry_run: bool,
     } => {
-        // Companion files are addressed by their full relative path
-        // (e.g. `site/index.html`), so no bundle is derived. Quadlet
-        // reads resolve against the flat scan directory instead.
-        let bundle_name = if payload.companion {
-            None
-        } else {
-            Some(quadlet_bundle_name(&payload.filename)?)
-        };
-        let base_dir = if payload.companion {
-            quadlet_files_base_dir(
-                payload.files_base_dir,
-                payload.scope,
-                bundle_name.as_deref(),
-            )?
-        } else {
-            quadlet_base_dir(payload.base_dir, payload.scope)?
-        };
-        let path = safe_join(&base_dir, &payload.filename)?;
+        let (base_dir, path) = target(
+            payload.base_dir,
+            payload.files_base_dir,
+            payload.scope,
+            &payload.filename,
+            payload.companion,
+            user,
+        )?;
         let contents = fs::read_to_string(&path)
             .with_context(|| format!("failed to read `{}`", path.display()))?;
         Ok(jsonf! { base_dir, payload.filename, contents, payload.dry_run })
@@ -206,14 +198,14 @@ actions!(Action [payload user] => {
         selinux: Option<SelinuxOptions>,
     } => {
         validate_quadlet(&payload.filename, &payload.contents)?;
-        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope)?;
-        let path = safe_join(&base_dir, &payload.filename)?;
-        if !payload.dry_run {
-            fs::create_dir_all(&base_dir)
-                .with_context(|| format!("failed to create `{}`", base_dir.display()))?;
-            fs::write(&path, &payload.contents)
-                .with_context(|| format!("failed to write `{}`", path.display()))?;
-        }
+        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope, user)?;
+        let path = write_under(
+            &base_dir,
+            &payload.filename,
+            payload.contents.as_bytes(),
+            UNIT_MODE,
+            payload.dry_run,
+        )?;
         let selinux =
             apply_selinux(payload.selinux.as_ref(), Some(&path), payload.dry_run)?;
         Ok(jsonf! {
@@ -233,21 +225,14 @@ actions!(Action [payload user] => {
         #[serde(default)]
         dry_run: bool,
     } => {
-        let bundle_name = if payload.companion {
-            None
-        } else {
-            Some(quadlet_bundle_name(&payload.filename)?)
-        };
-        let base_dir = if payload.companion {
-            quadlet_files_base_dir(
-                payload.files_base_dir,
-                payload.scope,
-                bundle_name.as_deref(),
-            )?
-        } else {
-            quadlet_base_dir(payload.base_dir, payload.scope)?
-        };
-        let path = safe_join(&base_dir, &payload.filename)?;
+        let (base_dir, path) = target(
+            payload.base_dir,
+            payload.files_base_dir,
+            payload.scope,
+            &payload.filename,
+            payload.companion,
+            user,
+        )?;
         if !payload.dry_run {
             fs::remove_file(&path)
                 .with_context(|| format!("failed to delete `{}`", path.display()))?;
@@ -278,7 +263,7 @@ actions!(Action [payload user] => {
         #[serde(default)]
         selinux: Option<SelinuxOptions>,
     } => {
-        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope)?;
+        let base_dir = quadlet_base_dir(payload.base_dir, payload.scope, user)?;
         // The companion bundle is named after the first Quadlet
         // resource's stem (`site.container` -> `site`). Callers are
         // expected to put the primary unit first; with no Quadlets,
@@ -292,6 +277,7 @@ actions!(Action [payload user] => {
             payload.files_base_dir,
             payload.scope,
             bundle_name.as_deref(),
+            user,
         )?;
         // Create both roots up front so a permission or disk failure
         // surfaces before any file is written, rather than midway
@@ -308,7 +294,7 @@ actions!(Action [payload user] => {
         let mut selinux_ops = Vec::new();
         for resource in payload.resources {
             validate_quadlet(&resource.filename, &resource.contents)?;
-            let path = write_resource(&base_dir, &resource, payload.dry_run)?;
+            let path = write_under(&base_dir, &resource.filename, resource.contents.as_bytes(), UNIT_MODE, payload.dry_run)?;
             selinux_ops.extend(apply_selinux(
                 resource.selinux.as_ref(),
                 Some(&path),
@@ -321,7 +307,7 @@ actions!(Action [payload user] => {
         }
         let mut files = Vec::new();
         for resource in payload.files {
-            let path = write_resource(&files_base_dir, &resource, payload.dry_run)?;
+            let path = write_under(&files_base_dir, &resource.filename, resource.contents.as_bytes(), COMPANION_MODE, payload.dry_run)?;
             selinux_ops.extend(apply_selinux(
                 resource.selinux.as_ref(),
                 Some(&path),
@@ -404,18 +390,33 @@ impl ManagedFile {
 /// Resolve the Quadlet scan directory for a request. An explicit `base_dir`
 /// always wins — tests and custom deployments rely on this — otherwise the
 /// scope picks the default Podman scan path.
-pub(crate) fn quadlet_base_dir(base_dir: Option<PathBuf>, scope: QuadletScope) -> Result<PathBuf> {
+pub(crate) fn quadlet_base_dir(
+    base_dir: Option<PathBuf>,
+    scope: QuadletScope,
+    user: Option<&str>,
+) -> Result<PathBuf> {
     if let Some(base_dir) = base_dir {
         return Ok(base_dir);
     }
 
     match scope {
-        QuadletScope::User => {
-            let home =
-                std::env::var_os("HOME").context("HOME is not set and no base_dir was provided")?;
-            Ok(PathBuf::from(home).join(".config/containers/systemd"))
-        }
+        QuadletScope::User => Ok(user_home(user)?.join(".config/containers/systemd")),
         QuadletScope::System => Ok(PathBuf::from("/etc/containers/systemd")),
+    }
+}
+
+/// The home directory user scope resolves against: the signed-in user's
+/// (from NSS), or, with no user (the `agent-dispatch` CLI), `$HOME`. Never
+/// the daemon's environment for a dashboard user.
+fn user_home(user: Option<&str>) -> Result<PathBuf> {
+    match user {
+        Some(name) => Ok(nix::unistd::User::from_name(name)
+            .with_context(|| format!("failed to look up `{name}`"))?
+            .with_context(|| format!("no account named `{name}`"))?
+            .dir),
+        None => std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .context("user scope needs a signed-in user (or HOME), or an explicit base directory"),
     }
 }
 
@@ -428,6 +429,7 @@ pub(crate) fn quadlet_files_base_dir(
     files_base_dir: Option<PathBuf>,
     scope: QuadletScope,
     bundle_name: Option<&str>,
+    user: Option<&str>,
 ) -> Result<PathBuf> {
     let base = if let Some(files_base_dir) = files_base_dir {
         files_base_dir
@@ -438,13 +440,16 @@ pub(crate) fn quadlet_files_base_dir(
                 // default of $HOME/.local/share. Never hardcode the latter so
                 // environments that relocate data (snaps, flatpak-style
                 // sandboxes) keep working.
-                let xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+                // The daemon's environment says nothing about a signed-in
+                // user's XDG_DATA_HOME, so only the CLI (no user) honors it.
+                let xdg_data_home = user
+                    .is_none()
+                    .then(|| std::env::var_os("XDG_DATA_HOME"))
+                    .flatten();
                 let base = if let Some(xdg_data_home) = xdg_data_home {
                     PathBuf::from(xdg_data_home)
                 } else {
-                    let home = std::env::var_os("HOME")
-                        .context("HOME is not set and no files_base_dir was provided")?;
-                    PathBuf::from(home).join(".local/share")
+                    user_home(user)?.join(".local/share")
                 };
                 base.join("tetra/quadlets")
             }
@@ -464,21 +469,9 @@ pub(crate) fn quadlet_files_base_dir(
 /// against path-traversal in filenames: it rejects absolute paths and any
 /// `..`/`Prefix` component before `safe_join` runs at write time.
 fn quadlet_bundle_name(pathstr: &str) -> Result<String> {
-    let path = Path::new(pathstr);
-    // Reject absolute paths and `..`/`Prefix` components up front so the
-    // derived bundle name can't be used to escape the data root later.
-    // `Prefix` covers Windows drive roots and is harmless to reject on Linux.
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir | std::path::Component::Prefix(_)
-            )
-        })
-    {
-        bail!("path `{pathstr}` must be relative and stay within the base directory");
-    }
-
+    // Reject absolute paths and `..` up front so the derived bundle name
+    // can't be used to escape the data root later.
+    let path = safe_join(Path::new(""), pathstr)?;
     let base_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -542,22 +535,33 @@ fn collect_files(base_dir: &Path, dir: &Path, files: &mut Vec<ManagedFile>) -> R
     Ok(())
 }
 
-/// Write one `InstallResource` under `base_dir`, creating parent
-/// directories as needed so nested companion paths such as
-/// `nginx/default.conf` work. `safe_join` enforces that the resource path
-/// stays within `base_dir`.
-fn write_resource(base_dir: &Path, resource: &InstallResource, dry_run: bool) -> Result<PathBuf> {
-    let path = safe_join(base_dir, &resource.filename)?;
-    if !dry_run {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create `{}`", parent.display()))?;
-        }
-        fs::write(&path, &resource.contents)
-            .with_context(|| format!("failed to write `{}`", path.display()))?;
-    }
-    Ok(path)
+/// The directory and path of a Quadlet (`companion: false`) or companion
+/// file named by a `read`/`delete` payload. Companion files are addressed by
+/// their full relative path (e.g. `site/index.html`), so no bundle is
+/// derived; Quadlets resolve against the flat scan directory. The path may
+/// not leave the directory or pass through a symlink.
+fn target(
+    base_dir: Option<PathBuf>,
+    files_base_dir: Option<PathBuf>,
+    scope: QuadletScope,
+    filename: &str,
+    companion: bool,
+    user: Option<&str>,
+) -> Result<(PathBuf, PathBuf)> {
+    let base_dir = if companion {
+        quadlet_files_base_dir(files_base_dir, scope, None, user)?
+    } else {
+        quadlet_bundle_name(filename)?;
+        quadlet_base_dir(base_dir, scope, user)?
+    };
+    let path = resolve_under(&base_dir, filename)?;
+    Ok((base_dir, path))
 }
+
+/// Mode of unit files, which can hold secrets (`Environment=...`).
+const UNIT_MODE: u32 = 0o600;
+/// Mode of companion files, which containers read through bind mounts.
+const COMPANION_MODE: u32 = 0o644;
 
 /// Cheap structural validation: supported extension, non-empty contents, and
 /// at least one Quadlet section header. This is *not* a full `quadlet
@@ -615,7 +619,7 @@ mod tests {
     #[test]
     fn system_scope_uses_system_quadlet_directory() {
         assert_eq!(
-            quadlet_base_dir(None, QuadletScope::System).unwrap(),
+            quadlet_base_dir(None, QuadletScope::System, None).unwrap(),
             PathBuf::from("/etc/containers/systemd")
         );
     }
@@ -623,7 +627,7 @@ mod tests {
     #[test]
     fn system_scope_uses_var_lib_for_companion_files() {
         assert_eq!(
-            quadlet_files_base_dir(None, QuadletScope::System, Some("app")).unwrap(),
+            quadlet_files_base_dir(None, QuadletScope::System, Some("app"), None).unwrap(),
             PathBuf::from("/var/lib/tetra/quadlets/app")
         );
     }

@@ -2,13 +2,14 @@
 //!
 //! A thin wrapper around the `podman` CLI. The listing actions (`containers`,
 //! `images`, `volumes`, `networks`, `inspect`) all rely on podman's native
-//! `--format json`, so [`run_command_json`] parses stdout straight into the
+//! `--format json`, so the `cmd!` macro's `JSON` mode parses stdout straight into the
 //! response `data` field with no module-specific parsing of our own. The
 //! mutating lifecycle actions (`start`/`stop`/`restart`/`remove`) honor the
 //! shared `dry_run` flag. Note the action name `remove` maps to the `podman rm`
 //! subcommand, keeping the protocol verb consistent across modules while the
 //! underlying CLI uses its native spelling.
 
+use crate::agent::module_support::positional;
 use crate::prelude::*;
 
 /// Marker type for the podman module. Stateless; all behavior lives in the
@@ -53,7 +54,7 @@ actions!(Action [payload user] => {
         crate::cmd!({ &INFO, "containers", user } "podman" ["ps", "--all", "--format", "json"] JSON)
     },
     Inspect { name: String } => {
-        crate::cmd!({ &INFO, "inspect", user } "podman" ["inspect", &payload.name] JSON)
+        crate::cmd!({ &INFO, "inspect", user } "podman" ["inspect", positional("name", &payload.name)?] JSON)
     },
     Images => {
         crate::cmd!({ &INFO, "images", user } "podman" ["images", "--format", "json"] JSON)
@@ -69,35 +70,35 @@ actions!(Action [payload user] => {
         #[serde(default = "default_log_lines")]
         lines: u16,
     } => {
-        crate::cmd!({ &INFO, "logs", user } "podman" ["logs", "--tail", &payload.lines.to_string(), &payload.name] json)
+        crate::cmd!({ &INFO, "logs", user } "podman" ["logs", "--tail", &payload.lines.to_string(), positional("name", &payload.name)?] json)
     },
     Start {
         name: String,
         #[serde(default)]
         dry_run: bool,
     } => {
-        crate::cmd!((payload.dry_run) { &INFO, "start", user } "podman" ["start", &payload.name] json)
+        crate::cmd!((payload.dry_run) { &INFO, "start", user } "podman" ["start", positional("name", &payload.name)?] json)
     },
     Stop {
         name: String,
         #[serde(default)]
         dry_run: bool,
     } => {
-        crate::cmd!((payload.dry_run) { &INFO, "stop", user } "podman" ["stop", &payload.name] json)
+        crate::cmd!((payload.dry_run) { &INFO, "stop", user } "podman" ["stop", positional("name", &payload.name)?] json)
     },
     Restart {
         name: String,
         #[serde(default)]
         dry_run: bool,
     } => {
-        crate::cmd!((payload.dry_run) { &INFO, "restart", user } "podman" ["restart", &payload.name] json)
+        crate::cmd!((payload.dry_run) { &INFO, "restart", user } "podman" ["restart", positional("name", &payload.name)?] json)
     },
     Remove {
         name: String,
         #[serde(default)]
         dry_run: bool,
     } => {
-        crate::cmd!((payload.dry_run) { &INFO, "remove", user } "podman" ["rm", &payload.name] json)
+        crate::cmd!((payload.dry_run) { &INFO, "remove", user } "podman" ["rm", positional("name", &payload.name)?] json)
     }
 });
 

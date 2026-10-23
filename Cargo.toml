@@ -9,6 +9,8 @@ homepage = "https://github.com/Ultramarine-Linux/tetra"
 documentation = "https://developer.fyralabs.com/tetra"
 
 [features]
+# `tetra::auth::testing`: fake PAM, accounts, sealer and host for tests.
+testing = []
 default = [
     "apps",
     "files",
@@ -58,12 +60,14 @@ futures-util = { version = "0.3", default-features = false, features = [
     "sink",
     "std",
 ] }
-kameo = "0.22"
 rand = "0.10"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls-native-roots-no-provider",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+serde_norway = "0.9"
 socket2 = { version = "0.6", features = ["all"] }
 tera = "2.0"
 tokio = { version = "1", features = [
@@ -72,24 +76,21 @@ tokio = { version = "1", features = [
     "net",
     "rt-multi-thread",
     "signal",
+    "sync",
     "time",
 ] }
 tokio-rustls = { version = "0.26", optional = true }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 rustls = "0.23"
-rustls-pemfile = "2"
 itertools = "0.15.0"
 libc = "0.2"
-preinterpret = "0.2.1"
-phf = { version = "0.14.0", features = ["macros"] }
-enum_dispatch = "0.3.13"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 x509-parser = "0.18.1"
 # Login and authorization (`src/auth`). `pam-client` links the system libpam
 # (bindgen, so it needs pam-devel and clang-devel to build); `webauthn-rs`
 # links the system OpenSSL dynamically (openssl-devel).
 chacha20poly1305 = "0.10"
-nix = { version = "0.31", features = ["fs", "user"] }
+nix = { version = "0.31", features = ["fs", "signal", "user"] }
 pam-client = { version = "0.5", default-features = false }
 sha2 = "0.11"
 subtle = "2.6"
@@ -97,6 +98,8 @@ totp-rs = { version = "6", features = ["gen_secret", "otpauth"] }
 webauthn-rs = { version = "0.5", features = ["conditional-ui"] }
 
 [dev-dependencies]
+# Integration tests use the fakes in `tetra::auth::testing`.
+tetra = { path = ".", default-features = false, features = ["testing"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 tempfile = "3"
 time = "0.3"
@@ -138,7 +141,6 @@ rest_pat_in_fully_bound_structs = "warn"
 semicolon_outside_block = "warn"
 str_to_string = "warn"
 string_lit_chars_any = "warn"
-tests_outside_test_module = "warn"
 todo = "warn"
 try_err = "warn"
 undocumented_unsafe_blocks = "deny"

@@ -27,7 +27,7 @@ use anyhow::{Context, Result, bail};
 use rand::{RngExt, distr::Alphanumeric};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use serde_yaml::Value as YamlValue;
+use serde_norway::Value as YamlValue;
 use tera::{Context as TeraContext, Tera};
 
 /// A parsed recipe: metadata plus the parameter and resource declarations that
@@ -90,7 +90,7 @@ pub enum Requirement {
 ///
 /// The `key` is what templates reference (e.g. `{{ domain }}`); the remaining
 /// fields describe how the dashboard should prompt for and constrain the
-/// value. Validation in [`validate_parameter_value`] mirrors `kind` so that a
+/// value. Validation in [`Parameter::validate_json`] mirrors `kind` so that a
 /// malformed `values.yaml` fails fast with a clear error instead of producing
 /// a broken unit file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,14 +129,6 @@ pub struct Parameter {
 }
 
 impl Parameter {
-    pub fn yaml_value(&self, values: &BTreeMap<String, YamlValue>) -> Result<YamlValue> {
-        let value = values.get(&self.key).or(self.default.as_ref()).cloned();
-        let value = value.or_else(|| self.generate.map(Into::into).map(YamlValue::String));
-        if value.is_none() && self.required {
-            bail!("missing required parameter `{}`", self.key);
-        }
-        Ok(value.unwrap_or(YamlValue::Null))
-    }
     pub fn json_value(&self, values: &BTreeMap<String, YamlValue>) -> Result<JsonValue> {
         let value = values.get(&self.key).or(self.default.as_ref()).cloned();
         let value = value.map(yaml_to_json).transpose()?;
@@ -150,12 +142,25 @@ impl Parameter {
         Ok(value)
     }
     pub fn validate_json(&self, value: &JsonValue) -> Result<()> {
+        // An unset optional parameter is `Null`; templates handle it with
+        // Tera's `default` filter.
+        if value.is_null() && !self.required {
+            return Ok(());
+        }
         match self.kind {
             // `Secret` validates exactly like `String`: the distinction is a UI
             // hint, not a separate value type.
             ParameterKind::String | ParameterKind::Secret => {
-                if !matches!(value, JsonValue::String(_)) {
+                let Some(text) = value.as_str() else {
                     bail!("parameter `{}` must be a string", self.key);
+                };
+                // Values land on unit-file lines (`Environment=KEY={{ value }}`),
+                // where a newline would add a directive of the caller's choosing.
+                if text.chars().any(char::is_control) {
+                    bail!(
+                        "parameter `{}` must be a single line without control characters",
+                        self.key
+                    );
                 }
             }
             ParameterKind::Integer => {
@@ -188,7 +193,7 @@ impl Parameter {
 }
 
 /// The type of value a [`Parameter`] holds, which drives both dashboard input
-/// rendering and runtime validation in [`validate_parameter_value`].
+/// rendering and runtime validation in [`Parameter::validate_json`].
 ///
 /// `Secret` validates identically to `String` but signals to the dashboard
 /// that the input should be masked and not logged; it is not a cryptographic
@@ -204,7 +209,7 @@ pub enum ParameterKind {
 }
 
 /// Strategy for auto-generating a parameter value when the operator supplies
-/// neither a value nor a default. See [`generate_value`].
+/// neither a value nor a default. See the `From<Generator> for String` impl.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Generator {
@@ -234,7 +239,7 @@ impl From<Generator> for String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resource {
     /// What kind of unit/file this is. Renamed from the YAML `type` field.
-    /// Determines the Quadlet extension appended in [`resource_extension`].
+    /// Determines the Quadlet extension appended in [`ResourceKind::ext`].
     #[serde(rename = "type")]
     pub kind: ResourceKind,
     /// Output filename, rendered through Tera so it can embed parameter
@@ -258,7 +263,7 @@ pub struct Resource {
 /// The kind of file a [`Resource`] produces.
 ///
 /// The Quadlet variants map 1:1 to Podman Quadlet systemd unit extensions
-/// (see [`resource_extension`]). `File` is the escape hatch for companion
+/// (see [`ResourceKind::ext`]). `File` is the escape hatch for companion
 /// content (e.g. an `index.html`) that ships alongside the units and is
 /// installed separately via the `quadlets.install.files` agent action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +292,17 @@ impl ResourceKind {
             Self::Pod => ".pod",
             Self::Kube => ".kube",
             Self::File => "",
+        }
+    }
+
+    /// Mode a rendered file is installed with: Quadlet units can hold
+    /// secrets (`Environment=MYSQL_PASSWORD=...`), companion files are read
+    /// by containers through bind mounts.
+    #[must_use]
+    pub const fn mode(self) -> u32 {
+        match self {
+            Self::File => 0o644,
+            _ => 0o600,
         }
     }
 }
@@ -327,10 +343,16 @@ impl RenderedResource {
                     output_dir.display()
                 )
             })?;
+            // Rendered filenames come from the recipe: keep them inside
+            // `output_dir`.
             for resource in &rendered {
-                let path = output_dir.join(&resource.filename);
-                fs::write(&path, &resource.contents)
-                    .with_context(|| format!("failed to write `{}`", path.display()))?;
+                crate::agent::module_support::write_under(
+                    output_dir,
+                    &resource.filename,
+                    resource.contents.as_bytes(),
+                    resource.kind.mode(),
+                    false,
+                )?;
             }
         }
 
@@ -338,7 +360,7 @@ impl RenderedResource {
     }
 }
 
-/// Options for the file-backed render pipeline ([`render_from_files`]).
+/// Options for the file-backed render pipeline ([`RenderedResource::from_files`]).
 ///
 /// Writing to disk is skipped when `dry_run` is set *or* when `output_dir` is
 /// `None`; in both cases the rendered resources are still returned so callers
@@ -363,11 +385,11 @@ pub fn load_values<P: AsRef<Path>>(path: Option<P>) -> Result<BTreeMap<String, Y
     let path = path.as_ref();
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read values `{}`", path.display()))?;
-    serde_yaml::from_str(&text)
+    serde_norway::from_str(&text)
         .with_context(|| format!("failed to parse values YAML `{}`", path.display()))
 }
 
-/// Bridge a `serde_yaml::Value` into a `serde_json::Value`.
+/// Bridge a `serde_norway::Value` into a `serde_json::Value`.
 ///
 /// Tera's context expects JSON values, while recipe defaults and operator
 /// values arrive as YAML. Going through `serde_json::to_value` round-trips
@@ -439,6 +461,37 @@ fn parse_condition_literal(value: &str) -> JsonValue {
     }
 }
 
+/// Tera filter `systemd_quote`: `value` as one double-quoted word of a
+/// systemd or Quadlet setting, so spaces, quotes, `\\` and `%` specifiers in
+/// it stay literal: `Environment={{ ("KEY=" ~ value) | systemd_quote }}`.
+fn systemd_quote(value: &str, _: tera::Kwargs, _: &tera::State) -> String {
+    let mut quoted = String::with_capacity(value.len().saturating_add(2));
+    quoted.push('"');
+    for c in value.chars() {
+        match c {
+            '"' | '\\' => {
+                quoted.push('\\');
+                quoted.push(c);
+            }
+            '%' => quoted.push_str("%%"),
+            _ => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// Render-context keys the renderer sets, which parameters may not use.
+const RESERVED_KEYS: &[&str] = &[
+    "recipe_id",
+    "name",
+    "version",
+    "recipe",
+    "resource",
+    "resource_filename",
+    "resource_name",
+];
+
 macro_rules! assert_not_empty {
     ($value:expr => $msg:literal) => {
         if $value.is_empty() {
@@ -453,22 +506,25 @@ impl AppRecipe {
     /// Used by the agent `render_inline` / `context_inline` actions, where the
     /// recipe body arrives over the wire rather than from the local filesystem.
     pub fn load_str(text: &str) -> Result<Self> {
-        let recipe: Self = serde_yaml::from_str(text).context("failed to parse recipe YAML")?;
+        let recipe: Self = serde_norway::from_str(text).context("failed to parse recipe YAML")?;
         recipe.validate()?;
         Ok(recipe)
     }
 
     /// Read, parse, and validate a recipe from a YAML file on disk.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let recipe: Self = serde_yaml::from_reader(fs::File::open(path.as_ref())?)
-            .with_context(|| format!("failed to load recipe YAML `{}`", path.as_ref().display()))?;
+        let path = path.as_ref();
+        let file = fs::File::open(path)
+            .with_context(|| format!("failed to open recipe `{}`", path.display()))?;
+        let recipe: Self = serde_norway::from_reader(file)
+            .with_context(|| format!("failed to load recipe YAML `{}`", path.display()))?;
         recipe.validate()?;
         Ok(recipe)
     }
 
     /// Validate recipe-level invariants that deserialization alone can't enforce.
     ///
-    /// Called from both load paths ([`load_recipe`] / [`load_recipe_from_str`])
+    /// Called from both load paths ([`AppRecipe::load`] / [`AppRecipe::load_str`])
     /// and again at the top of rendering, so inline bundles arriving over the
     /// wire get the same scrutiny as on-disk recipes. The checks are kept
     /// intentionally cheap: they catch schema mistakes that would otherwise
@@ -487,6 +543,11 @@ impl AppRecipe {
             assert_not_empty!(key => "parameter key is required");
             if !parameters.insert(key) {
                 bail!("duplicate parameter `{key}`");
+            }
+            // The renderer sets these itself; a parameter of the same name
+            // would be silently replaced.
+            if RESERVED_KEYS.contains(&key) {
+                bail!("parameter key `{key}` is reserved");
             }
             // A Choice parameter with no options can never validate, so catch
             // it here rather than failing at first render time.
@@ -550,7 +611,13 @@ impl AppRecipe {
         values: &BTreeMap<String, YamlValue>,
         load_template: impl Fn(&str) -> Result<S>,
     ) -> Result<Vec<RenderedResource>> {
-        let mut context = self.build_context(values)?;
+        let context = self.build_context(values)?;
+        // Built once: every resource starts from the same base context, so
+        // one resource's `resource*` keys never leak into the next one's
+        // filename or condition.
+        let base = TeraContext::from_serialize(&context).context("failed to build context")?;
+        let mut tera = Tera::default();
+        tera.register_filter("systemd_quote", systemd_quote);
         let mut rendered = Vec::new();
 
         for resource in &self.resources {
@@ -560,31 +627,21 @@ impl AppRecipe {
             }
 
             // First pass: resolve the filename with the base context only.
-            let tera_context =
-                TeraContext::from_serialize(&context).context("failed to build context")?;
-            let filename = Tera::one_off(&resource.filename, &tera_context, false)
+            let filename = tera
+                .render_str(&resource.filename, &base, false)
                 .with_context(|| format!("failed to render filename `{}`", resource.filename))?;
-            // Second pass: build an enriched context so the template body can see
-            // its own rendered filename and unit name, then render the body.
-            // Overwrite previous records of `context`.
-            context.extend([
-                (
-                    "resource".into(),
-                    serde_json::to_value(resource).context("failed to serialize resource")?,
-                ),
-                (
-                    "resource_filename".into(),
-                    JsonValue::String(filename.clone()),
-                ),
-                (
-                    "resource_name".into(),
-                    JsonValue::String(filename.trim_end_matches(resource.kind.ext()).to_owned()),
-                ),
-            ]);
-            let tera_context =
-                TeraContext::from_serialize(&context).context("failed to build context")?;
+            // Second pass: let the body see its own rendered filename and
+            // unit name.
+            let mut tera_context = base.clone();
+            tera_context.insert("resource", resource);
+            tera_context.insert("resource_filename", &filename);
+            tera_context.insert(
+                "resource_name",
+                filename.trim_end_matches(resource.kind.ext()),
+            );
             let template = load_template(&resource.template)?;
-            let contents = Tera::one_off(template.as_ref(), &tera_context, false)
+            let contents = tera
+                .render_str(template.as_ref(), &tera_context, false)
                 .with_context(|| format!("failed to render template `{}`", resource.template))?;
 
             rendered.push(RenderedResource {
@@ -625,8 +682,30 @@ impl AppRecipe {
     /// 5. otherwise `Null`, which optional parameters can handle in-template via
     ///    Tera's `default` filter.
     ///
-    /// Every resolved value is type-checked by [`validate_parameter_value`] before
+    /// Every resolved value is type-checked by [`Parameter::validate_json`] before
     /// being inserted, so a bad `values.yaml` fails before any template runs.
+    /// Pin generated values (such as `random_32` secrets) into `values`, so
+    /// they are stored with the app and stay the same across updates instead
+    /// of being generated afresh on every render.
+    pub fn fill_generated(&self, values: &mut BTreeMap<String, YamlValue>) {
+        for parameter in &self.parameters {
+            if let Some(generator) = parameter.generate
+                && parameter.default.is_none()
+                && !values.contains_key(&parameter.key)
+            {
+                values.insert(parameter.key.clone(), YamlValue::String(generator.into()));
+            }
+        }
+    }
+
+    /// Keys of the parameters holding secrets.
+    pub fn secret_keys(&self) -> impl Iterator<Item = &str> {
+        self.parameters
+            .iter()
+            .filter(|parameter| parameter.kind == ParameterKind::Secret)
+            .map(|parameter| parameter.key.as_str())
+    }
+
     fn build_context(
         &self,
         values: &BTreeMap<String, YamlValue>,
@@ -657,7 +736,7 @@ mod tests {
     use super::*;
 
     fn nextcloud_recipe() -> AppRecipe {
-        serde_yaml::from_str(
+        serde_norway::from_str(
             r#"
 recipe_id: nextcloud
 name: Nextcloud
@@ -755,7 +834,7 @@ resources:
             "<h1>{{ site_title }}</h1>\n",
         )
         .unwrap();
-        let recipe: AppRecipe = serde_yaml::from_str(
+        let recipe: AppRecipe = serde_norway::from_str(
             r#"
 recipe_id: nginx-site
 name: Nginx static site
@@ -799,8 +878,84 @@ resources:
     }
 
     #[test]
+    fn systemd_quote_keeps_values_one_literal_word() {
+        let recipe = AppRecipe::load_str(
+            "recipe_id: d\nname: D\nversion: '1'\nparameters:\n  - {key: proxies, label: x, type: string}\nresources:\n  - {type: container, filename: d.container, template: t}\n",
+        )
+        .unwrap();
+        let templates = BTreeMap::from([(
+            "t".into(),
+            "Environment={{ (\"TRUSTED_PROXIES=\" ~ proxies) | systemd_quote }}".into(),
+        )]);
+        let values = BTreeMap::from([(
+            "proxies".into(),
+            YamlValue::String(r#"10.0.0.0/8 "a\b" 100%h"#.into()),
+        )]);
+        let rendered = recipe.render_with_templates(&values, &templates).unwrap();
+        assert_eq!(
+            rendered[0].contents,
+            r#"Environment="TRUSTED_PROXIES=10.0.0.0/8 \"a\\b\" 100%%h""#
+        );
+    }
+
+    #[test]
+    fn string_values_cannot_add_unit_file_lines() {
+        let recipe = nextcloud_recipe();
+        for bad in ["x\n[Container]\nPodmanArgs=--privileged", "x\r", "x\0"] {
+            let values = BTreeMap::from([("domain".into(), YamlValue::String(bad.into()))]);
+            let error = recipe.build_context(&values).unwrap_err();
+            assert!(error.to_string().contains("single line"), "{error}");
+        }
+        let values = BTreeMap::from([("domain".into(), YamlValue::String("a b".into()))]);
+        recipe.build_context(&values).unwrap();
+    }
+
+    #[test]
+    fn resource_keys_do_not_leak_between_resources() {
+        let recipe = AppRecipe::load_str(
+            r#"
+recipe_id: demo
+name: Demo
+version: 0.1.0
+resources:
+  - type: container
+    filename: "a.container"
+    template: a
+  - type: file
+    filename: "{{ resource_name | default(value='none') }}.txt"
+    template: b
+"#,
+        )
+        .unwrap();
+        let templates = BTreeMap::from([
+            (
+                "a".into(),
+                "[Container]\nContainerName={{ resource_name }}\n".into(),
+            ),
+            ("b".into(), "{{ resource_filename }}".into()),
+        ]);
+        let rendered = recipe
+            .render_with_templates(&BTreeMap::new(), &templates)
+            .unwrap();
+        assert_eq!(rendered[0].contents, "[Container]\nContainerName=a\n");
+        // The second filename does not see the first resource's name.
+        assert_eq!(rendered[1].filename, "none.txt");
+        assert_eq!(rendered[1].contents, "none.txt");
+        assert_eq!(rendered[0].kind.mode(), 0o600);
+        assert_eq!(rendered[1].kind.mode(), 0o644);
+
+        for key in ["name", "resource_name"] {
+            let error = AppRecipe::load_str(&format!(
+                "recipe_id: d\nname: D\nversion: '1'\nparameters:\n  - {{key: {key}, label: x, type: string}}\nresources:\n  - {{type: file, filename: f, template: t}}\n"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("reserved"), "{error}");
+        }
+    }
+
+    #[test]
     fn renders_recipe_with_inline_template_bundle() {
-        let recipe: AppRecipe = serde_yaml::from_str(
+        let recipe: AppRecipe = serde_norway::from_str(
             r#"
 recipe_id: nginx-site
 name: Nginx static site

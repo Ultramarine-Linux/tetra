@@ -28,7 +28,8 @@ use rand::RngExt as _;
 use super::addresses::AddressScope;
 use crate::prelude::*;
 use crate::types::{
-    EapMethod, IpAddressConfig, IpConfig, Ipv4Method, Ipv6Method, NetworkConfigureRequest,
+    EapMethod, IpAddressConfig, IpConfig, Ipv4Config, Ipv4Method, Ipv6Config, Ipv6Method,
+    NetworkConfigureRequest,
     Phase2Method, Wired8021x, is_pem,
 };
 
@@ -211,13 +212,18 @@ pub fn validate(request: &mut NetworkConfigureRequest, cert_roots: &CertRoots<'_
     Ok(())
 }
 
+/// 1 to `max` letters, digits, `-`, `_` and `.`, not starting with `-` or
+/// `.` nor containing `..`: safe as an argument, file name and keyfile value.
+fn is_plain_name(value: &str, max: usize) -> bool {
+    (1..=max).contains(&value.len())
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !value.starts_with(['-', '.'])
+        && !value.contains("..")
+}
+
 pub(super) fn validate_interface(interface: &str) -> Result<()> {
     ensure!(
-        (1..=MAX_INTERFACE_LEN).contains(&interface.len())
-            && interface
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-            && !interface.starts_with(['-', '.']),
+        is_plain_name(interface, MAX_INTERFACE_LEN),
         "interface `{interface}` is not a valid interface name"
     );
     Ok(())
@@ -225,12 +231,7 @@ pub(super) fn validate_interface(interface: &str) -> Result<()> {
 
 fn validate_name(name: &str) -> Result<()> {
     ensure!(
-        (1..=MAX_NAME_LEN).contains(&name.len())
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-            && !name.starts_with(['-', '.'])
-            && !name.contains(".."),
+        is_plain_name(name, MAX_NAME_LEN),
         "name `{name}` must be 1-{MAX_NAME_LEN} letters, digits, `-`, `_` or `.`"
     );
     Ok(())
@@ -402,23 +403,14 @@ fn validate_family<M: Method, A: Family>(config: &IpConfig<M, A>) -> Result<bool
                 A::MAX_PREFIX
             );
             ensure!(
-                !matches!(
-                    AddressScope::of(address.ip()),
-                    AddressScope::Unspecified | AddressScope::Loopback | AddressScope::Multicast
-                ),
+                is_unicast(address.ip()),
                 "{label} address {address} cannot be assigned to an interface"
             );
             address.check_host(*prefix_length)?;
         }
         ensure_unique(config.addresses.iter().map(|a| a.address), label, "address")?;
         if let Some(gateway) = config.gateway {
-            ensure!(
-                !matches!(
-                    AddressScope::of(gateway.ip()),
-                    AddressScope::Unspecified | AddressScope::Loopback | AddressScope::Multicast
-                ),
-                "{label}.gateway {gateway} is not a usable gateway"
-            );
+            ensure!(is_unicast(gateway.ip()), "{label}.gateway {gateway} is not a usable gateway");
             ensure!(
                 config.addresses.iter().all(|a| a.address != gateway),
                 "{label}.gateway {gateway} is one of the host's own addresses"
@@ -462,6 +454,14 @@ fn validate_family<M: Method, A: Family>(config: &IpConfig<M, A>) -> Result<bool
                 .any(|a| AddressScope::of(a.address.ip()).is_routable())))
 }
 
+/// Whether `address` can be an interface's address or a gateway.
+fn is_unicast(address: IpAddr) -> bool {
+    !matches!(
+        AddressScope::of(address),
+        AddressScope::Unspecified | AddressScope::Loopback | AddressScope::Multicast
+    )
+}
+
 fn ensure_unique<A: Family>(values: impl Iterator<Item = A>, label: &str, what: &str) -> Result<()> {
     let mut seen = HashSet::new();
     for value in values {
@@ -486,25 +486,43 @@ fn render_keyfile(request: &NetworkConfigureRequest, uuid: &str, redact: bool) -
     let mut out = String::new();
     // Writing to a `String` cannot fail.
     let _ok: std::fmt::Result = (|| {
-        writeln!(out, "# Managed by Tetra (network.configure).")?;
-        writeln!(out, "[connection]")?;
-        writeln!(out, "id={}", connection_name(request))?;
-        writeln!(out, "uuid={uuid}")?;
-        writeln!(out, "type=ethernet")?;
-        writeln!(out, "interface-name={}", request.interface)?;
-        writeln!(out, "autoconnect=true")?;
-        writeln!(out)?;
+        render_connection(&mut out, "configure", connection_name(request), uuid, "ethernet", &request.interface)?;
         writeln!(out, "[ethernet]")?;
         writeln!(out)?;
         if let Some(wired) = &request.wired_8021x {
             render_8021x(&mut out, wired, redact)?;
             writeln!(out)?;
         }
-        render_family(&mut out, &request.ipv4)?;
-        writeln!(out)?;
-        render_family(&mut out, &request.ipv6)
+        render_ip(&mut out, &request.ipv4, &request.ipv6)
     })();
     out
+}
+
+/// The header and `[connection]` section of a profile `network.<action>`
+/// writes, with the blank line after it.
+pub(super) fn render_connection(
+    out: &mut String,
+    action: &str,
+    id: &str,
+    uuid: &str,
+    kind: &str,
+    interface: &str,
+) -> std::fmt::Result {
+    writeln!(out, "# Managed by Tetra (network.{action}).")?;
+    writeln!(out, "[connection]")?;
+    writeln!(out, "id={id}")?;
+    writeln!(out, "uuid={uuid}")?;
+    writeln!(out, "type={kind}")?;
+    writeln!(out, "interface-name={interface}")?;
+    writeln!(out, "autoconnect=true")?;
+    writeln!(out)
+}
+
+/// The `[ipv4]` and `[ipv6]` sections, which end the profile.
+pub(super) fn render_ip(out: &mut String, ipv4: &Ipv4Config, ipv6: &Ipv6Config) -> std::fmt::Result {
+    render_family(out, ipv4)?;
+    writeln!(out)?;
+    render_family(out, ipv6)
 }
 
 const fn eap_keyword(method: EapMethod) -> &'static str {
@@ -655,7 +673,7 @@ pub fn new_uuid() -> String {
     rand::rng().fill(&mut bytes[..]);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex = bytes.iter().map(|byte| format!("{byte:02x}")).join("");
+    let hex = crate::auth::sessions::hex(&bytes);
     format!(
         "{}-{}-{}-{}-{}",
         &hex[0..8],

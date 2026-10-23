@@ -1,6 +1,5 @@
 //! Passkey registration and login against a software authenticator, and the
 //! access configuration that decides whether passkeys are available.
-#![allow(clippy::tests_outside_test_module)]
 
 mod common;
 

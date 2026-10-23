@@ -12,7 +12,7 @@
 //! restore) points at. Once a change settles, [`prune`] removes every file
 //! the profile on disk no longer names, and the directory with the last one.
 
-use std::{io, os::unix::fs::PermissionsExt as _};
+use std::io;
 
 use sha2::{Digest as _, Sha256};
 
@@ -68,11 +68,15 @@ pub fn externalize(settings: &mut Wired8021x, dir: &Path) -> Vec<PemFile> {
 /// Errs when a directory is a symlink or any filesystem step fails.
 pub fn write(files: &[PemFile]) -> Result<Vec<PathBuf>> {
     let mut written = Vec::new();
+    let mut prepared = Vec::new();
     for file in files {
         let dir = file.path.parent().context("certificate path has no parent")?;
-        create_private_dir(dir)?;
-        if let Some(parent) = dir.parent() {
-            create_private_dir(parent)?;
+        if !prepared.contains(&dir) {
+            if let Some(parent) = dir.parent() {
+                crate::auth::store::private_dir(parent)?;
+            }
+            crate::auth::store::private_dir(dir)?;
+            prepared.push(dir);
         }
         if fs::read(&file.path).ok().as_deref() == Some(file.contents.as_slice()) {
             continue;
@@ -81,14 +85,6 @@ pub fn write(files: &[PemFile]) -> Result<Vec<PathBuf>> {
         written.push(file.path.clone());
     }
     Ok(written)
-}
-
-fn create_private_dir(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir).with_context(|| format!("failed to create `{}`", dir.display()))?;
-    let metadata = fs::symlink_metadata(dir)?;
-    ensure!(metadata.is_dir(), "`{}` is not a directory", dir.display());
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("failed to restrict `{}`", dir.display()))
 }
 
 /// Remove the files in `dir` that `keyfile` (the profile now on disk, if
@@ -122,6 +118,7 @@ pub fn prune(dir: &Path, keyfile: Option<&[u8]>) {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
     use serde_json::json;
 
     use super::*;

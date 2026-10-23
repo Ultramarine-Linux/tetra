@@ -44,11 +44,6 @@ impl Mod for NfsModule {
     }
 
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
-        // Standard metadata fast-path: `capabilities` and `plan` are answered
-        // from `INFO` without touching the system.
-        if let Some(response) = INFO.metadata_response(action, &payload) {
-            return Ok(response);
-        }
         Action::from_payload(action, payload)?.handle(user)
     }
 }

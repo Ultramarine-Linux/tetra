@@ -7,7 +7,7 @@ use super::{AgentCommand, AgentResponse};
 /// Registry of modules that the dispatcher routes commands to.
 ///
 /// Built via [`Dispatcher::new`] + [`Dispatcher::with_module`] (or
-/// [`modules::default_dispatcher`](super::modules::default_dispatcher) for the
+/// [`Dispatcher::full`] for the
 /// feature-gated default set). The `BTreeMap` keeps module iteration
 /// deterministic — `agent.capabilities` lists modules in name order, which
 /// makes dashboard diffs stable.
@@ -27,12 +27,9 @@ impl Dispatcher {
     /// This only includes modules available during compile time, according to the feature set.
     #[must_use]
     pub fn full() -> Self {
-        Self {
-            modules: super::modules::MODULES
-                .entries()
-                .map(|(&k, v)| (k.to_owned(), Box::new(v.clone()) as Box<dyn Mod>))
-                .collect(),
-        }
+        let mut dispatcher = Self::default();
+        super::modules::register_all(&mut dispatcher);
+        dispatcher
     }
 
     /// Builder-style registration: `Dispatcher::new().with_module(Foo).with_module(Bar)`.
@@ -54,8 +51,8 @@ impl Dispatcher {
     /// `AgentResponse::error` with the same command `id` — the caller always
     /// gets a well-formed response, never a panic.
     #[must_use]
-    pub fn dispatch(&self, command: AgentCommand) -> AgentResponse {
-        match self.try_dispatch(&command) {
+    pub fn dispatch(&self, mut command: AgentCommand) -> AgentResponse {
+        match self.try_dispatch(&mut command) {
             Ok(payload) => AgentResponse::ok(command.id, payload),
             Err(error) => AgentResponse::error(command.id, error.to_string()),
         }
@@ -68,7 +65,7 @@ impl Dispatcher {
         self.modules.values().map(|module| module.info()).collect()
     }
 
-    fn try_dispatch(&self, command: &AgentCommand) -> Result<Value> {
+    fn try_dispatch(&self, command: &mut AgentCommand) -> Result<Value> {
         command.validate()?;
         // `agent.capabilities` is reserved at the dispatcher level rather than
         // living in a fake `agent` module, so it always reports the *actually
@@ -81,7 +78,68 @@ impl Dispatcher {
             bail!("unknown module `{}`", command.module);
         };
 
-        module.handle(&command.action, command.payload.clone(), command.user())
+        if let Some(response) = module.metadata(&command.action, &command.payload) {
+            return Ok(response);
+        }
+        let run_as = RunAs::take(&mut command.payload)?;
+        // The command is owned: hand the (possibly large) payload over
+        // instead of copying it.
+        let payload = std::mem::take(&mut command.payload);
+        let action = command.action.as_str();
+        match run_as {
+            RunAs::User => module.handle(action, payload, command.user()),
+            RunAs::Root => module.handle(action, payload, None),
+            RunAs::Both => {
+                let user = command
+                    .user()
+                    .context("`run_as: both` needs a signed-in user")?;
+                ensure!(
+                    !module.info().is_privileged(action),
+                    "{}.{action} always runs as root; `run_as: both` is for reads",
+                    command.module
+                );
+                let outcome = |result: Result<Value>| match result {
+                    Ok(result) => jsonf! { "ok": true, result },
+                    Err(error) => jsonf! { "ok": false, "error": format!("{error:#}") },
+                };
+                Ok(jsonf! {
+                    "user": outcome(module.handle(action, payload.clone(), Some(user))),
+                    "root": outcome(module.handle(action, payload, None)),
+                })
+            }
+        }
+    }
+}
+
+/// Who host commands of an action run as, from the payload's optional
+/// `run_as` field (removed before the module sees the payload).
+///
+/// Unprivileged actions run as the signed-in user by default, so a user sees
+/// their own containers or VMs; `root` shows the host's, and `both` runs the
+/// action twice and returns `{user, root}`, each `{ok, result}` or
+/// `{ok, error}`. Privileged actions always run as root. Anything but
+/// `user` is administrator-only (see `auth::authz::admin_only_field`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunAs {
+    #[default]
+    User,
+    Root,
+    Both,
+}
+
+impl RunAs {
+    /// The payload field naming it.
+    pub const FIELD: &str = "run_as";
+
+    fn take(payload: &mut Value) -> Result<Self> {
+        let Some(value) = payload
+            .as_object_mut()
+            .and_then(|object| object.remove(Self::FIELD))
+        else {
+            return Ok(Self::User);
+        };
+        serde_json::from_value(value).context("`run_as` must be `user`, `root` or `both`")
     }
 }
 
@@ -100,13 +158,16 @@ mod tests {
                 feature: "test",
                 description: "Test echo module",
                 status: super::super::module_support::ModuleStatus::Available,
-                actions: &["ping"],
-                privileged_actions: &[],
+                actions: &["ping", "wipe"],
+                privileged_actions: &["wipe"],
             }
         }
 
-        fn handle(&self, action: &str, payload: Value, _user: Option<&str>) -> Result<Value> {
-            Ok(json!({ "action": action, "payload": payload }))
+        fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
+            if user == Some("nobody") {
+                bail!("permission denied");
+            }
+            Ok(json!({ "action": action, "payload": payload, "user": user }))
         }
     }
 
@@ -125,7 +186,41 @@ mod tests {
         assert!(response.ok);
         assert_eq!(
             response.payload,
-            Some(json!({ "action": "ping", "payload": { "value": 42 } }))
+            Some(json!({ "action": "ping", "payload": { "value": 42 }, "user": null }))
         );
+    }
+
+    fn as_alice(action: &str, payload: Value, user: &str) -> AgentResponse {
+        Dispatcher::new().with_module(Echo).dispatch(AgentCommand {
+            id: "cmd".into(),
+            module: "echo".into(),
+            action: action.into(),
+            payload,
+            signature: None,
+            user: Some(user.into()),
+        })
+    }
+
+    #[test]
+    fn run_as_picks_the_user_root_or_both() {
+        let user = as_alice("ping", json!({ "x": 1 }), "alice");
+        assert_eq!(user.payload.unwrap()["user"], "alice");
+
+        let root = as_alice("ping", json!({ "x": 1, "run_as": "root" }), "alice");
+        let root = root.payload.unwrap();
+        assert!(root["user"].is_null());
+        // The module never sees `run_as`.
+        assert_eq!(root["payload"], json!({ "x": 1 }));
+
+        let both = as_alice("ping", json!({ "run_as": "both" }), "nobody")
+            .payload
+            .unwrap();
+        assert_eq!(both["user"]["ok"], false);
+        assert_eq!(both["user"]["error"], "permission denied");
+        assert_eq!(both["root"]["ok"], true);
+        assert!(both["root"]["result"]["user"].is_null());
+
+        assert!(!as_alice("wipe", json!({ "run_as": "both" }), "alice").ok);
+        assert!(!as_alice("ping", json!({ "run_as": "admin" }), "alice").ok);
     }
 }

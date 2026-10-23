@@ -18,21 +18,21 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
-use kameo::actor::Spawn;
 use rand::RngExt;
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{accept_async_with_config, tungstenite::Message};
 
 use super::{
-    AgentBackend,
-    crypto::{parse_verifying_key, public_key_fingerprint, verify_challenge_signature},
-    identity::HostIdentity,
-    protocol::{AuthFrame, AuthenticatedSession, PROTOCOL_VERSION, SessionPolicy, unix_timestamp},
+    crypto::{parse_verifying_key, verify_challenge_signature},
+    identity::{HostIdentity, public_key_fingerprint},
+    protocol::{AuthFrame, AuthenticatedSession, PROTOCOL_VERSION, SessionPolicy},
     queue::{DEFAULT_QUEUE_CAPACITY, DispatchQueue, QueueError},
     verify_password::verify_password,
 };
 use ed25519_dalek::VerifyingKey;
+
+use crate::auth::clock::unix_timestamp;
 
 /// Everything an inbound connection needs, independent of the listener it
 /// arrived on (the local Unix socket or the development TCP listener).
@@ -78,7 +78,7 @@ impl ServerState {
             .transpose()?;
         let dispatcher = crate::agent::Dispatcher::full();
         let privileged_actions = build_privilege_map(&dispatcher);
-        let queue = DispatchQueue::spawn(AgentBackend::spawn(dispatcher), DEFAULT_QUEUE_CAPACITY);
+        let queue = DispatchQueue::spawn(dispatcher, DEFAULT_QUEUE_CAPACITY);
         Ok(Self {
             queue,
             identity,
@@ -156,9 +156,10 @@ async fn establish_connection(
         privileged_actions,
     }: ConnectionHandler,
 ) -> Result<AuthenticatedConnection> {
-    let mut socket = accept_async(stream)
-        .await
-        .context("WebSocket handshake failed")?;
+    let mut socket =
+        accept_async_with_config(stream, Some(super::local_protocol::websocket_config()))
+            .await
+            .context("WebSocket handshake failed")?;
     // Enrollment updates the identity store while the server is running. Reload
     // the persisted key per connection instead of relying only on the startup
     // snapshot, so the next Dashboard request can authenticate immediately.
@@ -258,7 +259,15 @@ async fn handle_connection(connection: ConnectionHandler) -> Result<()> {
                     .await?;
                     continue;
                 };
-                match verify_password(&username, &password) {
+                // PAM can take seconds; keep it off the async workers.
+                let checked = {
+                    let username = username.clone();
+                    tokio::task::spawn_blocking(move || verify_password(&username, &password))
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|result| result)
+                };
+                match checked {
                     Ok(true) => {
                         let grant = HeadlessElevationGrant::new(ELEVATION_TTL);
                         let expires_at = grant
@@ -477,7 +486,10 @@ async fn request_enroll_pubkey(
     let expected_token = enrollment_token
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("no enrollment token configured"))?;
-    if token != expected_token {
+    if !bool::from(subtle::ConstantTimeEq::ct_eq(
+        token.as_bytes(),
+        expected_token.as_bytes(),
+    )) {
         send_error(socket, "invalid enrollment token").await?;
         bail!("invalid enrollment token")
     }
@@ -592,7 +604,8 @@ mod tests {
     use super::*;
     use crate::agent::{
         AgentCommand,
-        crypto::{public_key_fingerprint, sign_challenge, sign_command},
+        crypto::{sign_challenge, sign_command},
+        identity::public_key_fingerprint,
     };
     use ed25519_dalek::SigningKey;
     use futures_util::{SinkExt, StreamExt};
@@ -619,7 +632,7 @@ mod tests {
         let identity_dir = tempdir().unwrap();
         let identity = HostIdentity::load_or_generate(identity_dir.path()).unwrap();
         let (client, server) = duplex(64 * 1024);
-        let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), DEFAULT_QUEUE_CAPACITY);
+        let queue = DispatchQueue::spawn(crate::agent::Dispatcher::full(), DEFAULT_QUEUE_CAPACITY);
         let expected_host_fingerprint = public_key_fingerprint(&identity.verifying_key());
         let controller_public_key = public_key_fingerprint(&controller.verifying_key());
 
@@ -698,7 +711,7 @@ mod tests {
         let identity = HostIdentity::load_or_generate(identity_dir.path()).unwrap();
         let expected_host_fingerprint = public_key_fingerprint(&identity.verifying_key());
         let (client, server) = duplex(64 * 1024);
-        let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), DEFAULT_QUEUE_CAPACITY);
+        let queue = DispatchQueue::spawn(crate::agent::Dispatcher::full(), DEFAULT_QUEUE_CAPACITY);
         let controller_key = controller.verifying_key();
 
         tokio::spawn(async move {

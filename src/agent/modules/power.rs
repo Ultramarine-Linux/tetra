@@ -28,9 +28,6 @@ impl Mod for PowerModule {
     }
 
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
-        if let Some(response) = INFO.metadata_response(action, &payload) {
-            return Ok(response);
-        }
         Action::from_payload(action, payload)?.handle(user)
     }
 }

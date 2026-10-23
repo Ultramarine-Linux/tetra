@@ -12,9 +12,11 @@ use std::{collections::BTreeMap, fmt::Write as _};
 
 use serde::Serialize;
 
-use super::keyfile::{CertRoots, REDACTED, keyfile_value, render_8021x, validate_8021x};
+use super::keyfile::{
+    CertRoots, REDACTED, keyfile_value, render_8021x, render_connection, render_ip, validate_8021x,
+};
 use crate::prelude::*;
-use crate::types::{EapMethod, NetworkConnectWifiRequest, WifiSecurity};
+use crate::types::{EapMethod, Ipv4Config, Ipv6Config, NetworkConnectWifiRequest, WifiSecurity};
 
 /// The longest SSID 802.11 allows, in bytes.
 const MAX_SSID_BYTES: usize = 32;
@@ -251,14 +253,8 @@ fn render_keyfile(
     let mut out = String::new();
     // Writing to a `String` cannot fail.
     let _ok: std::fmt::Result = (|| {
-        writeln!(out, "# Managed by Tetra (network.connect_wifi).")?;
-        writeln!(out, "[connection]")?;
-        writeln!(out, "id={}", connection_name(&request.interface))?;
-        writeln!(out, "uuid={uuid}")?;
-        writeln!(out, "type=wifi")?;
-        writeln!(out, "interface-name={}", request.interface)?;
-        writeln!(out, "autoconnect=true")?;
-        writeln!(out)?;
+        let id = connection_name(&request.interface);
+        render_connection(&mut out, "connect_wifi", &id, uuid, "wifi", &request.interface)?;
         writeln!(out, "[wifi]")?;
         writeln!(out, "mode=infrastructure")?;
         // As a list of bytes, so no SSID needs escaping or is read back as
@@ -289,11 +285,7 @@ fn render_keyfile(
                 writeln!(out)?;
             }
         }
-        writeln!(out, "[ipv4]")?;
-        writeln!(out, "method=auto")?;
-        writeln!(out)?;
-        writeln!(out, "[ipv6]")?;
-        writeln!(out, "method=auto")
+        render_ip(&mut out, &Ipv4Config::default(), &Ipv6Config::default())
     })();
     out
 }

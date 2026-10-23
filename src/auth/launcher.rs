@@ -19,7 +19,11 @@
 //! ([`Tolerant`]): such an entry is shown to administrators only, opens its
 //! stored URL, and is written back unchanged.
 
-use std::{collections::BTreeSet, os::unix::fs::PermissionsExt};
+use std::{
+    collections::BTreeSet,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    sync::{Arc, Mutex, PoisonError},
+};
 
 use base64::{
     Engine,
@@ -119,7 +123,7 @@ impl CatalogRoute {
                     DomainRoute::Subdomain { name } => {
                         let label = name.trim().to_ascii_lowercase();
                         ensure!(
-                            is_dns_label(&label),
+                            super::access::is_dns_label(&label),
                             "`{name}` is not a valid subdomain label"
                         );
                         format!("https://{label}.{}{port}/", access.url_host())
@@ -151,16 +155,6 @@ fn is_path_segment(segment: &str) -> bool {
         && segment
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-}
-
-fn is_dns_label(label: &str) -> bool {
-    !label.is_empty()
-        && label.len() <= 63
-        && !label.starts_with('-')
-        && !label.ends_with('-')
-        && label
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
 }
 
 /// One stored entry.
@@ -408,12 +402,50 @@ pub enum ChangeError {
 pub struct LauncherStore {
     path: PathBuf,
     public_dir: PathBuf,
+    /// The entries last read, keyed by the file's inode, size and mtime:
+    /// `launcher.can_access` runs for every `forward_auth` request.
+    cache: Arc<Mutex<Option<CachedEntries>>>,
 }
+
+/// `(inode, size, mtime, mtime_nsec)` of `launcher.json`.
+type FileStamp = (u64, u64, i64, i64);
+type CachedEntries = (FileStamp, Arc<[Entry]>);
 
 impl LauncherStore {
     #[must_use]
-    pub const fn new(path: PathBuf, public_dir: PathBuf) -> Self {
-        Self { path, public_dir }
+    pub fn new(path: PathBuf, public_dir: PathBuf) -> Self {
+        Self {
+            path,
+            public_dir,
+            cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// The stored entries, parsed again only when the file changed (every
+    /// write renames a new file into place, so the inode changes).
+    fn entries(&self) -> Result<Arc<[Entry]>> {
+        let stamp = match fs::metadata(&self.path) {
+            Ok(meta) => Some((meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read `{}`", self.path.display()));
+            }
+        };
+        let cached = self
+            .cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let (Some(stamp), Some((cached_stamp, entries))) = (stamp, cached)
+            && stamp == cached_stamp
+        {
+            return Ok(entries);
+        }
+        let entries: Arc<[Entry]> = self.load()?.entries.into();
+        *self.cache.lock().unwrap_or_else(PoisonError::into_inner) =
+            stamp.map(|stamp| (stamp, Arc::clone(&entries)));
+        Ok(entries)
     }
 
     /// The public page's path.
@@ -434,10 +466,10 @@ impl LauncherStore {
     /// Fails when the file exists but cannot be read.
     pub fn visible(&self, viewer: &Viewer) -> Result<Vec<Entry>> {
         Ok(self
-            .load()?
-            .entries
-            .into_iter()
+            .entries()?
+            .iter()
             .filter(|entry| entry.visible_to(viewer))
+            .cloned()
             .collect())
     }
 
@@ -448,9 +480,10 @@ impl LauncherStore {
     /// Fails when the file exists but cannot be read.
     pub fn get(&self, id: &str, viewer: &Viewer) -> Result<Option<Entry>> {
         Ok(self
-            .visible(viewer)?
-            .into_iter()
-            .find(|entry| entry.id == id))
+            .entries()?
+            .iter()
+            .find(|entry| entry.id == id && entry.visible_to(viewer))
+            .cloned())
     }
 
     /// Add an entry (`id` is `None`) or replace entry `id`, then regenerate
@@ -576,7 +609,8 @@ impl LauncherStore {
         )
         .with_context(|| format!("failed to set the mode of `{}`", self.public_dir.display()))?;
         let html = public_html(&file.entries, access);
-        store::replace(&path, html.as_bytes(), PUBLIC_FILE_MODE)
+        // Unchanged pages keep their mtime (and caches stay valid).
+        store::replace_if_changed(&path, html.as_bytes(), PUBLIC_FILE_MODE).map(drop)
     }
 }
 

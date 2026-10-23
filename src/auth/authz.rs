@@ -30,6 +30,7 @@
 use std::collections::BTreeMap;
 
 use crate::prelude::*;
+use crate::types::{EXPORTS_PATH, SAMBA_CONFIG_PATH};
 
 use super::store::{self, Extra, Header, Record, StoreLock, Tolerant};
 
@@ -150,7 +151,8 @@ const TABLE: &[(&str, &str, Requirement)] = &[
     ("apps", "update", AdminOnly),
     ("apps", "remove", AdminOnly),
     ("quadlets", "list", page(Apps, View)),
-    ("quadlets", "read", page(Apps, View)),
+    // Unit files hold app secrets (`Environment=MYSQL_PASSWORD=...`).
+    ("quadlets", "read", AdminOnly),
     ("quadlets", "validate", page(Apps, View)),
     ("quadlets", "list_files", page(Apps, View)),
     ("quadlets", "write", AdminOnly),
@@ -160,7 +162,9 @@ const TABLE: &[(&str, &str, Requirement)] = &[
     // root (and `render` can write rendered files anywhere); the inline forms
     // take their input in the payload.
     ("recipes", "render", AdminOnly),
-    ("recipes", "render_inline", page(Apps, View)),
+    // Tera loops nest, so an inline template can pin the serial dispatch
+    // queue (or exhaust memory) for everyone.
+    ("recipes", "render_inline", AdminOnly),
     ("recipes", "context", AdminOnly),
     ("recipes", "context_inline", page(Apps, View)),
     ("podman", "containers", page(Containers, View)),
@@ -182,13 +186,15 @@ const TABLE: &[(&str, &str, Requirement)] = &[
     ("storage", "configure", AdminOnly),
     ("samba", "list_shares", page(Sharing, View)),
     ("samba", "get_config", page(Sharing, View)),
-    ("samba", "set_config", page(Sharing, Manage)),
+    // The whole smb.conf/exports file is root-equivalent (`root preexec`,
+    // `no_root_squash`), and so is its nested `selinux` relabel.
+    ("samba", "set_config", AdminOnly),
     ("samba", "reload", page(Sharing, Manage)),
     ("samba", "enable", AdminOnly),
     ("samba", "disable", AdminOnly),
     ("nfs", "list_exports", page(Sharing, View)),
     ("nfs", "get_config", page(Sharing, View)),
-    ("nfs", "set_config", page(Sharing, Manage)),
+    ("nfs", "set_config", AdminOnly),
     ("nfs", "reload", page(Sharing, Manage)),
     ("nfs", "enable", AdminOnly),
     ("nfs", "disable", AdminOnly),
@@ -204,6 +210,7 @@ const TABLE: &[(&str, &str, Requirement)] = &[
     ("network", "reload", AdminOnly),
     ("network", "configure", AdminOnly),
     ("network", "confirm", AdminOnly),
+    ("network", "pending", AdminOnly),
     ("network", "scan_wifi", AdminOnly),
     ("network", "connect_wifi", AdminOnly),
     ("reverse_proxy", "list", page(Network, View)),
@@ -273,6 +280,7 @@ pub const SETUP_ALLOWED: &[(&str, &str)] = &[
     ("network", "connect_wifi"),
     ("network", "configure"),
     ("network", "confirm"),
+    ("network", "pending"),
     ("updates", "set_policy"),
     ("remote_access", "status"),
     ("remote_access", "tailscale_up"),
@@ -316,16 +324,24 @@ pub const SETUP_OPERATIONS: &[&str] = &[
 
 /// Payload fields that only administrators (and remote controllers) may set,
 /// because they point an action at arbitrary host paths. The setup session
-/// and granted users always get the defaults.
-const ADMIN_ONLY_FIELDS: &[(&str, &str)] = &[
-    ("reverse_proxy", "config_dir"),
-    ("quadlets", "base_dir"),
-    ("quadlets", "files_base_dir"),
-    ("apps", "base_dir"),
-    ("apps", "files_base_dir"),
+/// and granted users always get the defaults; a field may still be sent with
+/// its default value (the third element), since documented payloads do.
+const ADMIN_ONLY_FIELDS: &[(&str, &str, Option<&str>)] = &[
+    ("reverse_proxy", "config_dir", None),
+    ("quadlets", "base_dir", None),
+    ("quadlets", "files_base_dir", None),
+    ("apps", "base_dir", None),
+    ("apps", "files_base_dir", None),
     // A new account sharing another's home could replace that account's SSH
     // keys with `set_authorized_keys`.
-    ("users", "home"),
+    ("users", "home", None),
+    // The sharing modules read and replace `path` as root; any other path
+    // would turn the Sharing page into `files.read`/`files.write`.
+    ("samba", "path", Some(SAMBA_CONFIG_PATH)),
+    // Running a read as root (or as both) shows the host's view: rootful
+    // containers with their environment, every VM.
+    ("*", "run_as", Some("user")),
+    ("nfs", "path", Some(EXPORTS_PATH)),
 ];
 
 /// The first admin-only field set in a `module` payload, if any.
@@ -333,8 +349,13 @@ const ADMIN_ONLY_FIELDS: &[(&str, &str)] = &[
 pub fn admin_only_field(module: &str, payload: &Value) -> Option<&'static str> {
     ADMIN_ONLY_FIELDS
         .iter()
-        .find(|(m, field)| *m == module && payload.get(field).is_some())
-        .map(|(_, field)| *field)
+        .find(|(m, field, default)| {
+            (*m == module || *m == "*")
+                && payload
+                    .get(field)
+                    .is_some_and(|value| default.is_none_or(|default| value != default))
+        })
+        .map(|(_, field, _)| *field)
 }
 
 /// The requirement for `module.action`.
@@ -934,5 +955,29 @@ mod tests {
             None
         );
         assert_eq!(requirement("recipes", "render"), AdminOnly);
+    }
+
+    #[test]
+    fn running_as_root_is_admin_only_in_every_module() {
+        for module in ["podman", "virtual_machines", "selinux"] {
+            for run_as in ["root", "both"] {
+                let payload = serde_json::json!({ "run_as": run_as });
+                assert_eq!(admin_only_field(module, &payload), Some("run_as"));
+            }
+            let payload = serde_json::json!({ "run_as": "user" });
+            assert_eq!(admin_only_field(module, &payload), None);
+        }
+    }
+
+    #[test]
+    fn sharing_config_paths_are_pinned_for_non_admins() {
+        let shadow = serde_json::json!({"path": "/etc/shadow"});
+        assert_eq!(admin_only_field("samba", &shadow), Some("path"));
+        assert_eq!(admin_only_field("nfs", &shadow), Some("path"));
+        let samba = serde_json::json!({"path": "/etc/samba/smb.conf"});
+        assert_eq!(admin_only_field("samba", &samba), None);
+        let exports = serde_json::json!({"path": "/etc/exports", "contents": ""});
+        assert_eq!(admin_only_field("nfs", &exports), None);
+        assert_eq!(admin_only_field("nfs", &samba), Some("path"));
     }
 }

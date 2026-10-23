@@ -1,7 +1,6 @@
 //! What the server OOBE does through Tetra with a setup session: the setup
 //! allowlist, `access.set` (DNS-01, the dashboard's `ORIGIN`), the setup-code
 //! throttle and the handoff to the dashboard.
-#![allow(clippy::tests_outside_test_module)]
 #![cfg(all(
     feature = "network",
     feature = "reverse-proxy",

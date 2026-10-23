@@ -2,6 +2,7 @@
 
 use crate::prelude::*;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 const PRIVATE_KEY_FILE: &str = "ed25519-private.key";
@@ -29,27 +30,20 @@ impl HostIdentity {
             )
         })?;
         let path = directory.join(PRIVATE_KEY_FILE);
-        let bytes: [u8; PRIVATE_KEY_BYTES] = if path.exists() {
-            let bytes = fs::read(&path)
-                .with_context(|| format!("failed to read host identity `{}`", path.display()))?;
-            (bytes.try_into()).map_err(|_| anyhow::anyhow!("host identity length checked"))?
-        } else {
-            let mut bytes = [0_u8; PRIVATE_KEY_BYTES];
-            rand::fill(&mut bytes);
-            let temporary =
-                directory.join(format!(".{PRIVATE_KEY_FILE}.tmp-{}", std::process::id()));
-            fs::write(&temporary, bytes).with_context(|| {
-                format!(
-                    "failed to write temporary host identity `{}`",
-                    temporary.display()
-                )
-            })?;
-            fs::set_permissions(&temporary, permissions_private()).with_context(|| {
-                format!("failed to restrict host identity `{}`", temporary.display())
-            })?;
-            fs::rename(&temporary, &path)
-                .with_context(|| format!("failed to install host identity `{}`", path.display()))?;
-            bytes
+        let bytes: [u8; PRIVATE_KEY_BYTES] = match fs::read(&path) {
+            Ok(bytes) => bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("host identity `{}` is corrupt", path.display()))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut bytes = [0_u8; PRIVATE_KEY_BYTES];
+                rand::fill(&mut bytes);
+                crate::auth::store::replace(&path, &bytes, 0o600)?;
+                bytes
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read host identity `{}`", path.display()));
+            }
         };
 
         Ok(Self {
@@ -113,37 +107,14 @@ impl HostIdentity {
             "controller public key cannot be empty"
         );
         let path = self.directory().join(CONTROLLER_PUBLIC_KEY_FILE);
-        let temporary = self.directory().join(format!(
-            ".{CONTROLLER_PUBLIC_KEY_FILE}.tmp-{}",
-            std::process::id()
-        ));
-        fs::write(&temporary, format!("{}\n", public_key.trim())).with_context(|| {
-            format!(
-                "failed to write temporary controller key `{}`",
-                temporary.display()
-            )
-        })?;
-        fs::set_permissions(&temporary, permissions_private()).with_context(|| {
-            format!(
-                "failed to restrict controller key `{}`",
-                temporary.display()
-            )
-        })?;
-        fs::rename(&temporary, &path)
-            .with_context(|| format!("failed to install controller key `{}`", path.display()))?;
-        Ok(())
+        crate::auth::store::replace(&path, format!("{public_key}\n").as_bytes(), 0o600)
     }
 }
 
-#[cfg(unix)]
-fn permissions_private() -> std::fs::Permissions {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::Permissions::from_mode(0o600)
-}
-
-#[cfg(not(unix))]
-fn permissions_private() -> std::fs::Permissions {
-    std::fs::Permissions::readonly()
+/// Return a compact public-key fingerprint for enrollment and logs.
+#[must_use]
+pub fn public_key_fingerprint(verifying_key: &VerifyingKey) -> String {
+    URL_SAFE_NO_PAD.encode(verifying_key.as_bytes())
 }
 
 #[cfg(test)]

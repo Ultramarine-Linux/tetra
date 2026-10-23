@@ -15,7 +15,7 @@
 //!   remote catalog publish new recipes without bumping the installed Tetra
 //!   version, as long as the recipe schema is one the agent understands.
 
-use serde_yaml::Value as YamlValue;
+use serde_norway::Value as YamlValue;
 
 use crate::{
     catalog::{AppRecipe, RenderOptions, RenderedResource},
@@ -39,6 +39,7 @@ const INFO: ModuleInfo = ModuleInfo {
     status: ModuleStatus::Available,
     actions: &[
         "capabilities",
+        "plan",
         "render",
         "render_inline",
         "context",

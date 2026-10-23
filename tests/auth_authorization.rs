@@ -1,6 +1,5 @@
 //! Authorization of module actions: admins, default permissions, grants and
 //! the action log.
-#![allow(clippy::tests_outside_test_module)]
 
 mod common;
 
@@ -345,4 +344,148 @@ async fn files_cannot_be_granted_and_config_dir_is_admin_only() {
                 .is_none_or(|error| error.code != ErrorCode::Forbidden)
         );
     }
+}
+
+/// A `users` module that succeeds without touching the host.
+struct StubUsers;
+
+impl tetra::agent::modules::Mod for StubUsers {
+    fn info(&self) -> tetra::agent::module_support::ModuleInfo {
+        tetra::agent::module_support::ModuleInfo {
+            name: "users",
+            feature: "users",
+            description: "Stub users module",
+            status: tetra::agent::module_support::ModuleStatus::Available,
+            actions: &["set_password", "delete"],
+            privileged_actions: &[],
+        }
+    }
+
+    fn handle(
+        &self,
+        action: &str,
+        _payload: serde_json::Value,
+        _user: Option<&str>,
+    ) -> anyhow::Result<serde_json::Value> {
+        Ok(json!({ "action": action }))
+    }
+}
+
+#[tokio::test]
+async fn a_new_password_ends_the_accounts_other_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = tetra::auth::testing::TestHost::with_dispatcher(dir.path(), |dispatcher| {
+        dispatcher.with_module(StubUsers)
+    })
+    .unwrap();
+    host.accounts.add("alice", 1000, &[]);
+    host.accounts.add("admin", 1001, &["wheel"]);
+    host.passwords.set("alice", "hunter2");
+    host.passwords.set("admin", "hunter2");
+    let admin = login(&host.service, "admin").await;
+    let other_admin = login(&host.service, "admin").await;
+    let alice = login(&host.service, "alice").await;
+    let set_password = |name: &str, dry_run: bool| {
+        json!({"module": "users", "action": "set_password",
+               "payload": {"name": name, "password_hash": "$6$x", "dry_run": dry_run}})
+    };
+
+    // A dry run changes nothing.
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "module.dispatch",
+        set_password("alice", true),
+    )
+    .await;
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&alice),
+        "session.info",
+        json!({}),
+    )
+    .await;
+
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "module.dispatch",
+        set_password("alice", false),
+    )
+    .await;
+    fails(
+        &host.service,
+        Dashboard,
+        Some(&alice),
+        "session.info",
+        json!({}),
+        ErrorCode::Unauthenticated,
+    )
+    .await;
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&other_admin),
+        "session.info",
+        json!({}),
+    )
+    .await;
+
+    // Changing one's own password keeps the session it was changed from.
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "module.dispatch",
+        set_password("admin", false),
+    )
+    .await;
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "session.info",
+        json!({}),
+    )
+    .await;
+    fails(
+        &host.service,
+        Dashboard,
+        Some(&other_admin),
+        "session.info",
+        json!({}),
+        ErrorCode::Unauthenticated,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn grant_changes_are_in_the_action_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(dir.path());
+    let admin = login(&host.service, "admin").await;
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "admin.grants_set",
+        json!({"uid": 1000, "grants": {"storage": "view"}}),
+    )
+    .await;
+    let actions = ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "admin.actions",
+        json!({}),
+    )
+    .await;
+    let logged = &actions["actions"][0];
+    assert_eq!(logged["module"], "admin");
+    assert_eq!(logged["action"], "grants_set");
+    assert_eq!(logged["username"], "admin");
+    assert_eq!(logged["ok"], true);
 }

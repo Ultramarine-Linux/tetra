@@ -32,10 +32,6 @@ impl Mod for FilesModule {
     }
 
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
-        // Delegate `capabilities`/`plan` to the module descriptor first.
-        if let Some(response) = INFO.metadata_response(action, &payload) {
-            return Ok(response);
-        }
         Action::from_payload(action, payload)?.handle(user)
     }
 }
@@ -81,6 +77,38 @@ mod tests {
         assert_eq!(response["written"], false);
         assert_eq!(response["dry_run"], true);
         assert!(!dir.path().join("managed.conf").exists());
+    }
+
+    #[test]
+    fn only_regular_files_are_read_or_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        // Neither blocks on the FIFO.
+        Read(FileReadRequest { path: fifo.clone() }).handle(None).unwrap_err();
+        Write(FileWriteRequest {
+            path: fifo,
+            contents: "x".into(),
+            dry_run: false,
+            selinux: None,
+        })
+        .handle(None)
+        .unwrap_err();
+        Read(FileReadRequest { path: "/dev/zero".into() }).handle(None).unwrap_err();
+        Read(FileReadRequest { path: dir.path().into() }).handle(None).unwrap_err();
+
+        let path = dir.path().join("managed.conf");
+        fs::write(&path, "a much longer old value\n").unwrap();
+        Write(FileWriteRequest {
+            path: path.clone(),
+            contents: "new\n".into(),
+            dry_run: false,
+            selinux: None,
+        })
+        .handle(None)
+        .unwrap();
+        let response = Read(FileReadRequest { path }).handle(None).unwrap();
+        assert_eq!(response["contents"], "new\n");
     }
 
     #[test]

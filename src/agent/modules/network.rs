@@ -17,7 +17,8 @@
 //! ([`keyfile`]), writes the keyfile `0600`
 //! with its default SELinux label, loads and activates it, and rolls it back
 //! unless confirmed if the interface lost every routable address it had
-//! ([`apply`]). `get_config`/`set_config` remain for raw keyfile access, but
+//! ([`apply`]), through a NetworkManager checkpoint ([`checkpoint`]) so the
+//! rollback does not depend on Tetra staying up. `get_config`/`set_config` remain for raw keyfile access, but
 //! only for regular `.nmconnection` files directly inside that directory
 //! ([`paths`]). All of these are privileged.
 //!
@@ -29,6 +30,7 @@
 mod addresses;
 mod apply;
 mod certs;
+mod checkpoint;
 mod keyfile;
 mod paths;
 mod wifi;
@@ -36,6 +38,7 @@ mod wifi;
 use std::{
     net::IpAddr,
     sync::{Arc, LazyLock},
+    time::Duration,
 };
 
 use crate::prelude::*;
@@ -51,7 +54,7 @@ use apply::{Change, NetworkHost, SafeApply};
 use paths::{SYSTEM_CONNECTIONS_DIR, keyfile_path_for, read_keyfile, validate_keyfile_path, write_keyfile};
 
 /// Marker type for the network module. Stateless apart from the pending
-/// rollback held by [`SAFE_APPLY`]; all behavior lives in the [`Mod`] impl
+/// rollback held by [`SAFE_APPLY`] (and NetworkManager); all behavior lives in the [`Mod`] impl
 /// and the static [`INFO`] descriptor.
 #[derive(Clone, Copy, Debug)]
 pub struct NetworkModule;
@@ -70,6 +73,7 @@ const INFO: ModuleInfo = ModuleInfo {
         "routes",
         "configure",
         "confirm",
+        "pending",
         "get_config",
         "set_config",
         "reload",
@@ -79,6 +83,7 @@ const INFO: ModuleInfo = ModuleInfo {
     privileged_actions: &[
         "configure",
         "confirm",
+        "pending",
         "get_config",
         "set_config",
         "reload",
@@ -91,16 +96,21 @@ const INFO: ModuleInfo = ModuleInfo {
 static SAFE_APPLY: LazyLock<SafeApply> =
     LazyLock::new(|| SafeApply::new(Arc::new(NetworkManagerHost)));
 
+/// Pick up a network change a previous Tetra left awaiting confirmation.
+///
+/// Its rollback is re-armed, or done now if it is overdue (see [`apply`]).
+/// Every network action does this on first use; calling it at startup also
+/// covers a host where none is sent.
+pub fn recover_pending() {
+    SAFE_APPLY.recover();
+}
+
 impl Mod for NetworkModule {
     fn info(&self) -> ModuleInfo {
         INFO
     }
 
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
-        // Delegate `capabilities`/`plan` to the shared metadata handler first.
-        if let Some(response) = INFO.metadata_response(action, &payload) {
-            return Ok(response);
-        }
         Action::from_payload(action, payload)?.handle(user)
     }
 }
@@ -117,6 +127,9 @@ actions!(Action [payload user] => {
         // `ip -json addr show` returns structured JSON we pass through
         // verbatim in `data`; an optional `dev <name>` narrows the scope.
         // `addresses` adds a prefix-based scope to every address.
+        if let Some(interface) = &payload.interface {
+            keyfile::validate_interface(interface)?;
+        }
         let args = payload.ip_args();
         let mut response = crate::cmd!({ &INFO, "status", user } "ip" => &args ; JSON)?;
         response["addresses"] = serde_json::to_value(parse_ip_addr_json(&response["data"]))?;
@@ -133,10 +146,12 @@ actions!(Action [payload user] => {
         )
     },
     Confirm: NetworkConfirmRequest => SAFE_APPLY.confirm(&payload.token),
+    Pending => Ok(SAFE_APPLY.pending()),
     GetConfig: NetworkConfigRequest => {
         get_config(&payload, Path::new(SYSTEM_CONNECTIONS_DIR))
     },
     SetConfig: NetworkWriteConfigRequest => {
+        SAFE_APPLY.ensure_settled(&payload.path)?;
         set_config(&payload, Path::new(SYSTEM_CONNECTIONS_DIR))
     },
     Reload: DryRunRequest => {
@@ -454,6 +469,24 @@ impl NetworkHost for NetworkManagerHost {
             .collect())
     }
 
+    fn default_gateways(&self, interface: &str) -> Result<Vec<IpAddr>> {
+        let mut gateways = Vec::new();
+        for family in ["-4", "-6"] {
+            let result =
+                crate::cmd!("ip" ["-json", family, "route", "show", "default", "dev", interface])?;
+            let routes: Value = serde_json::from_str(&result.stdout)
+                .context("failed to parse `ip -json route show` output")?;
+            gateways.extend(
+                routes
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|route| route["gateway"].as_str()?.parse::<IpAddr>().ok()),
+            );
+        }
+        Ok(gateways)
+    }
+
     fn active_connection(&self, interface: &str) -> Option<String> {
         Self::nmcli(&["-g", "GENERAL.CON-UUID", "device", "show", interface])
             .ok()
@@ -480,6 +513,32 @@ impl NetworkHost for NetworkManagerHost {
     fn delete(&self, uuid: &str) -> Result<()> {
         Self::nmcli(&["--wait", "30", "connection", "delete", "uuid", uuid]).map(drop)
     }
+
+    fn checkpoint_create(&self, interface: &str, timeout: Duration) -> Result<String> {
+        checkpoint::create(interface, whole_seconds(timeout))
+    }
+
+    fn checkpoint_adjust(&self, checkpoint: &str, timeout: Duration) -> Result<()> {
+        checkpoint::adjust_timeout(checkpoint, whole_seconds(timeout))
+    }
+
+    fn checkpoint_destroy(&self, checkpoint: &str) -> Result<()> {
+        checkpoint::destroy(checkpoint)
+    }
+
+    fn checkpoint_rollback(&self, checkpoint: &str) -> Result<()> {
+        checkpoint::rollback(checkpoint)
+    }
+
+    fn checkpoints(&self) -> Result<Vec<String>> {
+        checkpoint::list()
+    }
+}
+
+/// `duration` in whole seconds for NetworkManager, at least one: zero
+/// would mean no timeout.
+fn whole_seconds(duration: Duration) -> u32 {
+    u32::try_from(duration.as_secs()).unwrap_or(u32::MAX).max(1)
 }
 
 fn read_optional(path: &str) -> Option<String> {
@@ -532,6 +591,14 @@ mod tests {
     use super::*;
     use apply::fake::FakeHost;
 
+    /// Safe apply on `host`, keeping its state in `dir`.
+    fn test_apply(host: &Arc<FakeHost>, dir: &Path) -> SafeApply {
+        SafeApply::with_state(
+            Arc::clone(host) as Arc<dyn NetworkHost>,
+            dir.join("state/pending.json"),
+        )
+    }
+
     #[test]
     fn dns_read_returns_a_stable_shape() {
         let response = Dns {}.handle(None).unwrap();
@@ -543,6 +610,7 @@ mod tests {
         for action in [
             "configure",
             "confirm",
+            "pending",
             "get_config",
             "set_config",
             "reload",
@@ -713,7 +781,7 @@ mod tests {
     fn connect_wifi_writes_the_passphrase_only_to_the_keyfile() {
         let dir = tempfile::tempdir().unwrap();
         let host = FakeHost::with(&[], None);
-        let apply = SafeApply::new(Arc::clone(&host) as Arc<dyn NetworkHost>);
+        let apply = test_apply(&host, dir.path());
         let request = wifi_request("Home", "wifi-S3CRET-pass");
 
         let response =
@@ -746,7 +814,7 @@ mod tests {
     fn a_failed_scan_fails_the_connection_instead_of_guessing() {
         let dir = tempfile::tempdir().unwrap();
         let host = FakeHost::with(&[], None);
-        let apply = SafeApply::new(Arc::clone(&host) as Arc<dyn NetworkHost>);
+        let apply = test_apply(&host, dir.path());
 
         let error = connect_wifi(
             &wifi_request("Home", "wifi-S3CRET-pass"),
@@ -799,7 +867,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let host = FakeHost::with(&[], None);
         host.fail_every_activation();
-        let apply = SafeApply::new(Arc::clone(&host) as Arc<dyn NetworkHost>);
+        let apply = test_apply(&host, dir.path());
 
         let error = connect_wifi(
             &wifi_request("Home", "wrong-S3CRET-pass"),
@@ -844,7 +912,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let certs = dir.path().join("certs");
         let host = FakeHost::with(&[], None);
-        let apply = SafeApply::new(Arc::clone(&host) as Arc<dyn NetworkHost>);
+        let apply = test_apply(&host, dir.path());
 
         let response =
             connect_wifi(&enterprise_request(), dir.path(), &certs, &apply, &|_| Ok(Vec::new()))
@@ -883,7 +951,7 @@ mod tests {
         let certs = dir.path().join("certs");
         let host = FakeHost::with(&[], None);
         host.fail_every_activation();
-        let apply = SafeApply::new(Arc::clone(&host) as Arc<dyn NetworkHost>);
+        let apply = test_apply(&host, dir.path());
 
         let error =
             connect_wifi(&enterprise_request(), dir.path(), &certs, &apply, &|_| Ok(Vec::new()))

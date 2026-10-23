@@ -25,7 +25,7 @@
 use std::{
     fs::{File, OpenOptions, Permissions},
     io::{ErrorKind, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
 };
 
 use nix::fcntl::{Flock, FlockArg};
@@ -111,14 +111,10 @@ pub trait Record: Serialize + DeserializeOwned {
 /// Fails when the file cannot be read or parsed, or was written by a build
 /// that requires a newer reader.
 pub fn read<T: Record>(path: &Path) -> Result<Option<T>> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read `{}`", path.display()));
-        }
+    let Some(bytes) = read_optional(path)? else {
+        return Ok(None);
     };
-    let record: T = serde_json::from_str(&text)
+    let record: T = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse `{}`", path.display()))?;
     let header = record.header();
     ensure!(
@@ -128,6 +124,18 @@ pub fn read<T: Record>(path: &Path) -> Result<Option<T>> {
         header.compat
     );
     Ok(Some(record))
+}
+
+/// Read `path`, or `None` when it does not exist.
+///
+/// # Errors
+/// Fails when the file exists but cannot be read.
+pub fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read `{}`", path.display())),
+    }
 }
 
 /// Atomically write `record` to `path` with mode `0600`, stamping the header
@@ -217,7 +225,11 @@ pub fn remove(path: &Path) -> Result<()> {
 /// # Errors
 /// Fails when a directory cannot be created or the file cannot be written.
 pub fn replace_if_changed(path: &Path, contents: &[u8], mode: u32) -> Result<bool> {
-    if fs::read(path).is_ok_and(|existing| existing == contents) {
+    // Also rewrite when only the mode drifted (say a secrets file made 0644).
+    let unchanged = fs::metadata(path)
+        .is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == mode)
+        && fs::read(path).is_ok_and(|existing| existing == contents);
+    if unchanged {
         return Ok(false);
     }
     let parent = parent_of(path)?;
@@ -244,7 +256,24 @@ pub fn remove_if_exists(path: &Path) -> Result<bool> {
 /// # Errors
 /// Fails when the directory cannot be created or its mode cannot be set.
 pub fn private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("failed to create `{}`", path.display()))?;
+    // Parents get the default mode; the leaf is `0700` from the start rather
+    // than briefly umask-wide.
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create `{}`", parent.display()))?;
+    }
+    match fs::DirBuilder::new().mode(DIR_MODE).create(path) {
+        Err(error) if error.kind() != ErrorKind::AlreadyExists => {
+            return Err(error).with_context(|| format!("failed to create `{}`", path.display()));
+        }
+        // Not `is_dir()`: a symlink planted at the leaf must not be followed
+        // (and then chmod'ed).
+        _ => ensure!(
+            fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()),
+            "`{}` is not a directory",
+            path.display()
+        ),
+    }
     fs::set_permissions(path, Permissions::from_mode(DIR_MODE))
         .with_context(|| format!("failed to restrict `{}`", path.display()))
 }

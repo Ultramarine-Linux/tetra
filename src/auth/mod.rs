@@ -26,6 +26,7 @@ pub mod service;
 pub mod sessions;
 pub mod setup;
 pub mod store;
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod totp;
 pub mod users;

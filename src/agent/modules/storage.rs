@@ -9,7 +9,7 @@
 
 use crate::prelude::*;
 
-use crate::agent::module_support::{SelinuxOptions, apply_selinux};
+use crate::agent::module_support::{SelinuxOptions, apply_selinux, option_arg, positional};
 use std::process::Command;
 
 /// Storage module entry point registered under feature `storage`.
@@ -41,13 +41,6 @@ impl Mod for StorageModule {
     }
 
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
-        if matches!(action, "capabilities" | "plan") {
-            let mut response = INFO
-                .metadata_response(action, &payload)
-                .expect("metadata action matched");
-            response["zfs"] = discover_zfs();
-            return Ok(response);
-        }
         Action::from_payload(action, payload)?.handle(user)
     }
 }
@@ -65,7 +58,7 @@ actions!(Action [payload user] => {
         #[serde(default)]
         dry_run: bool,
     } => {
-        let result = crate::cmd!({ &INFO, "status", user } "df" ["-h", payload.path.to_string_lossy().as_ref()] json)?;
+        let result = crate::cmd!({ &INFO, "status", user } "df" ["-h", positional("path", &payload.path.to_string_lossy())?] json)?;
         Ok(jsonf! { result, payload.dry_run, "zfs": discover_zfs() })
     },
     Zfs => Ok(discover_zfs()),
@@ -80,8 +73,11 @@ actions!(Action [payload user] => {
         selinux: Option<SelinuxOptions>,
     } => {
         let mut args = Vec::new();
-        flag!(args payload: ["-t" fstype] ["-o" options]);
+        option_arg(&mut args, "-t", payload.fstype);
+        option_arg(&mut args, "-o", payload.options);
         let target = PathBuf::from(&payload.target);
+        positional("source", &payload.source)?;
+        positional("target", &payload.target)?;
         args.extend([payload.source, payload.target]);
         let mount = crate::cmd!((payload.dry_run) { &INFO, "mount", user } "mount" => &args ; json)?;
         let selinux = apply_selinux(payload.selinux.as_ref(), Some(&target), payload.dry_run)?;
@@ -91,7 +87,7 @@ actions!(Action [payload user] => {
         path: PathBuf,
         #[serde(default)]
         dry_run: bool,
-    } => crate::cmd!((payload.dry_run) { &INFO, "unmount", user } "umount" [payload.path.to_string_lossy().as_ref()] json),
+    } => crate::cmd!((payload.dry_run) { &INFO, "unmount", user } "umount" [positional("path", &payload.path.to_string_lossy())?] json),
     Configure {
         #[serde(default = "default_fstab_path")]
         fstab_path: PathBuf,
@@ -101,6 +97,7 @@ actions!(Action [payload user] => {
         #[serde(default)]
         selinux: Option<SelinuxOptions>,
     } => {
+        validate_fstab_entry(&payload.entry)?;
         if !payload.dry_run {
             append_fstab_entry(&payload.fstab_path, &payload.entry)?;
         }
@@ -167,8 +164,12 @@ fn discover_zfs() -> Value {
 }
 
 fn run_zfs_list(program: &str, args: &[&str], fields: &[&str]) -> (bool, Vec<Value>) {
-    let output = match Command::new(program).args(args).output() {
-        Ok(output) if output.status.success() => output,
+    // Under the timeout: `zfs`/`zpool` block indefinitely on a suspended pool.
+    let output = match crate::agent::module_support::output_with_timeout(
+        Command::new(program).args(args),
+        None,
+    ) {
+        Ok((output, _)) if output.status.success() => output,
         _ => return (false, Vec::new()),
     };
     let rows = String::from_utf8_lossy(&output.stdout)
@@ -251,8 +252,18 @@ fn read_partitions(path: impl Into<PathBuf>) -> Result<Vec<Value>> {
 /// newline. This sidesteps the two common fstab foot-guns: joining two lines
 /// into one (no separator), and leaving the file without a terminating
 /// newline (which some fstab parsers reject).
-fn append_fstab_entry(path: &PathBuf, entry: &str) -> Result<()> {
-    let mut text = fs::read_to_string(path).unwrap_or_default();
+///
+/// Only a missing file counts as empty: any other read error would otherwise
+/// rewrite `/etc/fstab` with just the new entry. The file is replaced
+/// atomically.
+fn append_fstab_entry(path: &Path, entry: &str) -> Result<()> {
+    let mut text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read `{}`", path.display()));
+        }
+    };
     // Only add a separator when there is existing content that lacks a
     // trailing newline; an empty file or one already ending in `\n` needs
     // none, and adding one would create a stray blank line.
@@ -263,7 +274,19 @@ fn append_fstab_entry(path: &PathBuf, entry: &str) -> Result<()> {
     // Always terminate the file with a newline so subsequent appends and most
     // fstab parsers stay happy.
     text.push('\n');
-    fs::write(path, text).with_context(|| format!("failed to write `{}`", path.display()))
+    crate::auth::store::replace(path, text.as_bytes(), 0o644)
+}
+
+/// One fstab line: `spec file [vfstype [options [freq [passno]]]]`.
+fn validate_fstab_entry(entry: &str) -> Result<()> {
+    let entry = entry.trim();
+    ensure!(
+        !entry.contains(['\n', '\r'])
+            && !entry.starts_with('#')
+            && (2..=6).contains(&entry.split_whitespace().count()),
+        "fstab entry must be one line of 2 to 6 fields"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

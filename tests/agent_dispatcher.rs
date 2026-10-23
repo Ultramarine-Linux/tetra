@@ -1,8 +1,5 @@
-#![allow(clippy::tests_outside_test_module)]
-
 use serde_json::{Value, json};
-use tempfile::tempdir;
-use tetra::agent::{AgentCommand, Dispatcher, backend};
+use tetra::agent::{AgentCommand, Dispatcher, queue::DispatchQueue};
 
 fn dispatch(module: &str, action: &str, payload: Value) -> tetra::agent::AgentResponse {
     Dispatcher::full().dispatch(AgentCommand {
@@ -24,43 +21,53 @@ fn dispatcher_reports_enabled_modules() {
         .as_array()
         .unwrap()
         .clone();
-    let names = modules
-        .iter()
-        .map(|module| module["name"].as_str().unwrap())
-        .collect::<Vec<_>>();
+    let has = |name: &str| modules.iter().any(|module| module["name"] == name);
 
-    assert!(names.contains(&"settings"));
+    assert!(has("settings"));
     #[cfg(feature = "apps")]
-    assert!(names.contains(&"apps"));
+    assert!(has("apps"));
     #[cfg(feature = "files")]
-    assert!(names.contains(&"files"));
+    assert!(has("files"));
     #[cfg(feature = "recipes")]
-    assert!(names.contains(&"recipes"));
+    assert!(has("recipes"));
     #[cfg(feature = "services")]
-    assert!(names.contains(&"services"));
+    assert!(has("services"));
     #[cfg(feature = "selinux")]
-    assert!(names.contains(&"selinux"));
+    assert!(has("selinux"));
     #[cfg(feature = "quadlets")]
-    assert!(names.contains(&"quadlets"));
+    assert!(has("quadlets"));
 }
 
 #[tokio::test]
-async fn kameo_backend_dispatches_commands() {
-    let response = backend::dispatch_with_default_backend(AgentCommand {
-        id: "backend-settings".into(),
-        module: "settings".into(),
-        action: "get_system".into(),
-        payload: Value::Null,
-        signature: None,
-        user: None,
-    })
-    .await
-    .unwrap();
+async fn dispatch_queue_dispatches_commands() {
+    let queue = DispatchQueue::spawn(Dispatcher::full(), 1);
+    let response = queue
+        .dispatch(AgentCommand {
+            id: "backend-settings".into(),
+            module: "settings".into(),
+            action: "get_system".into(),
+            payload: Value::Null,
+            signature: None,
+            user: None,
+        })
+        .await
+        .unwrap();
 
     assert!(response.ok, "{response:?}");
     let payload = response.payload.unwrap();
     assert!(payload["os"].is_string());
     assert!(payload["arch"].is_string());
+}
+
+#[test]
+fn every_module_answers_capabilities_and_plan() {
+    for module in Dispatcher::full().capabilities() {
+        let capabilities = dispatch(module.name, "capabilities", json!({}));
+        assert!(capabilities.ok, "{}: {capabilities:?}", module.name);
+        let plan = dispatch(module.name, "plan", json!({ "x": 1 }));
+        assert!(plan.ok, "{}: {plan:?}", module.name);
+        assert_eq!(plan.payload.unwrap()["requested"]["x"], 1);
+    }
 }
 
 #[test]
@@ -101,7 +108,7 @@ fn settings_module_returns_host_shape() {
 #[cfg(feature = "files")]
 #[test]
 fn files_module_reads_and_writes_files() {
-    let dir = tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("managed.conf");
 
     let write = dispatch(
@@ -119,8 +126,8 @@ fn files_module_reads_and_writes_files() {
 #[cfg(feature = "quadlets")]
 #[test]
 fn quadlets_module_installs_lists_reads_and_deletes_files() {
-    let dir = tempdir().unwrap();
-    let files_dir = tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let files_dir = tempfile::tempdir().unwrap();
     let base_dir = dir.path();
     let files_base_dir = files_dir.path();
 
@@ -215,7 +222,7 @@ fn quadlets_module_installs_lists_reads_and_deletes_files() {
 #[cfg(feature = "quadlets")]
 #[test]
 fn quadlets_module_rejects_invalid_or_unsafe_files() {
-    let dir = tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let base_dir = dir.path();
 
     let wrong_extension = dispatch(
@@ -244,7 +251,7 @@ fn quadlets_module_rejects_invalid_or_unsafe_files() {
 #[cfg(feature = "quadlets")]
 #[test]
 fn quadlets_module_supports_dry_run_and_system_scope() {
-    let dir = tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let base_dir = dir.path();
 
     let dry_run = dispatch(
@@ -279,8 +286,8 @@ fn quadlets_module_supports_dry_run_and_system_scope() {
 #[cfg(feature = "apps")]
 #[test]
 fn apps_module_cooks_lists_and_removes_apps() {
-    let dir = tempdir().unwrap();
-    let files_dir = tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let files_dir = tempfile::tempdir().unwrap();
     let base_dir = dir.path();
     let files_base_dir = files_dir.path();
 
@@ -366,8 +373,8 @@ resources:
 #[cfg(feature = "apps")]
 #[test]
 fn apps_create_dry_run_previews_systemd_commands() {
-    let dir = tempdir().unwrap();
-    let files_dir = tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let files_dir = tempfile::tempdir().unwrap();
 
     let create = dispatch(
         "apps",
@@ -398,7 +405,6 @@ fn apps_create_dry_run_previews_systemd_commands() {
         commands,
         [
             "systemctl daemon-reload",
-            "systemctl enable demo-web.service",
             "systemctl start demo-web.service",
         ]
     );

@@ -10,10 +10,12 @@
 //! absence) on every `systemctl`/`journalctl` invocation. `list` additionally
 //! parses the raw `list-units` table into a stable `services` array.
 
-use crate::agent::module_support::parse_payload;
+use crate::agent::module_support::positional;
 use crate::prelude::*;
 
-use crate::types::{DaemonReloadRequest, ServiceListRequest, ServiceLogsRequest, ServiceRequest};
+use crate::types::{
+    DaemonReloadRequest, ServiceListRequest, ServiceLogsRequest, ServiceRequest, ServiceStatus,
+};
 
 /// Marker type for the services module. Stateless; all behavior lives in the
 /// [`Mod`] impl and the static [`INFO`] descriptor.
@@ -54,22 +56,6 @@ impl Mod for ServicesModule {
     }
 
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
-        // Delegate `capabilities`/`plan` to the module descriptor first.
-        if let Some(response) = INFO.metadata_response(action, &payload) {
-            return Ok(response);
-        }
-
-        // The five single-service mutations share one arm because their
-        // `systemctl` invocation has identical shape: `systemctl <action>
-        // <service>`. The `action` string is already a valid systemctl
-        // subcommand, which is why it can be forwarded directly.
-
-        if ["start", "stop", "restart", "enable", "disable"].contains(&action) {
-            let payload: ServiceRequest = parse_payload(payload)?;
-            let args = payload.scope.command_args([action, &payload.service]);
-            return crate::cmd!((payload.dry_run) { &INFO, action, user } "systemctl" => &args ; json);
-        }
-
         Action::from_payload(action, payload)?.handle(user)
     }
 }
@@ -97,7 +83,7 @@ actions!(Action [payload user] => {
             "stdout": result.stdout,
             "stderr": result.stderr,
             "dry_run": result.dry_run,
-            "services": parse_systemctl_services(&result.stdout),
+            "services": ServiceStatus::parse_all(&result.stdout),
         })
     },
     Status: ServiceRequest => {
@@ -105,7 +91,7 @@ actions!(Action [payload user] => {
             "--no-pager",
             "--plain",
             "status",
-            &payload.service,
+            positional("service", &payload.service)?,
         ]);
         crate::cmd!({ &INFO, "status", user } "systemctl" => &args ; json)
     },
@@ -123,41 +109,29 @@ actions!(Action [payload user] => {
         ]);
         crate::cmd!({ &INFO, "logs", user } "journalctl" => &args ; json)
     },
+    // `systemctl <verb> <service>` for the single-service mutations.
+    Start: ServiceRequest => unit_verb("start", &payload, user),
+    Stop: ServiceRequest => unit_verb("stop", &payload, user),
+    Restart: ServiceRequest => unit_verb("restart", &payload, user),
+    Enable: ServiceRequest => unit_verb("enable", &payload, user),
+    Disable: ServiceRequest => unit_verb("disable", &payload, user),
     DaemonReload: DaemonReloadRequest => {
         let args = payload.scope.command_args(["daemon-reload"]);
         crate::cmd!((payload.dry_run) { &INFO, "daemon_reload", user } "systemctl" => &args ; json)
     },
 });
 
-/// Parses the whitespace-separated rows emitted by `systemctl list-units`.
-///
-/// Each row has the fixed prefix `UNIT LOAD ACTIVE SUB` followed by a
-/// free-form `DESCRIPTION` that may contain spaces. We split on runs of
-/// whitespace and treat the first four fields as the fixed columns, rejoining
-/// everything from index 4 onward as the description. Rows with fewer than
-/// four fields (e.g. stray blank lines or the suppressed legend) are dropped
-/// via the `>= 4` guard.
-fn parse_systemctl_services(stdout: &str) -> Vec<Value> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let mut it = line.split_whitespace();
-            let (unit, load, active, sub) = it.next_tuple()?;
-            Some(jsonf! {
-                unit,
-                load,
-                active,
-                sub,
-                "description": it.join(" "),
-            })
-        })
-        .collect()
+fn unit_verb(verb: &str, payload: &ServiceRequest, user: Option<&str>) -> Result<Value> {
+    let args = payload
+        .scope
+        .command_args([verb, positional("service", &payload.service)?]);
+    crate::cmd!((payload.dry_run) { &INFO, verb, user } "systemctl" => &args ; json)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ServiceScope, ServiceStatus};
+    use crate::types::ServiceScope;
 
     #[test]
     fn parses_systemctl_service_rows() {

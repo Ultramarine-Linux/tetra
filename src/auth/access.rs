@@ -20,7 +20,7 @@
 //! file is parsed with `deny_unknown_fields`, and a rolled-back Tetra would
 //! refuse a config containing a new section.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use webauthn_rs::{Webauthn, WebauthnBuilder, prelude::Url};
 
@@ -43,13 +43,15 @@ pub const HTTPS_PORT: u16 = 443;
 pub const SETUP_PORT: u16 = 6623;
 /// Port the OOBE listens on (loopback only), behind its Caddy site.
 pub const SETUP_UPSTREAM_PORT: u16 = 6624;
+/// Caddy's admin API: proxying to it would hand out control of Caddy.
+pub const CADDY_ADMIN_PORT: u16 = 2019;
 /// Ports the dashboard may not use: none, plain HTTP (Caddy would serve
 /// HTTP there while the origin says `https`), Caddy's admin endpoint, and
 /// the OOBE's site and the OOBE itself (Caddy listens on every address, so
 /// it would collide with a loopback listener too). The dashboard's upstream
 /// may not use them either, nor may the site use the upstream's port; see
 /// [`AccessConfig::from_request`].
-const RESERVED_PORTS: [u16; 5] = [0, 80, 2019, SETUP_PORT, SETUP_UPSTREAM_PORT];
+const RESERVED_PORTS: [u16; 5] = [0, 80, CADDY_ADMIN_PORT, SETUP_PORT, SETUP_UPSTREAM_PORT];
 
 /// Fails when `port` (named `what` in the error) is in [`RESERVED_PORTS`].
 fn ensure_unreserved(what: &str, port: u16) -> Result<()> {
@@ -201,30 +203,21 @@ impl AccessConfig {
                 }
             }
         }
-        let upstream = request
-            .dashboard_upstream
-            .as_deref()
-            .unwrap_or(default_upstream)
-            .trim()
-            .to_owned();
-        ensure!(
-            upstream.contains(':') && !upstream.contains(char::is_whitespace),
-            "dashboard_upstream must be a host:port address"
-        );
+        let (upstream, upstream_port) = parse_upstream(
+            request
+                .dashboard_upstream
+                .as_deref()
+                .unwrap_or(default_upstream),
+        )?;
         if let Some(port) = request.port {
             ensure_unreserved("port", port)?;
         }
-        let upstream_port = upstream
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.parse().ok());
         // Caddy (or the setup) listens there, not the dashboard.
-        if let Some(upstream_port) = upstream_port {
-            ensure_unreserved("dashboard_upstream port", upstream_port)?;
-        }
+        ensure_unreserved("dashboard_upstream port", upstream_port)?;
         // Caddy must not proxy the dashboard's site to itself.
         let port = request.port.unwrap_or(HTTPS_PORT);
         ensure!(
-            upstream_port != Some(port),
+            upstream_port != port,
             "port {port} is reserved; the dashboard may listen on it ({upstream})"
         );
         Ok(Self {
@@ -368,6 +361,28 @@ fn is_tailnet_name(name: &str) -> bool {
     name.ends_with(".ts.net")
 }
 
+/// The dashboard's upstream as `host:port`: an IPv4 address, a bracketed
+/// IPv6 address or a DNS name, and a decimal port. No scheme or path, so the
+/// port checked against [`RESERVED_PORTS`] is the one Caddy dials.
+fn parse_upstream(upstream: &str) -> Result<(String, u16)> {
+    let upstream = upstream.trim();
+    let parsed = upstream.rsplit_once(':').and_then(|(host, port)| {
+        let host_ok = match host.strip_prefix('[') {
+            Some(v6) => v6.strip_suffix(']')?.parse::<Ipv6Addr>().is_ok(),
+            None => host.parse::<Ipv4Addr>().is_ok() || validate_dns_name(host).is_ok(),
+        };
+        let port = port
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| port.parse::<u16>().ok())??;
+        host_ok.then_some(port)
+    });
+    let port = parsed.with_context(|| {
+        format!("dashboard_upstream `{upstream}` must be host:port, such as {DEFAULT_DASHBOARD_UPSTREAM}")
+    })?;
+    Ok((upstream.to_owned(), port))
+}
+
 /// Normalize and validate a DNS name: lowercase, no trailing dot, LDH labels,
 /// and not an IP address (which belongs in IP mode).
 fn validate_dns_name(name: &str) -> Result<String> {
@@ -376,19 +391,24 @@ fn validate_dns_name(name: &str) -> Result<String> {
         name.parse::<IpAddr>().is_err(),
         "`{name}` is an IP address; use IP mode"
     );
-    let valid = !name.is_empty()
-        && name.len() <= 253
-        && name.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-        });
-    ensure!(valid, "`{name}` is not a valid hostname");
+    ensure!(is_dns_name(&name), "`{name}` is not a valid hostname");
     Ok(name)
+}
+
+/// Whether `name` is a DNS name of LDH labels (no trailing dot).
+pub(crate) fn is_dns_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 253 && name.split('.').all(is_dns_label)
+}
+
+/// Whether `label` is one DNS label: letters, digits and inner hyphens.
+pub(crate) fn is_dns_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
 }
 
 #[cfg(test)]
@@ -662,6 +682,25 @@ mod tests {
         let config = AccessConfig::load(&path).unwrap().unwrap();
         assert_eq!(config.challenge, AcmeChallenge::Http01);
         assert_eq!(config.dns_provider, None);
+    }
+
+    #[test]
+    fn upstreams_are_host_and_port_only() {
+        for upstream in ["127.0.0.1:3972", "[::1]:8080", "dashboard.internal:8080"] {
+            assert_eq!(parse_upstream(upstream).unwrap().0, upstream);
+        }
+        for upstream in [
+            "http://127.0.0.1:2019/",
+            "127.0.0.1:2019/",
+            "a:b",
+            "127.0.0.1:+80",
+            "::1:80",
+            "{env.HOME}:1",
+            "127.0.0.1",
+            "unix//run/x.sock:1",
+        ] {
+            parse_upstream(upstream).unwrap_err();
+        }
     }
 
     #[test]

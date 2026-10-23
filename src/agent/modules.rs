@@ -5,63 +5,53 @@ pub use crate::prelude::*;
 pub use settings::SettingsModule;
 
 macro_rules! modules {
-    ($($m:ident),+$(,)?) => { ::preinterpret::preinterpret! {
+    ($($m:ident: $feature:literal => $Module:ident),+ $(,)?) => {
         $(
-            #[cfg(feature = [!kebab! $m])]
+            #[cfg(feature = $feature)]
             pub mod $m;
-            #[cfg(feature = [!kebab! $m])]
-            pub use $m::[!ident_camel! $m Module];
+            #[cfg(feature = $feature)]
+            pub use $m::$Module;
         )+
-        pub const MODULES: phf::Map<&'static str, Module> = ::phf::phf_map! {
-            "settings" => Module::SettingsModule(SettingsModule),
+        /// Register every module compiled into this build.
+        pub fn register_all(dispatcher: &mut super::Dispatcher) {
+            dispatcher.register(SettingsModule);
             $(
-                #[cfg(feature = [!kebab! $m])]
-                [!string! $m] => Module::[!ident_camel! $m Module]([!ident_camel! $m Module]),
-            )+
-        };
-        #[enum_dispatch::enum_dispatch]
-        #[derive(Clone, Debug)]
-        pub enum Module {
-            SettingsModule,
-            $(
-                #[cfg(feature = [!kebab! $m])]
-                [!ident_camel! $m Module],
+                #[cfg(feature = $feature)]
+                dispatcher.register($Module);
             )+
         }
-    } }
+    };
 }
 
 modules![
-    apps,
-    files,
-    network,
-    nfs,
-    podman,
-    power,
-    quadlets,
-    recipes,
-    remote_access,
-    reverse_proxy,
-    samba,
-    selinux,
-    services,
-    storage,
-    updates,
-    users,
-    virtual_machines,
+    apps: "apps" => AppsModule,
+    files: "files" => FilesModule,
+    network: "network" => NetworkModule,
+    nfs: "nfs" => NfsModule,
+    podman: "podman" => PodmanModule,
+    power: "power" => PowerModule,
+    quadlets: "quadlets" => QuadletsModule,
+    recipes: "recipes" => RecipesModule,
+    remote_access: "remote-access" => RemoteAccessModule,
+    reverse_proxy: "reverse-proxy" => ReverseProxyModule,
+    samba: "samba" => SambaModule,
+    selinux: "selinux" => SelinuxModule,
+    services: "services" => ServicesModule,
+    storage: "storage" => StorageModule,
+    updates: "updates" => UpdatesModule,
+    users: "users" => UsersModule,
+    virtual_machines: "virtual-machines" => VirtualMachinesModule,
 ];
 
 /// A single host-management surface exposed to the dashboard.
 ///
 /// Each module owns one slice of host state (settings, files, services,
-/// quadlets, …). The [`Dispatcher`] looks up a module by name and hands the
+/// quadlets, …). The [`Dispatcher`](super::Dispatcher) looks up a module by name and hands the
 /// command's `action` and `payload` to its `handle` method.
 ///
 /// Modules are stateless: `handle` takes `&self`, so the same module can be
 /// invoked concurrently from multiple transport tasks. State lives in the
 /// host (systemd, the filesystem, etc.), not in the module.
-#[allow(clippy::missing_errors_doc)]
-#[enum_dispatch::enum_dispatch(Module)]
 pub trait Mod: Send + Sync {
     /// Static metadata describing this module to the dashboard: name, feature
     /// flag, description, status, and the actions it supports.
@@ -74,13 +64,17 @@ pub trait Mod: Send + Sync {
         self.info().name
     }
 
-    /// Handle one action.
+    /// Answer the shared `capabilities`/`plan` meta-actions, which the
+    /// [`Dispatcher`](super::Dispatcher) asks before [`handle`](Self::handle). `None` for every
+    /// other action.
+    fn metadata(&self, action: &str, payload: &Value) -> Option<Value> {
+        self.info().metadata_response(action, payload)
+    }
+
+    /// Handle one module-specific action.
     ///
     /// - `action` is the command's `action` field
     /// - `payload` is the command's `payload` (already parsed from JSON by the transport)
-    ///
-    /// Implementations conventionally start with [`super::module_support::handle_metadata`] to
-    /// serve the shared `capabilities`/`plan` meta-actions, then match on `action`.
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value>;
 }
 
@@ -159,7 +153,7 @@ macro_rules! actions {
         }
         $crate::actions!(@[$payload $user $Action]{$($rest)*}[$($done)* $a]);
     };
-    (@[$payload:ident $user:ident $Action:ident]{$(,)?}[$($done:ident)*]) => { ::preinterpret::preinterpret! {
+    (@[$payload:ident $user:ident $Action:ident]{$(,)?}[$($done:ident)*]) => {
         #[derive(Debug, ::serde::Deserialize)]
         #[serde(rename_all = "snake_case")]
         enum $Action { $( $done($done), )* }
@@ -176,7 +170,7 @@ macro_rules! actions {
                 $crate::agent::module_support::parse_action::<$Action>(action, payload)
             }
         }
-    } };
+    };
 }
 
 #[cfg(test)]

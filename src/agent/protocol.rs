@@ -3,6 +3,7 @@
 //! WebSocket framing will use these types in the next transport increment. The
 //! validator is transport-neutral so outbound WSS and inbound development WSS
 //! cannot accidentally implement different replay rules.
+use super::crypto::verify_command_signature;
 use crate::prelude::*;
 use ed25519_dalek::VerifyingKey;
 
@@ -210,20 +211,6 @@ impl AuthenticatedSession {
         }
         Ok(command)
     }
-}
-
-/// Returns the current Unix timestamp in seconds since the epoch.
-///
-/// # Panics
-/// Panics if the system clock is before the Unix epoch.
-#[must_use]
-pub fn unix_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before Unix epoch")
-        .as_secs()
-        .try_into()
-        .expect("unix_timestamp overflow when casting u64 → i64")
 }
 
 #[derive(Serialize)]

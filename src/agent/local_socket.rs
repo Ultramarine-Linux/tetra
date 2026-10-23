@@ -5,7 +5,7 @@
 //! listen on the network. Each connection is identified by its peer
 //! credentials ([`super::peer`]) and then speaks the session protocol in
 //! [`super::local_protocol`]: every request carries a Tetra-issued session
-//! token. The controller-key login of [`super::websocket_server`] is not
+//! token. The controller-key login of `websocket_server` is not
 //! accepted here; it remains only on the development TCP listener.
 //!
 //! The socket is normally created by systemd (`tetra.socket`) as
@@ -25,7 +25,9 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use socket2::{Domain, Socket, Type};
-use tokio::net::{UnixListener, UnixStream};
+use std::sync::Arc;
+
+use tokio::net::UnixListener;
 
 use super::local_protocol::LocalServer;
 
@@ -36,6 +38,8 @@ pub const DEFAULT_SOCKET_PATH: &str = "/run/tetra/tetra.sock";
 const LISTEN_FDS_START: i32 = 3;
 /// Mode for a socket Tetra binds itself: owner and group only.
 const SOCKET_MODE: u32 = 0o660;
+/// Most local connections open at once.
+const MAX_CONNECTIONS: usize = 64;
 
 /// Return the systemd-activated listener if one was passed to this process,
 /// otherwise bind `path`.
@@ -61,6 +65,10 @@ pub fn listener(path: &Path) -> Result<UnixListener> {
         "socket-activated descriptor is not a listening Unix stream socket"
     );
     socket.set_nonblocking(true)?;
+    // sd_listen_fds(3) would set this; without it every child (systemctl,
+    // podman under `runuser`, ...) inherits the listener and could accept()
+    // dashboard connections.
+    socket.set_cloexec(true)?;
     let listener = UnixListener::from_std(std::os::unix::net::UnixListener::from(OwnedFd::from(
         socket,
     )))?;
@@ -119,28 +127,57 @@ fn bind(path: &Path) -> Result<UnixListener> {
 /// Accept local clients forever, running the session protocol on each
 /// connection.
 pub async fn serve(listener: UnixListener, server: LocalServer) -> Result<()> {
+    // Bounds the tasks (and descriptors) any number of idle or stuck clients
+    // can pin; the dashboard and the OOBE need a handful.
+    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .context("failed to accept local client")?;
-        let peer = peer_label(&stream);
-        let uid = stream.peer_cred().ok().map(|cred| cred.uid());
-        tokio::spawn(server.clone().handle(stream, uid, peer));
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            // Running out of descriptors or memory, or a client giving up
+            // mid-handshake, is transient: it must not take the whole daemon
+            // (and the remote session) down.
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(
+                        libc::EMFILE
+                            | libc::ENFILE
+                            | libc::ENOBUFS
+                            | libc::ENOMEM
+                            | libc::ECONNABORTED
+                            | libc::EINTR
+                            | libc::EPROTO
+                    )
+                ) =>
+            {
+                eprintln!("failed to accept local client: {error}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+            Err(error) => return Err(error).context("failed to accept local client"),
+        };
+        let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
+            eprintln!("refusing a local client: {MAX_CONNECTIONS} connections are open");
+            continue;
+        };
+        let cred = stream.peer_cred().ok();
+        let peer = cred.map_or_else(
+            || "unix:unknown".to_owned(),
+            |cred| {
+                cred.pid().map_or_else(
+                    || format!("unix:uid={}", cred.uid()),
+                    |pid| format!("unix:uid={},pid={pid}", cred.uid()),
+                )
+            },
+        );
+        let server = server.clone();
+        tokio::spawn(async move {
+            server
+                .handle(stream, cred.map(|cred| cred.uid()), peer)
+                .await;
+            drop(permit);
+        });
     }
-}
-
-/// Describe a local peer for logs.
-fn peer_label(stream: &UnixStream) -> String {
-    stream.peer_cred().map_or_else(
-        |_| "unix:unknown".to_owned(),
-        |cred| {
-            cred.pid().map_or_else(
-                || format!("unix:uid={}", cred.uid()),
-                |pid| format!("unix:uid={},pid={pid}", cred.uid()),
-            )
-        },
-    )
 }
 
 #[cfg(test)]
@@ -156,6 +193,7 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
     use std::path::PathBuf;
+    use tokio::net::UnixStream;
     use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message};
 
     async fn receive(socket: &mut WebSocketStream<UnixStream>) -> ServerFrame {

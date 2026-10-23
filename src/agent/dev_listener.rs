@@ -4,7 +4,7 @@
 //! Compiled only with the `dev-listener` feature, so release builds cannot
 //! listen on the network. Production clients use [`super::local_socket`].
 
-use std::{fs::File, io::BufReader, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
 use tokio::net::TcpListener;
@@ -34,19 +34,13 @@ impl WebSocketServerConfig {
     }
 
     fn load_tls_config((cert_path, key_path): &(PathBuf, PathBuf)) -> Result<rustls::ServerConfig> {
-        let mut cert_reader = BufReader::new(File::open(cert_path).with_context(|| {
-            format!("failed to open TLS certificate `{}`", cert_path.display())
-        })?);
-        let certificates = rustls_pemfile::certs(&mut cert_reader)
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
+        let certificates = CertificateDer::pem_file_iter(cert_path)
+            .with_context(|| format!("failed to open TLS certificate `{}`", cert_path.display()))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .context("failed to parse TLS certificate PEM")?;
-        let mut key_reader = BufReader::new(
-            File::open(key_path)
-                .with_context(|| format!("failed to open TLS key `{}`", key_path.display()))?,
-        );
-        let key = rustls_pemfile::private_key(&mut key_reader)
-            .context("failed to parse TLS private key PEM")?
-            .ok_or_else(|| anyhow::anyhow!("TLS private key PEM contains no private key"))?;
+        let key = PrivateKeyDer::from_pem_file(key_path)
+            .with_context(|| format!("failed to read TLS key `{}`", key_path.display()))?;
         rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certificates, key)

@@ -1,5 +1,4 @@
 //! First-boot setup: the setup code, the setup session and completion.
-#![allow(clippy::tests_outside_test_module)]
 
 mod common;
 
@@ -24,6 +23,12 @@ async fn the_oobe_redeems_the_published_code_for_a_limited_session() {
     let banner =
         std::fs::read_to_string(host.config.issue_dir.join("50-tetra-setup.issue")).unwrap();
     assert!(banner.contains(&code));
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(host.config.issue_dir.join("50-tetra-setup.issue"))
+            .unwrap()
+            .permissions(),
+    );
+    assert_eq!(mode & 0o777, 0o600, "local users must not read the code");
 
     // Only the OOBE may redeem it.
     fails(

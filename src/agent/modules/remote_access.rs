@@ -178,9 +178,6 @@ impl Mod for RemoteAccessWithPaths {
 }
 
 fn handle(paths: &Paths, action: &str, payload: Value) -> Result<Value> {
-    if let Some(response) = INFO.metadata_response(action, &payload) {
-        return Ok(response);
-    }
     let action: Action = parse_action(action, payload)?;
     match action {
         Action::Status(NoPayload {}) => Ok(status()),
@@ -480,11 +477,16 @@ fn cloudflared_disable(paths: &Paths, dry_run: bool) -> Result<Value> {
     // Fails when cloudflared is not installed; clean up anyway.
     let disabled =
         commands.run_ignoring_failure("systemctl", &["disable", "--now", CLOUDFLARED]);
-    if !dry_run {
-        store::remove(&paths.drop_in(CLOUDFLARED))?;
+    let drop_in = paths.drop_in(CLOUDFLARED);
+    let removed = if dry_run {
+        drop_in.exists()
+    } else {
         paths.secret_store().remove(CLOUDFLARED_TOKEN)?;
+        store::remove_if_exists(&drop_in)?
+    };
+    if removed {
+        commands.run("systemctl", &["daemon-reload"])?;
     }
-    commands.run("systemctl", &["daemon-reload"])?;
     let enabled = !disabled && unit_enabled(CLOUDFLARED);
     Ok(jsonf! { enabled, dry_run, "commands": commands.done })
 }

@@ -8,8 +8,6 @@
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use kameo::actor::Spawn as _;
-
 use crate::prelude::*;
 
 use super::{clock::Clock, seal::Sealer};
@@ -314,7 +312,7 @@ impl TestHost {
         let clock = Arc::new(ManualClock::new(TEST_EPOCH));
         let host = Arc::new(RecordingHost::default());
         let queue = crate::agent::queue::DispatchQueue::spawn(
-            crate::agent::AgentBackend::spawn(customize(config.dispatcher())),
+            customize(config.dispatcher()),
             crate::agent::queue::DEFAULT_QUEUE_CAPACITY,
         );
         let service = super::AuthService::new(
@@ -377,7 +375,7 @@ impl TestHost {
                 host: Arc::clone(&self.host) as _,
             },
             crate::agent::queue::DispatchQueue::spawn(
-                crate::agent::AgentBackend::spawn(self.config.dispatcher()),
+                self.config.dispatcher(),
                 crate::agent::queue::DEFAULT_QUEUE_CAPACITY,
             ),
         )

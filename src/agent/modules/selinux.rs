@@ -12,6 +12,7 @@
 //! code; they share the `SelinuxOptions` payload via `apply_selinux()` in
 //! `module_support.rs`.
 
+use crate::agent::module_support::positional;
 use crate::prelude::*;
 
 /// SELinux module entry point registered under feature `selinux`.
@@ -92,6 +93,7 @@ actions!(Action [payload user] => {
         if payload.persistent {
             args.push("-P".to_owned());
         }
+        positional("name", &payload.name)?;
         args.push(payload.name);
         args.push(boolean_value(payload.value).to_owned());
         crate::cmd!({&INFO, "set_boolean", user} (payload.dry_run) "setsebool" => &args ; json)
@@ -112,14 +114,14 @@ actions!(Action [payload user] => {
         "fcontext",
         "-a",
         "-t",
-        &payload.context_type,
-        &payload.path_pattern,
+        positional("context_type", &payload.context_type)?,
+        positional("path_pattern", &payload.path_pattern)?,
     ] json),
     DeleteFileContext {
         path_pattern: String,
         #[serde(default)]
         dry_run: bool,
-    } => crate::cmd!((payload.dry_run){&INFO, "delete_file_context", user} "semanage" ["fcontext", "-d", &payload.path_pattern] json),
+    } => crate::cmd!((payload.dry_run){&INFO, "delete_file_context", user} "semanage" ["fcontext", "-d", positional("path_pattern", &payload.path_pattern)?] json),
     RestoreContext {
         path: String,
         #[serde(default)]
@@ -129,7 +131,7 @@ actions!(Action [payload user] => {
     } => {
         let mut args = Vec::new();
         args.extend(payload.recursive.then_some("-R"));
-        args.extend(["-v", &payload.path]);
+        args.extend(["-v", positional("path", &payload.path)?]);
         crate::cmd!((payload.dry_run){&INFO, "restore_context", user} "restorecon" => &args ; json)
     },
 });

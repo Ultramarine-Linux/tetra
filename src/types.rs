@@ -1,10 +1,59 @@
 //! Shared domain types used by Tetra's agent modules
 
-use serde_yaml::Value as YamlValue;
+use serde_norway::Value as YamlValue;
 
 use crate::agent::module_support::SelinuxOptions;
 use crate::catalog::{AppRecipe, RenderedResource};
 use crate::prelude::*;
+
+fn read_text(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+    let file = open_regular(path, fs::OpenOptions::new().read(true))?;
+    let mut text = String::new();
+    file.take(MAX_TEXT_LEN + 1)
+        .read_to_string(&mut text)
+        .with_context(|| format!("failed to read `{}`", path.display()))?;
+    ensure!(
+        u64::try_from(text.len()).is_ok_and(|len| len <= MAX_TEXT_LEN),
+        "`{}` is larger than {MAX_TEXT_LEN} bytes",
+        path.display()
+    );
+    Ok(text)
+}
+
+/// Replace `path` with `contents` unless `dry_run`. Writes in place so the
+/// file keeps its owner, mode and SELinux label.
+fn write_text(path: &Path, contents: &str, dry_run: bool) -> Result<()> {
+    use std::io::Write as _;
+    if !dry_run {
+        let mut file = open_regular(path, fs::OpenOptions::new().write(true).create(true))?;
+        file.set_len(0)
+            .and_then(|()| file.write_all(contents.as_bytes()))
+            .with_context(|| format!("failed to write `{}`", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Largest file [`read_text`] returns (a response must fit one WebSocket
+/// message).
+const MAX_TEXT_LEN: u64 = 16 << 20;
+
+/// Open `path` only if it is a regular file. `O_NONBLOCK`, so a FIFO fails
+/// instead of blocking the agent's one-at-a-time dispatch queue forever; a
+/// device such as `/dev/zero` is refused before it fills memory.
+fn open_regular(path: &Path, options: &mut fs::OpenOptions) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = options
+        .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+        .open(path)
+        .with_context(|| format!("failed to open `{}`", path.display()))?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "`{}` is not a regular file",
+        path.display()
+    );
+    Ok(file)
+}
 
 #[derive(Debug, Deserialize)]
 pub struct FileReadRequest {
@@ -13,8 +62,7 @@ pub struct FileReadRequest {
 
 impl FileReadRequest {
     pub fn read(&self) -> Result<String> {
-        fs::read_to_string(&self.path)
-            .with_context(|| format!("failed to read `{}`", self.path.display()))
+        read_text(&self.path)
     }
 }
 
@@ -30,11 +78,7 @@ pub struct FileWriteRequest {
 
 impl FileWriteRequest {
     pub fn write(&self) -> Result<()> {
-        if !self.dry_run {
-            fs::write(&self.path, &self.contents)
-                .with_context(|| format!("failed to write `{}`", self.path.display()))?;
-        }
-        Ok(())
+        write_text(&self.path, &self.contents, self.dry_run)
     }
 }
 
@@ -330,8 +374,13 @@ pub struct DryRunRequest {
     pub dry_run: bool,
 }
 
+/// Default `nfs` config path; non-admins may not override it.
+pub const EXPORTS_PATH: &str = "/etc/exports";
+/// Default `samba` config path; non-admins may not override it.
+pub const SAMBA_CONFIG_PATH: &str = "/etc/samba/smb.conf";
+
 fn default_exports_path() -> PathBuf {
-    PathBuf::from("/etc/exports")
+    PathBuf::from(EXPORTS_PATH)
 }
 
 #[derive(Debug, Deserialize)]
@@ -342,8 +391,7 @@ pub struct NfsConfigRequest {
 
 impl NfsConfigRequest {
     pub fn read(&self) -> Result<String> {
-        fs::read_to_string(&self.path)
-            .with_context(|| format!("failed to read `{}`", self.path.display()))
+        read_text(&self.path)
     }
 }
 
@@ -360,16 +408,12 @@ pub struct NfsWriteConfigRequest {
 
 impl NfsWriteConfigRequest {
     pub fn write(&self) -> Result<()> {
-        if !self.dry_run {
-            fs::write(&self.path, &self.contents)
-                .with_context(|| format!("failed to write `{}`", self.path.display()))?;
-        }
-        Ok(())
+        write_text(&self.path, &self.contents, self.dry_run)
     }
 }
 
 fn default_samba_config_path() -> PathBuf {
-    PathBuf::from("/etc/samba/smb.conf")
+    PathBuf::from(SAMBA_CONFIG_PATH)
 }
 
 #[derive(Debug, Deserialize)]
@@ -380,8 +424,7 @@ pub struct SambaConfigRequest {
 
 impl SambaConfigRequest {
     pub fn read(&self) -> Result<String> {
-        fs::read_to_string(&self.path)
-            .with_context(|| format!("failed to read `{}`", self.path.display()))
+        read_text(&self.path)
     }
 }
 
@@ -398,11 +441,7 @@ pub struct SambaWriteConfigRequest {
 
 impl SambaWriteConfigRequest {
     pub fn write(&self) -> Result<()> {
-        if !self.dry_run {
-            fs::write(&self.path, &self.contents)
-                .with_context(|| format!("failed to write `{}`", self.path.display()))?;
-        }
-        Ok(())
+        write_text(&self.path, &self.contents, self.dry_run)
     }
 }
 
@@ -489,27 +528,28 @@ pub enum AppRecipeSource {
 }
 
 impl AppRecipeSource {
+    /// Parse the recipe.
+    pub fn load(&self) -> Result<AppRecipe> {
+        match self {
+            Self::Inline { recipe, .. } => AppRecipe::load_str(recipe),
+            Self::File { recipe_path, .. } => AppRecipe::load(recipe_path),
+        }
+    }
+
     /// Render the recipe with `values`, returning the parsed recipe alongside
     /// the rendered resources so callers can record `recipe_id`/`version`.
+    /// Generated values are added to `values` first, so callers store them.
     pub fn render(
         &self,
-        values: &BTreeMap<String, YamlValue>,
+        values: &mut BTreeMap<String, YamlValue>,
     ) -> Result<(AppRecipe, Vec<RenderedResource>)> {
-        match self {
-            Self::Inline { recipe, templates } => {
-                let recipe = AppRecipe::load_str(recipe)?;
-                let resources = recipe.render_with_templates(values, templates)?;
-                Ok((recipe, resources))
-            }
-            Self::File {
-                recipe_path,
-                templates_dir,
-            } => {
-                let recipe = AppRecipe::load(recipe_path)?;
-                let resources = recipe.render(values, templates_dir)?;
-                Ok((recipe, resources))
-            }
-        }
+        let recipe = self.load()?;
+        recipe.fill_generated(values);
+        let resources = match self {
+            Self::Inline { templates, .. } => recipe.render_with_templates(values, templates)?,
+            Self::File { templates_dir, .. } => recipe.render(values, templates_dir)?,
+        };
+        Ok((recipe, resources))
     }
 }
 
@@ -661,6 +701,10 @@ pub struct AppManifest {
     pub recipe: AppRecipeSource,
     #[serde(default)]
     pub values: BTreeMap<String, YamlValue>,
+    /// Keys that were `Secret` parameters at any render. Redaction uses this
+    /// snapshot, so editing a recipe file cannot declassify a stored value.
+    #[serde(default)]
+    pub secret_keys: std::collections::BTreeSet<String>,
     /// Quadlet unit filenames installed into the scan directory.
     #[serde(default)]
     pub units: Vec<String>,
@@ -882,6 +926,7 @@ mod tests {
                 templates: BTreeMap::new(),
             },
             values: BTreeMap::new(),
+            secret_keys: std::collections::BTreeSet::new(),
             units: [
                 "demo-web.container",
                 "site.kube",

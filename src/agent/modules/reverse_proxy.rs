@@ -164,18 +164,9 @@ actions!(Action [payload user] => {
         if !payload.dry_run {
             fs::create_dir_all(config_dir)
                 .with_context(|| format!("failed to create `{}`", config_dir.display()))?;
-            fs::write(&path, &contents)
-                .with_context(|| format!("failed to write `{}`", path.display()))?;
+            crate::auth::store::replace(&path, contents.as_bytes(), SITE_MODE)?;
         }
-
-        let (reload, reload_error) = if payload.reload {
-            match reload_caddy("write", payload.dry_run, user) {
-                Ok(result) => (Some(result), None),
-                Err(error) => (None, Some(error.to_string())),
-            }
-        } else {
-            (None, None)
-        };
+        let (reload, reload_error) = optional_reload(payload.reload, "write", payload.dry_run, user);
 
         Ok(jsonf! {
             config_dir, filename, path, contents, site,
@@ -198,19 +189,10 @@ actions!(Action [payload user] => {
         let path = safe_join(config_dir, &filename)?;
         ensure_managed(&path)?;
 
-        if !payload.dry_run && path.exists() {
-            fs::remove_file(&path)
-                .with_context(|| format!("failed to delete `{}`", path.display()))?;
+        if !payload.dry_run {
+            crate::auth::store::remove(&path)?;
         }
-
-        let (reload, reload_error) = if payload.reload {
-            match reload_caddy("delete", payload.dry_run, user) {
-                Ok(result) => (Some(result), None),
-                Err(error) => (None, Some(error.to_string())),
-            }
-        } else {
-            (None, None)
-        };
+        let (reload, reload_error) = optional_reload(payload.reload, "delete", payload.dry_run, user);
 
         Ok(jsonf! {
             config_dir, filename, path,
@@ -223,6 +205,23 @@ actions!(Action [payload user] => {
         dry_run: bool,
     } => reload_caddy("reload", payload.dry_run, user)
 });
+
+/// Reload Caddy when asked. A failed reload is reported next to the change
+/// (which already happened) rather than failing the action.
+fn optional_reload(
+    reload: bool,
+    action: &str,
+    dry_run: bool,
+    user: Option<&str>,
+) -> (Option<Value>, Option<String>) {
+    if !reload {
+        return (None, None);
+    }
+    match reload_caddy(action, dry_run, user) {
+        Ok(result) => (Some(result), None),
+        Err(error) => (None, Some(error.to_string())),
+    }
+}
 
 /// Serde default for `tls`. Caddy auto-provisions HTTPS, so TLS is the
 /// safe default; callers must explicitly opt out.
@@ -241,16 +240,7 @@ fn validate_domain(domain: &str) -> Result<String> {
     if domain.is_empty() {
         bail!("domain is required");
     }
-    if domain.len() > 253
-        || domain.contains('/')
-        || domain.contains(':')
-        || !domain
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.')
-        || domain.split('.').any(|part| {
-            part.is_empty() || part.starts_with('-') || part.ends_with('-') || part.len() > 63
-        })
-    {
+    if !crate::auth::access::is_dns_name(&domain) {
         bail!("invalid domain `{domain}`");
     }
 
@@ -267,16 +257,32 @@ fn validate_upstream(upstream: &str) -> Result<String> {
     if upstream.is_empty() {
         bail!("upstream is required");
     }
-    if upstream.contains('\n')
-        || upstream.contains('\r')
-        || upstream.contains('{')
-        || upstream.contains('}')
+    // One address only: whitespace would add more upstreams to the
+    // `reverse_proxy` directive, and braces or newlines more directives.
+    if !upstream
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']' | '/'))
     {
         bail!("invalid upstream `{upstream}`");
     }
-    if !upstream.contains(':') {
-        bail!("upstream must include a host and port, such as 127.0.0.1:8080");
-    }
+    // `[scheme://]host:port[/...]`: the port is required, and may not be one
+    // that would expose Caddy's admin API or the OOBE to anyone who can
+    // reach the new site (`reverse_proxy.write` is grantable).
+    let authority = upstream.split_once("://").map_or(upstream, |(_, rest)| rest);
+    let authority = authority.split('/').next().unwrap_or_default();
+    let port = authority
+        .rsplit_once(':')
+        .and_then(|(host, port)| (!host.is_empty()).then_some(port))
+        .and_then(|port| port.parse::<u16>().ok())
+        .context("upstream must include a host and port, such as 127.0.0.1:8080")?;
+    ensure!(
+        ![
+            crate::auth::access::CADDY_ADMIN_PORT,
+            crate::auth::access::SETUP_UPSTREAM_PORT
+        ]
+        .contains(&port),
+        "upstream port {port} is reserved for Caddy's admin API or the setup"
+    );
 
     Ok(upstream.to_owned())
 }
@@ -624,6 +630,26 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn upstreams_need_one_host_and_an_unreserved_port() {
+        for ok in ["127.0.0.1:8080", "[::1]:8080", "localhost:3000", "http://app.lan:80/"] {
+            validate_upstream(ok).unwrap();
+        }
+        for bad in [
+            "127.0.0.1:2019",
+            "[::1]:2019",
+            "localhost:2019",
+            "http://127.0.0.1:2019/",
+            "127.0.0.1:6624",
+            "127.0.0.1",
+            ":8080",
+            "127.0.0.1:x",
+            "127.0.0.1:1 unix//run/x.sock",
+        ] {
+            assert!(validate_upstream(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn renders_caddy_site() {

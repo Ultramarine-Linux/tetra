@@ -46,39 +46,13 @@ macro_rules! __jsonf_inner {
     ([$a:literal: $b:expr $(,$($tt:tt)*)?] $($done:tt)*) => {
         $crate::__jsonf_inner!([$($($tt)*)?] $($done)* $a: $b,)
     }; // ╰─ match field: expr
-    ([$e:expr $(,$($tt:tt)*)?] $($done:tt)*) => { ::preinterpret::preinterpret! {
-        $crate::__jsonf_inner!(@last [[!raw! $e]] [$e $(, $($tt)*)?] $($done)*)
-    } }; // ╰─ match obj.field
-    (@last [$f:ident . $($stuff:tt)+] [$e:expr $(,$($tt:tt)*)?] $($done:tt)*) => {
-        $crate::__jsonf_inner!(@last [$($stuff)+] [$e $(, $($tt)*)?] $($done)*)
+    ([$head:ident $(. $field:ident)* $(,$($tt:tt)*)?] $($done:tt)*) => {
+        $crate::__jsonf_inner!(@last [$head $(. $field)*] [$head $(. $field)*] [$($($tt)*)?] $($done)*)
+    }; // ╰─ match obj.field
+    (@last [$f:ident . $($rest:tt)+] $e:tt $tt:tt $($done:tt)*) => {
+        $crate::__jsonf_inner!(@last [$($rest)+] $e $tt $($done)*)
     }; // @last: extracting last field
-    (@last [$f:ident] [$e:expr $(,$($tt:tt)*)?] $($done:tt)*) => { ::preinterpret::preinterpret! {
-        $crate::__jsonf_inner!([$($($tt)*)?] $($done)* [!string! $f]: $e,)
-    } }; // @last: form tt
-}
-
-/// Helper for adding flags to a vec `args`.
-///
-/// # Usage
-/// `flag!(args payload: system [shell] ["--home-dir" home]);` will:
-/// - add `--system` if `payload.system` is true
-/// - add `--shell {payload.shell}` if `payload.shell.is_some()`
-/// - add `--home-dir {home}` if `payload.home.is_some()`
-#[macro_export]
-macro_rules! flag {
-    ($args:ident $payload:ident:$($idk:tt)+) => {
-        $($args.extend(flag!(@$payload $idk));)+
-    };
-    (@$payload:ident [$field:ident]) => {
-        $payload.$field.into_iter().flat_map(|$field| [stringify!(--$field).to_owned(), $field])
-    };
-    (@$payload:ident [$s:literal $field:ident]) => {
-        $payload.$field.into_iter().flat_map(|$field| [$s.to_owned(), $field])
-    };
-    (@$payload:ident $field:ident) => {
-        $payload.$field.then(|| stringify!(--$field).to_owned())
-    };
-    (@$payload:ident $field:ident($e:expr)) => {
-        $payload.$field.then(|| $e)
-    };
+    (@last [$f:ident] [$($e:tt)+] [$($tt:tt)*] $($done:tt)*) => {
+        $crate::__jsonf_inner!([$($tt)*] $($done)* stringify!($f): $($e)+,)
+    }; // @last: form tt
 }

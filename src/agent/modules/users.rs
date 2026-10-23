@@ -39,6 +39,7 @@ use nix::{
     unistd::{Gid, Uid, UnlinkatFlags, fchown, fsync, unlinkat},
 };
 
+use crate::agent::module_support::option_arg;
 use crate::prelude::*;
 
 /// Group whose members are Tetra administrators (with `wheel`).
@@ -81,7 +82,6 @@ const INFO: ModuleInfo = ModuleInfo {
         "set_password",
         "set_authorized_keys",
         "add_admin",
-        "groups",
     ],
 };
 
@@ -115,7 +115,11 @@ actions!(Action [payload user] => {
         let mut args = Vec::new();
         // `useradd` spells the home flag `--home-dir` (unlike
         // `usermod`'s `--home` below).
-        flag!(args payload: system [shell] ["--home-dir" home]);
+        if payload.system {
+            args.push("--system".to_owned());
+        }
+        option_arg(&mut args, "--shell", payload.shell);
+        option_arg(&mut args, "--home-dir", payload.home);
         args.push(payload.name);
         crate::cmd!((payload.dry_run) { &INFO, "create", user } "useradd" => &args ; json)
     },
@@ -129,7 +133,8 @@ actions!(Action [payload user] => {
     } => {
         validate_name(&payload.name)?;
         let mut args = Vec::new();
-        flag!(args payload: [shell] [home]);
+        option_arg(&mut args, "--shell", payload.shell);
+        option_arg(&mut args, "--home", payload.home);
         if let Some(groups) = payload.groups {
             groups.iter().try_for_each(|group| validate_name(group))?;
             args.extend(["--groups".into(), groups.join(",")]);

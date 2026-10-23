@@ -24,6 +24,8 @@ use super::store::{self, Extra, Header, Record, Tolerant};
 pub const TOKEN_PREFIX: &str = "tts_";
 const TOKEN_BYTES: usize = 32;
 const PUBLIC_ID_CHARS: usize = 16;
+/// Live sessions per account; a new one ends the least recently used.
+pub const MAX_SESSIONS_PER_USER: usize = 32;
 
 /// Which local client a connection (and so a token) belongs to, from the
 /// peer's credentials.
@@ -242,6 +244,19 @@ impl SessionStore {
         };
         let mut state = self.lock();
         self.prune(&mut state, now);
+        if let Some(uid) = session.uid {
+            let mut mine: Vec<_> = state
+                .sessions
+                .iter()
+                .filter(|(_, other)| other.uid == Some(uid))
+                .map(|(hash, other)| (other.last_seen, hash.clone()))
+                .collect();
+            mine.sort_unstable();
+            let excess = mine.len().saturating_sub(MAX_SESSIONS_PER_USER - 1);
+            for (_, hash) in mine.into_iter().take(excess) {
+                state.sessions.remove(&hash);
+            }
+        }
         state.sessions.insert(token_hash, session.clone());
         let persisted = self.persist(&mut state);
         drop(state);
@@ -603,6 +618,28 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&future("current", 1000))
+        );
+    }
+
+    #[test]
+    fn each_account_keeps_its_most_recently_used_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = store(dir.path());
+        let (first, _) = sessions.issue(new_user(ClientKind::Dashboard), 0).unwrap();
+        let (second, _) = sessions.issue(new_user(ClientKind::Dashboard), 1).unwrap();
+        sessions.validate(&first, ClientKind::Dashboard, 2).unwrap();
+        for now in 3..i64::try_from(MAX_SESSIONS_PER_USER).unwrap() + 2 {
+            sessions
+                .issue(new_user(ClientKind::Dashboard), now)
+                .unwrap();
+        }
+        assert_eq!(sessions.list(|_| true, 100).len(), MAX_SESSIONS_PER_USER);
+        sessions
+            .validate(&first, ClientKind::Dashboard, 100)
+            .unwrap();
+        assert_eq!(
+            sessions.validate(&second, ClientKind::Dashboard, 100),
+            Err(SessionError::Invalid)
         );
     }
 

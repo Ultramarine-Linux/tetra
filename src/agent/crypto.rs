@@ -163,12 +163,6 @@ fn canonicalize(value: Value) -> Value {
     }
 }
 
-/// Return a compact public-key fingerprint for enrollment and logs.
-#[must_use]
-pub fn public_key_fingerprint(verifying_key: &VerifyingKey) -> String {
-    URL_SAFE_NO_PAD.encode(verifying_key.as_bytes())
-}
-
 /// Parse a URL-safe base64 public key.
 ///
 /// # Errors
@@ -186,6 +180,7 @@ pub fn parse_verifying_key(encoded: &str) -> Result<VerifyingKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::identity::public_key_fingerprint;
     use ed25519_dalek::SigningKey;
     use serde_json::json;
 

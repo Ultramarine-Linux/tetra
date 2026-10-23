@@ -60,7 +60,10 @@ actions!(Action [payload user] => {
         hostname: String,
         #[serde(default)]
         dry_run: bool,
-    } => crate::cmd!((payload.dry_run) { &INFO, "set_hostname", user } "hostnamectl" ["set-hostname", &payload.hostname] json),
+    } => {
+        validate_hostname(&payload.hostname)?;
+        crate::cmd!((payload.dry_run) { &INFO, "set_hostname", user } "hostnamectl" ["set-hostname", &payload.hostname] json)
+    },
     SetKeymap {
         /// X11 layout, such as `us` or `de` (comma-separated for several).
         layout: String,
@@ -103,6 +106,18 @@ actions!(Action [payload user] => {
         crate::cmd!((payload.dry_run) { &INFO, "set_timezone", user } "timedatectl" ["set-timezone", &payload.timezone] json)
     },
 });
+
+/// A hostname for `hostnamectl set-hostname`, which also accepts a "pretty"
+/// name (spaces, Unicode). Refuses what would be read as an option (the
+/// setup session can call this) and control characters.
+fn validate_hostname(hostname: &str) -> Result<()> {
+    crate::agent::module_support::positional("hostname", hostname)?;
+    ensure!(
+        hostname.len() <= 255 && !hostname.chars().any(char::is_control),
+        "hostname must be at most 255 bytes without control characters"
+    );
+    Ok(())
+}
 
 /// XKB layout and variant names: letters, digits, `_`, `-`, and `,` between
 /// several layouts.

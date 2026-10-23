@@ -4,23 +4,23 @@
 //! Architecture at a glance:
 //!
 //! - [`Dispatcher`] routes an [`AgentCommand`] `{module, action, payload}`
-//!   envelope to the matching [`AgentModule`] and returns an [`AgentResponse`].
-//! - [`modules`] holds one `AgentModule` implementation per host-management
+//!   envelope to the matching [`Mod`](modules::Mod) and returns an [`AgentResponse`].
+//! - [`modules`] holds one [`Mod`](modules::Mod) implementation per host-management
 //!   surface (settings, files, services, quadlets, recipes, …), each gated by
 //!   a Cargo feature so installs only ship what they need.
 //! - [`module_support`] provides the shared plumbing every module uses:
 //!   `ModuleInfo` metadata, the `capabilities`/`plan` meta-actions, the dry-run
 //!   command runner, and the shared SELinux-labeling helper.
-//! - [`backend`] wraps the dispatcher in a Kameo actor so transports can handle
-//!   commands concurrently without sharing a `&mut Dispatcher`.
-//! - Transports — [`local_socket`], [`vsock`] and [`websocket`] — feed the same
-//!   envelope shape into the same backend. [`local_socket`] is the only
+//! - [`queue`] runs commands from every transport one at a time on the
+//!   blocking pool.
+//! - Transports — [`local_socket`], [`websocket`] and the development-only
+//!   `vsock` — feed the same envelope shape into the same queue. [`local_socket`] is the only
 //!   listener in production; [`transport`] holds the shared endpoint-parsing
 //!   config.
 
-pub mod backend;
 pub mod command;
 pub mod config;
+#[cfg(feature = "dev-listener")]
 pub mod crypto;
 #[cfg(feature = "dev-listener")]
 pub mod dev_listener;
@@ -28,20 +28,21 @@ pub mod dispatcher;
 pub mod identity;
 pub mod local_protocol;
 pub mod local_socket;
-pub mod messages;
 pub mod module_support;
 pub mod modules;
 pub mod peer;
+#[cfg(feature = "dev-listener")]
 pub mod protocol;
 pub mod queue;
 pub mod remote;
 pub mod transport;
+#[cfg(feature = "dev-listener")]
 pub mod verify_password;
+#[cfg(feature = "dev-listener")]
 pub mod vsock;
 pub mod websocket;
+#[cfg(feature = "dev-listener")]
 pub mod websocket_server;
 
-pub use backend::AgentBackend;
 pub use command::{AgentCommand, AgentResponse};
 pub use dispatcher::Dispatcher;
-pub use messages::DispatchCommand;

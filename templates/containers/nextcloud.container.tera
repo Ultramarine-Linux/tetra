@@ -11,18 +11,18 @@ ContainerName={{ app_id }}-app
 Image=docker.io/library/nextcloud:latest
 Network={{ app_id }}-net.network
 Volume={{ app_id }}-data.volume:/var/www/html
-Environment=NEXTCLOUD_TRUSTED_DOMAINS={{ domain }}
-Environment=OVERWRITEHOST={{ domain }}
-Environment=OVERWRITEPROTOCOL={{ overwrite_protocol }}
+Environment={{ ("NEXTCLOUD_TRUSTED_DOMAINS=" ~ domain) | systemd_quote }}
+Environment={{ ("OVERWRITEHOST=" ~ domain) | systemd_quote }}
+Environment={{ ("OVERWRITEPROTOCOL=" ~ overwrite_protocol) | systemd_quote }}
 Environment=MYSQL_HOST={{ app_id }}-db
-Environment=MYSQL_DATABASE={{ database_name }}
-Environment=MYSQL_USER={{ database_user }}
-Environment=MYSQL_PASSWORD={{ db_password }}
-Environment=NEXTCLOUD_ADMIN_USER={{ admin_user }}
-Environment=NEXTCLOUD_ADMIN_PASSWORD={{ admin_password }}
-Environment=PHP_MEMORY_LIMIT={{ php_memory_limit }}
-Environment=PHP_UPLOAD_LIMIT={{ upload_limit }}
-{% if trusted_proxies %}Environment=TRUSTED_PROXIES={{ trusted_proxies }}
+Environment={{ ("MYSQL_DATABASE=" ~ database_name) | systemd_quote }}
+Environment={{ ("MYSQL_USER=" ~ database_user) | systemd_quote }}
+Environment={{ ("MYSQL_PASSWORD=" ~ db_password) | systemd_quote }}
+Environment={{ ("NEXTCLOUD_ADMIN_USER=" ~ admin_user) | systemd_quote }}
+Environment={{ ("NEXTCLOUD_ADMIN_PASSWORD=" ~ admin_password) | systemd_quote }}
+Environment={{ ("PHP_MEMORY_LIMIT=" ~ php_memory_limit) | systemd_quote }}
+Environment={{ ("PHP_UPLOAD_LIMIT=" ~ upload_limit) | systemd_quote }}
+{% if trusted_proxies %}Environment={{ ("TRUSTED_PROXIES=" ~ trusted_proxies) | systemd_quote }}
 {% endif %}{% if enable_redis %}Environment=REDIS_HOST={{ app_id }}-redis
 {% endif %}PublishPort={{ host_port }}:80
 

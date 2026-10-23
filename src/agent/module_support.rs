@@ -17,7 +17,7 @@ pub enum ModuleStatus {
 
 /// Static metadata each module exposes about itself.
 ///
-/// Returned by [`AgentModule::info`](super::AgentModule::info) and used to:
+/// Returned by [`Mod::info`](super::modules::Mod::info) and used to:
 /// - answer the dispatcher-level `agent.capabilities` action (lists modules)
 /// - answer each module's own `capabilities` action (single-module info)
 /// - drive the dashboard's module/action pickers
@@ -37,7 +37,7 @@ pub struct ModuleInfo {
 }
 
 impl ModuleInfo {
-    /// Whether `action` is listed in [`privileged_actions`].
+    /// Whether `action` is listed in [`privileged_actions`](Self::privileged_actions).
     #[must_use]
     pub fn is_privileged(&self, action: &str) -> bool {
         self.privileged_actions.contains(&action)
@@ -64,49 +64,32 @@ impl ModuleInfo {
     pub fn effective_user<'a>(&self, action: &str, user: Option<&'a str>) -> Option<&'a str> {
         (!self.is_privileged(action)).then_some(user).flatten()
     }
+}
 
-    /// Create the uniform unsupported-action error used by all modules.
-    ///
-    /// # Errors
-    /// This method always returns an error.
-    pub fn unsupported_action(&self, action: &str) -> Result<Value> {
-        bail!("unsupported {} action `{action}`", self.name)
+/// Append `flag value` to `args` when `value` is set.
+pub fn option_arg(args: &mut Vec<String>, flag: &str, value: Option<String>) {
+    if let Some(value) = value {
+        args.extend([flag.to_owned(), value]);
     }
 }
 
-/// Handle the shared `capabilities` and `plan` meta-actions that every
-/// module supports.
+/// Check a payload value that becomes a positional argument of a host
+/// command: an empty value or one starting with `-` would be read as an
+/// option (`podman rm -a`, `podman logs -f`).
 ///
-/// Convention: each module's `handle` method calls this first and returns
-/// `Some(...)` if it matched, then matches on its own module-specific
-/// actions. `plan` is a lightweight "what would you do with this payload?"
-/// endpoint — it returns the module metadata plus the echoed payload, so
-/// the dashboard can show a preview without committing to a dry run.
-///
-/// Returns `None` when the action isn't one of these meta-actions, so the
-/// caller can fall through to its own match.
-#[must_use]
-pub fn handle_metadata(info: ModuleInfo, action: &str, payload: &Value) -> Option<Value> {
-    info.metadata_response(action, payload)
-}
-
-/// Bail with a consistent "unknown action" error message. Centralizing this
-/// keeps the error format uniform across modules.
-#[allow(clippy::missing_errors_doc)]
-pub fn unsupported_action(module: &str, action: &str) -> Result<Value> {
-    bail!("unsupported {module} action `{action}`")
+/// # Errors
+/// Fails when `value` is empty or starts with `-`.
+pub fn positional<'a>(field: &str, value: &'a str) -> Result<&'a str> {
+    ensure!(
+        !value.is_empty() && !value.starts_with('-'),
+        "`{field}` must not be empty or start with `-`"
+    );
+    Ok(value)
 }
 
 #[derive(Debug, Deserialize)]
 pub struct NamedPayload {
     pub name: String,
-    #[serde(default)]
-    pub dry_run: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ServicePayload {
-    pub service: String,
     #[serde(default)]
     pub dry_run: bool,
 }
@@ -150,21 +133,14 @@ pub struct NoPayload {}
 /// Errs on an unknown action or a payload the action does not accept.
 pub fn parse_action<T: serde::de::DeserializeOwned>(action: &str, payload: Value) -> Result<T> {
     let payload = if payload.is_null() {
-        json!({})
+        Value::Object(serde_json::Map::new())
     } else {
         payload
     };
-    Ok(serde_json::from_value(json!({ action: payload }))?)
-}
-
-/// Deserialize a typed payload from a [`serde_json::Value`] with a consistent
-/// "invalid command payload" error message. Centralizing this keeps the
-/// per-module error surface uniform.
-///
-/// # Errors
-/// An error is returned if the payload cannot be deserialized.
-pub fn parse_payload<T: for<'de> Deserialize<'de>>(payload: Value) -> Result<T> {
-    serde_json::from_value(payload).context("invalid command payload")
+    // `json!({ action: payload })` would serialize a copy of the payload.
+    let mut wrapper = serde_json::Map::new();
+    wrapper.insert(action.to_owned(), payload);
+    Ok(serde_json::from_value(Value::Object(wrapper))?)
 }
 
 /// Whether the module supports running non-privileged actions as a non-root
@@ -254,16 +230,142 @@ macro_rules! __cmd_inner {
     }) };
 }
 
+/// Upper bound for one host command.
+///
+/// The dispatch queue runs one command at a time, so a hung child (a `systemctl` job, `virsh`, `podman`) would stall
+/// every transport. Generous enough for an image pull during `systemctl start`.
+pub const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(15);
+
+impl CommandResult {
+    const fn planned(command: String) -> Self {
+        Self {
+            command,
+            status: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            dry_run: true,
+        }
+    }
+
+    fn finish(command: String, output: &std::process::Output) -> Result<Self> {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let status = output.status.code();
+        ensure!(
+            output.status.success(),
+            "`{command}` failed with status {status:?}: {}",
+            stderr.trim()
+        );
+        Ok(Self {
+            command,
+            status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr,
+            dry_run: false,
+        })
+    }
+}
+
+/// `command.output()` with `input` on its stdin (or none), killing the
+/// child's process group after [`COMMAND_TIMEOUT`]. Also returns whether
+/// all of `input` was written: a command that exits without reading it
+/// closes the pipe, and its status says more than the failed write.
+pub(crate) fn output_with_timeout(
+    command: &mut Command,
+    input: Option<&[u8]>,
+) -> io::Result<(std::process::Output, io::Result<()>)> {
+    use std::{
+        io::Write as _,
+        os::unix::process::CommandExt as _,
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
+    fn drain(mut pipe: impl io::Read + Send + 'static) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+        thread::spawn(move || {
+            let mut buffer = Vec::new();
+            pipe.read_to_end(&mut buffer).map(|_| buffer)
+        })
+    }
+    fn join(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+        handle
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("output reader panicked")))
+    }
+
+    let mut child = command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Its own group, so the kill also reaches the program under `runuser`.
+        .process_group(0)
+        .spawn()?;
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("no stdout"))?,
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("no stderr"))?,
+    );
+    // From a thread of its own, so a child that writes before it reads
+    // cannot deadlock against us.
+    let writer = match (input, child.stdin.take()) {
+        (Some(input), Some(mut stdin)) => {
+            let input = input.to_vec();
+            Some(thread::spawn(move || stdin.write_all(&input)))
+        }
+        _ => None,
+    };
+    let deadline = Instant::now().checked_add(COMMAND_TIMEOUT);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if let Ok(pid) = i32::try_from(child.id()) {
+                let group = nix::unistd::Pid::from_raw(pid);
+                nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL).ok();
+            }
+            child.wait().ok();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out after {COMMAND_TIMEOUT:?}"),
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let written = writer.map_or(Ok(()), |writer| {
+        writer
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("input writer panicked")))
+    });
+    let output = std::process::Output {
+        status,
+        stdout: join(stdout)?,
+        stderr: join(stderr)?,
+    };
+    Ok((output, written))
+}
+
 /// Run a host command, optionally impersonating `default_user`.
 ///
-/// When `default_user` is `Some`, the command is wrapped in
-/// `runuser -u <user> -- <program> <args>`.  This lets Tetra run as root
-/// while executing day-to-day operations (podman inspect, reading configs)
-/// with unprivileged credentials.  Privileged actions bypass this wrapper
-/// by passing `default_user: None`.
+/// When `default_user` is `Some` (and Tetra runs as root), the command is
+/// wrapped in `runuser -u <user> -- <program> <args>`. This lets Tetra run as
+/// root while executing day-to-day operations (podman inspect, reading
+/// configs) with unprivileged credentials. Privileged actions bypass this
+/// wrapper by passing `default_user: None`.
 ///
 /// # Errors
-/// An error is returned if the command fails to start, or if it exits with a non-zero status code.
+/// An error is returned if the command fails to start, times out, or exits
+/// with a non-zero status code.
 pub fn run_command_output_as<I, S>(
     program: &str,
     args: I,
@@ -274,49 +376,21 @@ where
     I: IntoIterator<Item = S> + Copy,
     S: AsRef<OsStr> + std::fmt::Display,
 {
-    let command = command_display(program, args);
-
+    let display = command_display(program, args);
     if dry_run {
-        return Ok(CommandResult {
-            command,
-            status: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            dry_run: true,
-        });
+        return Ok(CommandResult::planned(display));
     }
-
-    let output = match default_user {
-        Some(user) if DEFAULT_USER_SUPPORT && current_uid_is_root() => Command::new("runuser")
-            .args(["-u", user, "--", program])
-            .args(args)
-            .output()
-            .with_context(|| format!("failed to run `{program}` as `{user}`")),
-        Some(user) => Command::new(program)
-            .args(args)
-            .output()
-            .with_context(|| format!("failed to run `{program}` as current user `{user}`")),
-        _ => Command::new(program)
-            .args(args)
-            .output()
-            .with_context(|| format!("failed to run `{program}`")),
-    }?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let code = output.status.code();
-
-    if !output.status.success() {
-        bail!("`{command}` failed with status {code:?}: {}", stderr.trim());
-    }
-
-    Ok(CommandResult {
-        command,
-        status: code,
-        stdout,
-        stderr,
-        dry_run: false,
-    })
+    let mut command = match default_user {
+        Some(user) if DEFAULT_USER_SUPPORT && nix::unistd::geteuid().is_root() => {
+            let mut command = Command::new("runuser");
+            command.args(["-u", user, "--", program]);
+            command
+        }
+        _ => Command::new(program),
+    };
+    let (output, _) = output_with_timeout(command.args(args), None)
+        .with_context(|| format!("failed to run `{display}`"))?;
+    CommandResult::finish(display, &output)
 }
 
 /// Run `program` with `input` on its stdin, as Tetra's own user.
@@ -334,56 +408,14 @@ pub fn run_command_with_input(
     display: String,
     dry_run: bool,
 ) -> Result<CommandResult> {
-    use std::{io::Write as _, process::Stdio};
     if dry_run {
-        return Ok(CommandResult {
-            command: display,
-            status: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            dry_run: true,
-        });
+        return Ok(CommandResult::planned(display));
     }
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let (output, written) = output_with_timeout(Command::new(program).args(args), Some(input))
         .with_context(|| format!("failed to run `{program}`"))?;
-    // A command that exits without reading closes the pipe; its status says
-    // more than the failed write.
-    let written = child.stdin.take().context("no stdin")?.write_all(input);
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("failed to run `{program}`"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let code = output.status.code();
-    ensure!(
-        output.status.success(),
-        "`{display}` failed with status {code:?}: {}",
-        stderr.trim()
-    );
-    written.with_context(|| format!("failed to write to `{display}`"))?;
-    Ok(CommandResult {
-        command: display,
-        status: code,
-        stdout,
-        stderr,
-        dry_run: false,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn current_uid_is_root() -> bool {
-    // SAFETY: `geteuid` has no preconditions and only reads process credentials.
-    unsafe { libc::geteuid() == 0 }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn current_uid_is_root() -> bool {
-    false
+    let result = CommandResult::finish(display, &output)?;
+    written.with_context(|| format!("failed to write to `{}`", result.command))?;
+    Ok(result)
 }
 
 /// Compute the effective OS user for a module action.
@@ -467,15 +499,23 @@ pub fn apply_selinux(
         let pattern = (options.path_pattern.clone())
             .or_else(|| default_fcontext_pattern(path.as_ref(), options.recursive))
             .context("SELinux context_type requires path, path_pattern, or default path")?;
-        operations.push(
-            cmd!((dry_run) "semanage" ["fcontext", "-a", "-t", context_type, &pattern] json)?,
-        );
+        let context_type = positional("context_type", context_type)?;
+        let pattern = positional("path_pattern", &pattern)?;
+        let fcontext =
+            |verb| cmd!((dry_run) "semanage" ["fcontext", verb, "-t", context_type, pattern]);
+        // `-a` refuses a pattern that already has a local rule (the second
+        // `apps.update` with the same options); `-m` changes that rule.
+        let result = match fcontext("-a") {
+            Err(_) if !dry_run => fcontext("-m")?,
+            result => result?,
+        };
+        operations.push(json!(result));
     }
 
     if let Some(path) = path.as_deref() {
         let mut args = Vec::new();
         args.extend(options.recursive.then_some("-R"));
-        args.extend_from_slice(&["-v", path]);
+        args.extend_from_slice(&["-v", positional("path", path)?]);
         operations.push(cmd!((dry_run) "restorecon" &args ; json)?);
     }
 
@@ -547,6 +587,66 @@ pub fn safe_join(base: &Path, name: &str) -> Result<PathBuf> {
     Ok(base.join(path))
 }
 
+/// [`safe_join`] `relative` onto `base`, also refusing a path that passes
+/// through a symlink below `base`, so a link planted in a managed directory
+/// is never followed.
+///
+/// # Errors
+/// Fails when `relative` escapes `base` or a component is a symlink.
+pub fn resolve_under(base: &Path, relative: &str) -> Result<PathBuf> {
+    let path = safe_join(base, relative)?;
+    let mut current = base.to_path_buf();
+    for component in Path::new(relative).components() {
+        if let Component::Normal(component) = component {
+            current.push(component);
+            if fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.is_symlink()) {
+                bail!("managed path `{relative}` contains a symlink");
+            }
+        }
+    }
+    Ok(path)
+}
+
+/// Remove `relative` under `base` (see [`resolve_under`]) unless `dry_run`;
+/// a missing file is not an error. Returns its path.
+///
+/// # Errors
+/// Fails when the path is refused or the file cannot be removed.
+pub fn remove_under(base: &Path, relative: &str, dry_run: bool) -> Result<PathBuf> {
+    let path = resolve_under(base, relative)?;
+    if !dry_run {
+        crate::auth::store::remove_if_exists(&path)?;
+    }
+    Ok(path)
+}
+
+/// Atomically write `contents` to `relative` under `base` with `mode`.
+///
+/// Parent directories are created for nested paths. The path must stay inside
+/// `base` and contain no symlink, so a planted link is never followed.
+/// Nothing is written on a dry run; the path is returned either way.
+///
+/// # Errors
+/// Fails when the path escapes `base` or contains a symlink, or the write
+/// fails.
+pub fn write_under(
+    base: &Path,
+    relative: &str,
+    contents: &[u8],
+    mode: u32,
+    dry_run: bool,
+) -> Result<PathBuf> {
+    let path = resolve_under(base, relative)?;
+    if !dry_run {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create `{}`", parent.display()))?;
+        }
+        crate::auth::store::replace(&path, contents, mode)?;
+    }
+    Ok(path)
+}
+
 /// Render a command and its args as a single space-joined display string.
 /// Used both for dry-run previews and for error messages (`` `foo bar` failed ``).
 #[must_use]
@@ -554,8 +654,12 @@ pub fn command_display<I: IntoIterator<Item = S>, S: std::fmt::Display, P: std::
     program: P,
     args: I,
 ) -> String {
-    let args = (args.into_iter()).map(|arg| Box::new(arg) as Box<dyn std::fmt::Display>);
-    (std::iter::once(Box::new(program) as Box<dyn std::fmt::Display>).chain(args)).join(" ")
+    use std::fmt::Write as _;
+    let mut display = program.to_string();
+    for arg in args {
+        write!(display, " {arg}").expect("writing to a String cannot fail");
+    }
+    display
 }
 
 /// The result of running (or dry-running) a host command. Serialized as JSON
@@ -658,28 +762,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct Payload {
-        name: String,
-    }
-
-    #[test]
-    fn parses_typed_payloads() {
-        let payload: Payload = parse_payload(json!({ "name": "example" })).unwrap();
-        assert_eq!(
-            payload,
-            Payload {
-                name: "example".into()
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_typed_payloads() {
-        let error = parse_payload::<Payload>(json!({ "other": true })).unwrap_err();
-        assert!(error.to_string().contains("invalid command payload"));
-    }
 
     #[derive(Debug, Deserialize, PartialEq)]
     #[serde(rename_all = "snake_case")]

@@ -19,7 +19,10 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{Semaphore, mpsc},
 };
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{
+    accept_async_with_config,
+    tungstenite::{Message, protocol::WebSocketConfig},
+};
 
 use crate::auth::{
     AuthService,
@@ -28,6 +31,20 @@ use crate::auth::{
 };
 
 use super::peer::PeerPolicy;
+
+/// Largest WebSocket message or frame a client may send (file writes
+/// included). Tungstenite's default is 64 MiB, per in-flight request.
+pub(crate) const MAX_MESSAGE_BYTES: usize = 16 << 20;
+
+/// How long a client may take to finish the WebSocket handshake.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Server-side WebSocket limits for Tetra's listeners.
+pub(crate) fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_MESSAGE_BYTES))
+}
 
 /// Requests one connection may have in flight.
 const MAX_IN_FLIGHT: usize = 32;
@@ -80,9 +97,13 @@ impl LocalServer {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let socket = accept_async(stream)
-            .await
-            .context("WebSocket handshake failed")?;
+        let socket = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            accept_async_with_config(stream, Some(websocket_config())),
+        )
+        .await
+        .context("WebSocket handshake timed out")?
+        .context("WebSocket handshake failed")?;
         let (mut sink, mut source) = socket.split();
         let Some(client) = client else {
             let refused = ServerFrame::Error {

@@ -195,9 +195,6 @@ struct SetPolicy {
 }
 
 fn handle(paths: &Paths, action: &str, payload: Value) -> Result<Value> {
-    if let Some(response) = INFO.metadata_response(action, &payload) {
-        return Ok(response);
-    }
     let action: Action = parse_action(action, payload)?;
     let variant = Variant::detect(Path::new(OSTREE_BOOTED));
     let timer_enabled = || unit_enabled(variant.timer());

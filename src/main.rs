@@ -8,22 +8,19 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use kameo::actor::Spawn as _;
 use tokio::sync::watch;
 
 use tetra::{
     agent::{
-        AgentBackend, AgentCommand, backend,
+        AgentCommand, Dispatcher,
         config::{self, RuntimeConfig},
-        crypto::public_key_fingerprint,
-        identity::HostIdentity,
+        identity::{HostIdentity, public_key_fingerprint},
         local_protocol::LocalServer,
         local_socket,
         peer::{self, PeerPolicy},
         queue::{DEFAULT_QUEUE_CAPACITY, DispatchQueue},
         remote,
         transport::TransportConfig,
-        vsock::VsockAgentConfig,
         websocket::WebSocketAgentConfig,
     },
     auth::{
@@ -48,10 +45,10 @@ use tetra::{
 ///   recipe + Tera templates into container unit and companion files. No agent
 ///   backend, no transport.
 /// - **Agent** (`agent-serve`, `agent-dispatch`, `agent-vsock-serve`,
-///   `agent-connect`, `agent-ws-serve`) — the same Kameo-backed dispatcher
+///   `agent-connect`, `agent-ws-serve`) — the same dispatcher
 ///   exposed through different surfaces: the local Unix socket daemon, a
-///   one-shot CLI, a vsock smoke-test listener, an outbound WSS control-plane
-///   connection, and (with the `dev-listener` feature) a development TCP
+///   one-shot CLI, an outbound WSS control-plane connection, and (with the
+///   `dev-listener` feature) a vsock smoke-test listener and a development TCP
 ///   WebSocket listener.
 #[derive(Debug, Parser)]
 #[command(
@@ -72,11 +69,13 @@ enum Commands {
     /// Run the host agent daemon, serving local clients over a Unix socket.
     AgentServe(AgentServeCli),
 
-    /// Dispatch one signed agent command envelope locally.
+    /// Dispatch one agent command envelope from stdin locally, as root and without authorization.
     AgentDispatch(AgentDispatchCli),
 
-    /// Serve the local agent backend over a Linux virtio-vsock listener.
-    AgentVsockServe(VsockAgentConfig),
+    /// Serve the local agent backend over a Linux virtio-vsock listener
+    /// (unauthenticated development smoke test).
+    #[cfg(feature = "dev-listener")]
+    AgentVsockServe(tetra::agent::vsock::VsockAgentConfig),
 
     /// Connect the local agent backend to an outbound WSS control plane.
     AgentConnect(AgentConnectCli),
@@ -351,8 +350,7 @@ struct AgentConnectCli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    // Both rustls providers are compiled in (reqwest pulls in ring), so rustls
-    // cannot pick one itself and would panic on first TLS use.
+    // reqwest is built without its own provider and uses this one.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("a rustls crypto provider was already installed"))?;
@@ -361,6 +359,7 @@ async fn main() -> Result<()> {
         Commands::Render(cli) => render(cli),
         Commands::AgentServe(cli) => Box::pin(agent_serve(cli)).await,
         Commands::AgentDispatch(cli) => agent_dispatch(cli).await,
+        #[cfg(feature = "dev-listener")]
         Commands::AgentVsockServe(cli) => cli.serve(),
         Commands::AgentConnect(cli) => agent_connect(cli).await,
         #[cfg(feature = "dev-listener")]
@@ -448,7 +447,7 @@ fn console_auth(paths: ConsolePaths) -> Result<AuthService> {
         caddy_sites_dir: paths.caddy_sites_dir,
         ..AuthConfig::system(paths.state_dir)
     };
-    let queue = DispatchQueue::spawn(AgentBackend::spawn(config.dispatcher()), 1);
+    let queue = DispatchQueue::spawn(config.dispatcher(), 1);
     system_auth(config, tetra_pam::DEFAULT_SERVICE.into(), queue)
 }
 
@@ -540,10 +539,9 @@ async fn agent_dispatch(cli: AgentDispatchCli) -> Result<()> {
 
     let command: AgentCommand =
         serde_json::from_str(&text).context("failed to parse agent command JSON")?;
-    // Spawn a one-shot backend, dispatch, and print the response. The actor is
-    // dropped when this future completes — no long-lived state survives the
-    // CLI invocation, which is the right behavior for a one-shot dispatch.
-    let response = backend::dispatch_with_default_backend(command).await?;
+    let response = tokio::task::spawn_blocking(move || Dispatcher::full().dispatch(command))
+        .await
+        .context("dispatch failed")?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
@@ -597,14 +595,15 @@ async fn agent_serve(cli: AgentServeCli) -> Result<()> {
     };
     #[cfg(feature = "reverse-proxy")]
     migrate_legacy_proxy_sites();
-    let queue = DispatchQueue::spawn(
-        AgentBackend::spawn(config.dispatcher()),
-        DEFAULT_QUEUE_CAPACITY,
-    );
+    let queue = DispatchQueue::spawn(config.dispatcher(), DEFAULT_QUEUE_CAPACITY);
     let auth = system_auth(config, cli.pam_service, queue.clone())?;
     // Off the serving path: it waits for systemctl.
     let resume = auth.clone();
     tokio::task::spawn_blocking(move || resume.resume_handoff());
+    // A network change a previous run left awaiting confirmation: re-arm its
+    // rollback (or do it now, if overdue) even if no network action follows.
+    #[cfg(feature = "network")]
+    tokio::task::spawn_blocking(tetra::agent::modules::network::recover_pending);
     let audit = auth.audit();
     let server = LocalServer {
         auth: auth.clone(),
@@ -698,7 +697,7 @@ async fn agent_connect(cli: AgentConnectCli) -> Result<()> {
     };
 
     let (sender, settings) = watch::channel(Some(resolve()?));
-    let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), DEFAULT_QUEUE_CAPACITY);
+    let queue = DispatchQueue::spawn(Dispatcher::full(), DEFAULT_QUEUE_CAPACITY);
     let audit = AuditLog::new(action_log::DEFAULT_DIR.into());
     let select = move |config: &RuntimeConfig| {
         config

@@ -32,16 +32,18 @@
 //! 3. Write `<bundle>/app.json`.
 //! 4. Optionally apply the shared `selinux` payload to the bundle directory.
 //! 5. Unless `converge: false`, converge systemd: `daemon-reload`, then
-//!    `enable` + `start` (create) or `restart` (update) each service derived
-//!    from the app's `.container`/`.kube`/`.pod` units. `.network`/`.volume`
+//!    `start` (create) or `restart` (update) each service derived from the
+//!    app's `.container`/`.kube`/`.pod` units. Quadlet services are
+//!    generated, so `systemctl enable` refuses them; their `[Install]`
+//!    section enables them at boot instead. `.network`/`.volume`
 //!    units are not managed directly — Podman pulls them in as dependencies
 //!    of the containers.
 //!
 //! All systemd interaction is delegated to the `services` module and all path
 //! handling reuses the `quadlets` module's scope/traversal-safe helpers, so
-//! every step stays representable as plain module actions. `remove` stops and
-//! disables the app's services, deletes its units, reloads systemd, and
-//! removes the bundle directory; stop/disable failures are tolerated (and
+//! every step stays representable as plain module actions. `remove` stops
+//! the app's services, deletes its units, reloads systemd, and
+//! removes the bundle directory; stop failures are tolerated (and
 //! reported) so removal still cleans up after partial drift. Note that
 //! Podman volumes created by `.volume` units are *not* deleted — app data
 //! survives removal by design.
@@ -51,9 +53,9 @@
 //! rendered resources, target paths, and `systemctl` commands — before
 //! committing.
 
-use serde_yaml::Value as YamlValue;
+use serde_norway::Value as YamlValue;
 
-use crate::agent::module_support::{apply_selinux, safe_join};
+use crate::agent::module_support::{apply_selinux, remove_under, resolve_under, safe_join, write_under};
 use crate::agent::modules::quadlets::{
     QuadletScope, list_companion_files, quadlet_base_dir, quadlet_files_base_dir, validate_quadlet,
 };
@@ -104,17 +106,13 @@ impl Mod for AppsModule {
     }
 
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
-        // Delegate `capabilities`/`plan` to the module descriptor first.
-        if let Some(response) = INFO.metadata_response(action, &payload) {
-            return Ok(response);
-        }
         Action::from_payload(action, payload)?.handle(user)
     }
 }
 
 actions!(Action [payload user] => {
     List: AppListRequest => {
-        let dirs = AppDirs::resolve(payload.base_dir, payload.files_base_dir, payload.scope)?;
+        let dirs = AppDirs::resolve(payload.base_dir, payload.files_base_dir, payload.scope, user)?;
         let mut apps = Vec::new();
         // Directories under the data root whose `app.json` cannot be read are
         // reported by name rather than failing the whole listing — they are
@@ -153,7 +151,7 @@ actions!(Action [payload user] => {
     },
     Get: AppGetRequest => {
         validate_app_name(&payload.name)?;
-        let dirs = AppDirs::resolve(payload.base_dir, payload.files_base_dir, payload.scope)?;
+        let dirs = AppDirs::resolve(payload.base_dir, payload.files_base_dir, payload.scope, user)?;
         let bundle = dirs.bundle(&payload.name)?;
         let manifest = bundle.manifest()?;
         ensure!(
@@ -176,6 +174,9 @@ actions!(Action [payload user] => {
             .filter(|file| file.filename() != APP_MANIFEST)
             .collect::<Vec<_>>();
         let services = manifest.services();
+        // `get` is open to the Apps page; secrets stay with administrators.
+        let mut manifest = manifest;
+        redact_secrets(&mut manifest);
         Ok(jsonf! {
             "app": manifest,
             "base_dir": dirs.base_dir,
@@ -185,7 +186,7 @@ actions!(Action [payload user] => {
     },
     Create: AppCreateRequest => {
         validate_app_name(&payload.name)?;
-        let dirs = AppDirs::resolve(payload.base_dir.clone(), payload.files_base_dir.clone(), payload.scope)?;
+        let dirs = AppDirs::resolve(payload.base_dir.clone(), payload.files_base_dir.clone(), payload.scope, user)?;
         let bundle = dirs.bundle(&payload.name)?;
         ensure!(
             !bundle.exists(),
@@ -199,10 +200,11 @@ actions!(Action [payload user] => {
         let mut values = load_values(payload.values_path.as_ref())?;
         values.extend(payload.values);
         bundle.inject_dir(&mut values);
-        let (recipe, resources) = source.render(&values)?;
+        let (recipe, resources) = source.render(&mut values)?;
 
         let outcome = bundle.install(&resources, None, payload.dry_run)?;
         let now = epoch_secs();
+        let secret_keys = recipe.secret_keys().map(str::to_owned).collect();
         let manifest = AppManifest {
             version: MANIFEST_VERSION,
             name: payload.name,
@@ -211,6 +213,7 @@ actions!(Action [payload user] => {
             recipe_version: recipe.version,
             recipe: source,
             values,
+            secret_keys,
             units: outcome.units.clone(),
             files: outcome.files.clone(),
             created_at: now,
@@ -237,7 +240,7 @@ actions!(Action [payload user] => {
     },
     Update: AppUpdateRequest => {
         validate_app_name(&payload.name)?;
-        let dirs = AppDirs::resolve(payload.base_dir.clone(), payload.files_base_dir.clone(), payload.scope)?;
+        let dirs = AppDirs::resolve(payload.base_dir.clone(), payload.files_base_dir.clone(), payload.scope, user)?;
         let bundle = dirs.bundle(&payload.name)?;
         let mut manifest = bundle.manifest()?;
         ensure!(
@@ -251,9 +254,18 @@ actions!(Action [payload user] => {
         if let Some(source) = payload.recipe_source()? {
             manifest.recipe = source;
         }
-        manifest.values.extend(payload.values);
+        // `get` shows secrets as `REDACTED`; sent back unchanged, they keep
+        // the stored value instead of replacing it.
+        let is_secret = secrets(&manifest);
+        let incoming: Vec<_> = payload
+            .values
+            .into_iter()
+            .filter(|(key, value)| !(value.as_str() == Some(REDACTED) && is_secret(key)))
+            .collect();
+        manifest.values.extend(incoming);
         bundle.inject_dir(&mut manifest.values);
-        let (recipe, resources) = manifest.recipe.render(&manifest.values)?;
+        let (recipe, resources) = manifest.recipe.render(&mut manifest.values)?;
+        manifest.secret_keys.extend(recipe.secret_keys().map(str::to_owned));
         manifest.recipe_id = recipe.recipe_id;
         manifest.recipe_version = recipe.version;
 
@@ -283,7 +295,7 @@ actions!(Action [payload user] => {
     },
     Remove: AppRequest => {
         validate_app_name(&payload.name)?;
-        let dirs = AppDirs::resolve(payload.base_dir, payload.files_base_dir, payload.scope)?;
+        let dirs = AppDirs::resolve(payload.base_dir, payload.files_base_dir, payload.scope, user)?;
         let bundle = dirs.bundle(&payload.name)?;
         let manifest = bundle.manifest()?;
         ensure!(
@@ -293,7 +305,7 @@ actions!(Action [payload user] => {
         );
         let services = manifest.services();
 
-        // Stop/disable before deleting anything so systemd can still resolve
+        // Stop before deleting anything so systemd can still resolve
         // the units.
         let phase = Systemd::new(payload.scope, payload.dry_run, user);
         let mut systemd = if payload.converge {
@@ -348,22 +360,22 @@ impl AppDirs {
         base_dir: Option<PathBuf>,
         files_base_dir: Option<PathBuf>,
         scope: ServiceScope,
+        user: Option<&str>,
     ) -> Result<Self> {
         let scope = match scope {
             ServiceScope::System => QuadletScope::System,
             ServiceScope::User => QuadletScope::User,
         };
         Ok(Self {
-            base_dir: quadlet_base_dir(base_dir, scope)?,
-            files_root: quadlet_files_base_dir(files_base_dir, scope, None)?,
+            base_dir: quadlet_base_dir(base_dir, scope, user)?,
+            files_root: quadlet_files_base_dir(files_base_dir, scope, None, user)?,
         })
     }
 
     /// Address an app's bundle directory inside the data root. `safe_join`
     /// keeps names with traversal components from escaping the root.
     fn bundle(&self, name: &str) -> Result<AppBundle> {
-        let dir = safe_join(&self.files_root, name)?;
-        reject_symlink_path(&self.files_root, name)?;
+        let dir = resolve_under(&self.files_root, name)?;
         Ok(AppBundle {
             base_dir: self.base_dir.clone(),
             dir,
@@ -385,49 +397,12 @@ fn validate_app_unit_filename(filename: &str) -> Result<()> {
     Ok(())
 }
 
-fn reject_symlink_path(base: &Path, relative: &str) -> Result<()> {
-    let path = Path::new(relative);
-    ensure!(
-        path.is_relative()
-            && !path.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
-                )
-            }),
-        "managed path `{relative}` must be relative and stay within its base"
-    );
-
-    let mut current = base.to_path_buf();
-    for component in path.components() {
-        if let std::path::Component::Normal(component) = component {
-            current.push(component);
-            if let Ok(metadata) = fs::symlink_metadata(&current) {
-                ensure!(
-                    !metadata.file_type().is_symlink(),
-                    "managed path `{relative}` contains a symlink"
-                );
-            }
-        }
-    }
-    Ok(())
-}
 
 fn validate_companion_filename(filename: &str) -> Result<()> {
-    let path = Path::new(filename);
     ensure!(
-        !filename.is_empty()
-            && filename != "."
-            && !filename.ends_with('/')
+        !filename.ends_with('/')
             && !filename.ends_with("/.")
-            && path.is_relative()
-            && path.file_name().is_some()
-            && !path.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
-                )
-            }),
+            && safe_join(Path::new(""), filename).is_ok_and(|path| path.file_name().is_some()),
         "companion filename `{filename}` must identify a relative file path"
     );
     Ok(())
@@ -450,7 +425,6 @@ fn validate_manifest_paths(manifest: &AppManifest) -> Result<()> {
             "app manifest cannot own reserved file `{APP_MANIFEST}`"
         );
         validate_companion_filename(file)?;
-        safe_join(Path::new("."), file)?;
         ensure!(
             files.insert(file.as_str()),
             "duplicate file `{file}` in app manifest"
@@ -501,8 +475,7 @@ impl AppBundle {
 
     /// Read and parse `<dir>/app.json`.
     fn manifest(&self) -> Result<AppManifest> {
-        reject_symlink_path(&self.dir, APP_MANIFEST)?;
-        let path = self.dir.join(APP_MANIFEST);
+        let path = resolve_under(&self.dir, APP_MANIFEST)?;
         let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read app manifest `{}`", path.display()))?;
         let manifest: AppManifest = serde_json::from_str(&text)
@@ -520,13 +493,12 @@ impl AppBundle {
     /// Serialize the manifest into the bundle. Skipped on dry runs; returns
     /// the target path either way so previews show where it would land.
     fn write_manifest(&self, manifest: &AppManifest, dry_run: bool) -> Result<PathBuf> {
-        reject_symlink_path(&self.dir, APP_MANIFEST)?;
-        let path = self.dir.join(APP_MANIFEST);
+        let path = resolve_under(&self.dir, APP_MANIFEST)?;
         if !dry_run {
-            let contents = serde_json::to_string_pretty(manifest)
+            let contents = serde_json::to_vec_pretty(manifest)
                 .context("failed to serialize app manifest")?;
-            fs::write(&path, contents)
-                .with_context(|| format!("failed to write `{}`", path.display()))?;
+            // Holds the app's values, secrets included.
+            crate::auth::store::replace(&path, &contents, PRIVATE_MODE)?;
         }
         Ok(path)
     }
@@ -572,15 +544,13 @@ impl AppBundle {
                 "duplicate companion filename `{}` in rendered app",
                 companion.filename
             );
-            safe_join(&self.dir, &companion.filename)?;
         }
 
         let previous_units: HashSet<&str> = previous
             .map(|manifest| manifest.units.iter().map(String::as_str).collect())
             .unwrap_or_default();
         for unit in &units {
-            reject_symlink_path(&self.base_dir, &unit.filename)?;
-            let path = safe_join(&self.base_dir, &unit.filename)?;
+            let path = resolve_under(&self.base_dir, &unit.filename)?;
             if path.exists() && !previous_units.contains(unit.filename.as_str()) {
                 bail!(
                     "Quadlet unit `{}` already exists and is not owned by this app",
@@ -604,12 +574,7 @@ impl AppBundle {
                 if desired_units.contains(unit.as_str()) {
                     continue;
                 }
-                reject_symlink_path(&self.base_dir, unit)?;
-                let path = safe_join(&self.base_dir, unit)?;
-                if !dry_run && path.exists() {
-                    fs::remove_file(&path)
-                        .with_context(|| format!("failed to delete `{}`", path.display()))?;
-                }
+                remove_under(&self.base_dir, unit, dry_run)?;
                 outcome.removed_units.push(unit.clone());
             }
             let desired_files: HashSet<&str> = companions
@@ -620,24 +585,19 @@ impl AppBundle {
                 if desired_files.contains(file.as_str()) {
                     continue;
                 }
-                reject_symlink_path(&self.dir, file)?;
-                let path = safe_join(&self.dir, file)?;
-                if !dry_run && path.exists() {
-                    fs::remove_file(&path)
-                        .with_context(|| format!("failed to delete `{}`", path.display()))?;
-                }
+                remove_under(&self.dir, file, dry_run)?;
                 outcome.removed_files.push(file.clone());
             }
         }
 
         for unit in units {
-            reject_symlink_path(&self.base_dir, &unit.filename)?;
-            write_file(&self.base_dir, &unit.filename, &unit.contents, dry_run)?;
+            // Units can carry secrets (`Environment=MYSQL_PASSWORD=...`).
+            write_under(&self.base_dir, &unit.filename, unit.contents.as_bytes(), unit.kind.mode(), dry_run)?;
             outcome.units.push(unit.filename.clone());
         }
         for companion in companions {
-            reject_symlink_path(&self.dir, &companion.filename)?;
-            write_file(&self.dir, &companion.filename, &companion.contents, dry_run)?;
+            // Containers read companions through bind mounts.
+            write_under(&self.dir, &companion.filename, companion.contents.as_bytes(), companion.kind.mode(), dry_run)?;
             outcome.files.push(companion.filename.clone());
         }
         Ok(outcome)
@@ -646,17 +606,10 @@ impl AppBundle {
     /// Delete the app's Quadlet units from the scan directory, returning the
     /// affected paths (deleted, or that would be on a dry run).
     fn delete_units(&self, units: &[String], dry_run: bool) -> Result<Vec<PathBuf>> {
-        let mut deleted = Vec::new();
-        for unit in units {
-            reject_symlink_path(&self.base_dir, unit)?;
-            let path = safe_join(&self.base_dir, unit)?;
-            if !dry_run && path.exists() {
-                fs::remove_file(&path)
-                    .with_context(|| format!("failed to delete `{}`", path.display()))?;
-            }
-            deleted.push(path);
-        }
-        Ok(deleted)
+        units
+            .iter()
+            .map(|unit| remove_under(&self.base_dir, unit, dry_run))
+            .collect()
     }
 
     /// Remove the bundle directory and everything in it.
@@ -691,20 +644,46 @@ impl AppBundle {
     }
 }
 
-/// Write one file under `base_dir`, creating parent directories for nested
-/// companion paths. `safe_join` keeps rendered filenames inside the base.
-/// Serves [`AppBundle::install`].
-fn write_file(base_dir: &Path, filename: &str, contents: &str, dry_run: bool) -> Result<PathBuf> {
-    let path = safe_join(base_dir, filename)?;
-    if !dry_run {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create `{}`", parent.display()))?;
-        }
-        fs::write(&path, contents)
-            .with_context(|| format!("failed to write `{}`", path.display()))?;
+/// Mode of `app.json`, which holds the app's values (secrets included).
+const PRIVATE_MODE: u32 = 0o600;
+
+/// What `get` shows in place of a secret.
+const REDACTED: &str = "********";
+
+/// Whether a key holds a secret: it was a `Secret` parameter at some
+/// render, is one in the current recipe, or the recipe cannot be read.
+fn secrets(manifest: &AppManifest) -> impl Fn(&str) -> bool + use<> {
+    let current: Option<std::collections::BTreeSet<String>> = manifest
+        .recipe
+        .load()
+        .ok()
+        .map(|recipe| recipe.secret_keys().map(str::to_owned).collect());
+    let stored = manifest.secret_keys.clone();
+    move |key| {
+        stored.contains(key) || current.as_ref().is_none_or(|current| current.contains(key))
     }
-    Ok(path)
+}
+
+/// Hide secrets in a manifest shown to the Apps page: the values of secret
+/// parameters, and an inline recipe that spells out a secret's default.
+fn redact_secrets(manifest: &mut AppManifest) {
+    let is_secret = secrets(manifest);
+    for (key, value) in &mut manifest.values {
+        if is_secret(key) {
+            *value = YamlValue::String(REDACTED.to_owned());
+        }
+    }
+    if let crate::types::AppRecipeSource::Inline { recipe, .. } = &mut manifest.recipe {
+        let secret_default = crate::catalog::AppRecipe::load_str(recipe).map_or(true, |parsed| {
+            parsed
+                .parameters
+                .iter()
+                .any(|p| p.kind == crate::catalog::ParameterKind::Secret && p.default.is_some())
+        });
+        if secret_default {
+            REDACTED.clone_into(recipe);
+        }
+    }
 }
 
 /// Adapter that drives the systemd phase of the app lifecycle through the
@@ -750,33 +729,31 @@ impl<'a> Systemd<'a> {
         )
     }
 
-    /// The create/update phase: reload, then enable and start (or restart,
-    /// on update) each app service.
+    /// The create/update phase: reload, then start (or restart, on update)
+    /// each app service. No `enable`: systemd refuses it for generated
+    /// units ("Unit ... is transient or generated"); the generator applies
+    /// the unit's `[Install]` section on every reload instead.
     fn converge(self, services: &[String], service_action: &str) -> Result<Vec<Value>> {
         let mut ops = vec![self.daemon_reload()?];
         for service in services {
-            ops.push(self.service_action("enable", service)?);
             ops.push(self.service_action(service_action, service)?);
         }
         Ok(ops)
     }
 
-    /// The remove phase: stop and disable each service before its unit is
-    /// deleted. Failures are reported inline but tolerated: the unit may
-    /// already be gone, and removal should still clean up the bundle.
+    /// The remove phase: stop each service before its unit is deleted
+    /// (deleting the unit and reloading drops its `[Install]` links).
+    /// Failures are reported inline but tolerated: the unit may already be
+    /// gone, and removal should still clean up the bundle.
     fn teardown(self, services: &[String]) -> Vec<Value> {
-        let mut ops = Vec::new();
-        for service in services {
-            for action in ["stop", "disable"] {
-                match self.service_action(action, service) {
-                    Ok(op) => ops.push(op),
-                    Err(error) => ops.push(jsonf! {
-                        action, service, "error": error.to_string(),
-                    }),
-                }
-            }
-        }
-        ops
+        services
+            .iter()
+            .map(|service| {
+                self.service_action("stop", service).unwrap_or_else(|error| {
+                    jsonf! { "action": "stop", service, "error": error.to_string() }
+                })
+            })
+            .collect()
     }
 }
 
@@ -1059,7 +1036,6 @@ resources:
             commands,
             [
                 "systemctl daemon-reload",
-                "systemctl enable demo-web.service",
                 "systemctl start demo-web.service",
             ]
         );
@@ -1295,6 +1271,108 @@ resources:
     }
 
     #[test]
+    fn generated_secrets_survive_updates_and_stay_private() {
+        let base = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let recipe = DEMO_RECIPE.replace(
+            "resources:",
+            "  - key: db_password\n    label: Database password\n    type: secret\n    generate: random_32\nresources:",
+        );
+        let mut templates = demo_templates();
+        templates["containers/demo.container.tera"] = json!(
+            "[Container]\nImage=example/demo:latest\nEnvironment=PW={{ db_password }}\n"
+        );
+        let mut create = create_payload(base.path(), files.path());
+        create["recipe"] = json!(recipe);
+        create["templates"] = templates;
+        let created = dispatch("create", create).unwrap();
+        let password = created["app"]["values"]["db_password"].as_str().unwrap().to_owned();
+        assert_eq!(password.len(), 32);
+
+        let unit = base.path().join("demo-web.container");
+        let read = || fs::read_to_string(&unit).unwrap();
+        assert!(read().contains(&password));
+        let update = json!({
+            "name": "demo",
+            "base_dir": base.path(),
+            "files_base_dir": files.path(),
+            "converge": false,
+        });
+        dispatch("update", update).unwrap();
+        assert!(read().contains(&password), "the secret was regenerated");
+
+        let mode = |path: &Path| {
+            use std::os::unix::fs::PermissionsExt;
+            fs::metadata(path).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode(&unit), 0o600);
+        assert_eq!(mode(&files.path().join("demo/app.json")), 0o600);
+        assert_eq!(mode(&files.path().join("demo/site/index.html")), 0o644);
+
+        let got = dispatch(
+            "get",
+            json!({ "name": "demo", "base_dir": base.path(), "files_base_dir": files.path() }),
+        )
+        .unwrap();
+        assert_eq!(got["app"]["values"]["db_password"], "********");
+        assert_eq!(got["app"]["values"]["app_id"], "demo-web");
+
+        // Sending `get`'s values back keeps the secret.
+        let mut update = json!({
+            "name": "demo",
+            "base_dir": base.path(),
+            "files_base_dir": files.path(),
+            "converge": false,
+        });
+        update["values"] = got["app"]["values"].clone();
+        update["values"]["bundle_dir"] = json!(files.path().join("demo"));
+        dispatch("update", update).unwrap();
+        assert!(read().contains(&password), "the secret became the placeholder");
+    }
+
+    #[test]
+    fn get_keeps_secrets_hidden_even_after_the_recipe_declassifies_them() {
+        let base = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let secret = DEMO_RECIPE.replace(
+            "resources:",
+            "  - key: token\n    label: Token\n    type: secret\n    default: hunter3\nresources:",
+        );
+        let mut create = create_payload(base.path(), files.path());
+        create["recipe"] = json!(secret);
+        create["values"]["token"] = json!("hunter2");
+        dispatch("create", create).unwrap();
+        let get = || {
+            dispatch(
+                "get",
+                json!({ "name": "demo", "base_dir": base.path(), "files_base_dir": files.path() }),
+            )
+            .unwrap()
+        };
+        let shown = get();
+        assert_eq!(shown["app"]["values"]["token"], "********");
+        assert!(!shown.to_string().contains("hunter2"));
+        assert!(!shown.to_string().contains("hunter3"), "the recipe's secret default");
+
+        // A later recipe calls it a plain string; the stored value stays hidden.
+        dispatch(
+            "update",
+            json!({
+                "name": "demo",
+                "base_dir": base.path(),
+                "files_base_dir": files.path(),
+                "recipe": secret.replace("type: secret\n    default: hunter3", "type: string"),
+                "templates": demo_templates(),
+                "converge": false,
+            }),
+        )
+        .unwrap();
+        let shown = get();
+        assert_eq!(shown["app"]["values"]["token"], "********");
+        assert!(!shown.to_string().contains("hunter2"));
+    }
+
+    #[test]
     fn remove_deletes_units_and_bundle() {
         let base = tempfile::tempdir().unwrap();
         let files = tempfile::tempdir().unwrap();
@@ -1356,7 +1434,6 @@ resources:
             commands,
             [
                 "systemctl stop demo-web.service",
-                "systemctl disable demo-web.service",
                 "systemctl daemon-reload",
             ]
         );

@@ -1,8 +1,7 @@
-pub use crate::agent::crypto::verify_command_signature;
 pub use crate::agent::module_support::{ModuleInfo, ModuleStatus};
 pub use crate::agent::modules::{Act, Mod};
-pub use crate::agent::{AgentBackend, AgentCommand, AgentResponse, DispatchCommand};
-pub use crate::{actions, cmd, flag, jsonf};
+pub use crate::agent::{AgentCommand, AgentResponse};
+pub use crate::{actions, cmd, jsonf};
 pub use anyhow::{Context, Result, bail, ensure};
 pub use itertools::Itertools;
 
