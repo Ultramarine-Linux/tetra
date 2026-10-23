@@ -56,7 +56,9 @@ const INFO: ModuleInfo = ModuleInfo {
         "context",
         "context_inline",
     ],
-    privileged_actions: &[],
+    // `render` writes its output when given an `output_dir`, so it runs
+    // once, as root, never twice under `run_as: both`.
+    privileged_actions: &["render"],
 };
 
 impl Mod for RecipesModule {
@@ -149,4 +151,17 @@ fn bundle_dir(recipe: &AppRecipe, values: &BTreeMap<String, YamlValue>) -> Optio
         .ok()?
         .as_str()
         .map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_writes_so_it_is_privileged() {
+        assert!(INFO.is_privileged("render"));
+        for action in ["render_inline", "context", "context_inline"] {
+            assert!(!INFO.is_privileged(action), "{action}");
+        }
+    }
 }

@@ -567,7 +567,7 @@ Feature: `recipes`
 
 Actions:
 
-- `render`
+- `render` (privileged: it writes `output_dir`, so `run_as: both` is refused)
 - `render_inline`
 - `context`
 - `context_inline`
