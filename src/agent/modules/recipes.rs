@@ -16,9 +16,11 @@
 //!   version, as long as the recipe schema is one the agent understands.
 
 use serde_norway::Value as YamlValue;
+use crate::agent::module_support::write_under;
 
 use crate::{
-    catalog::{AppRecipe, RenderOptions, RenderedResource},
+    catalog::{AppRecipe, load_values, verification::{RecipeSource, verify_images}},
+    types::AppRecipeSource,
     prelude::*,
 };
 
@@ -62,34 +64,50 @@ actions!(Action [payload user] => {
     Render {
         recipe_path: PathBuf,
         templates_dir: PathBuf,
+        source: Option<RecipeSource>,
+        #[serde(default)]
+        allow_unpinned_images: bool,
         values_path: Option<PathBuf>,
         output_dir: Option<PathBuf>,
         #[serde(default)]
         dry_run: bool,
     } => {
-        let resources = RenderedResource::from_files(&RenderOptions {
+        let bundle = AppRecipeSource::File {
             recipe_path: payload.recipe_path,
-            values_path: payload.values_path,
             templates_dir: payload.templates_dir,
-            output_dir: payload.output_dir,
-            dry_run: payload.dry_run,
-        })?;
-        Ok(jsonf! { resources })
+        }.snapshot()?;
+        let source = bundle.verify(payload.source.as_ref(), payload.allow_unpinned_images)?;
+        let mut values = load_values(payload.values_path.as_ref())?;
+        let (_, resources) = bundle.render(&mut values)?;
+        verify_images(&resources, payload.allow_unpinned_images)?;
+        if let Some(output_dir) = payload.output_dir {
+            for resource in &resources {
+                write_under(&output_dir, &resource.filename, resource.contents.as_bytes(),
+                    resource.kind.mode(), payload.dry_run)?;
+            }
+        }
+        Ok(jsonf! { resources, source })
     },
     RenderInline {
         recipe: String,
+        source: Option<RecipeSource>,
+        #[serde(default)]
+        allow_unpinned_images: bool,
         #[serde(default)]
         templates: BTreeMap<String, String>,
         #[serde(default)]
         values: BTreeMap<String, YamlValue>,
     } => {
+        let source = crate::catalog::verification::verify_source(&payload.recipe, &payload.templates,
+            payload.source.as_ref(), payload.allow_unpinned_images)?;
         let recipe = AppRecipe::load_str(&payload.recipe)?;
         let resources =
             recipe.render_with_templates(&payload.values, &payload.templates)?;
+        verify_images(&resources, payload.allow_unpinned_images)?;
         // Echo the parsed recipe alongside the rendered resources so
         // the dashboard can display normalized metadata (id, version,
         // parameters) without re-parsing the YAML it just sent.
-        Ok(jsonf! { recipe, resources })
+        Ok(jsonf! { recipe, resources, source })
     },
     Context {
         recipe_path: PathBuf,

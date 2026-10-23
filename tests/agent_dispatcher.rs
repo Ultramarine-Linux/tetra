@@ -317,7 +317,7 @@ resources:
     template: files/index.html.tera
 "#,
             "templates": {
-                "containers/nginx.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=docker.io/library/nginx:alpine\n",
+                "containers/nginx.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=docker.io/library/nginx:alpine@sha256:a3554c0d0b48177b1413c26e01f695334428020d9df01243fbae3e11cfd17417\n",
                 "files/index.html.tera": "<h1>{{ app_id }}</h1>\n",
             },
             "values": { "app_id": "demo-web" },
@@ -386,7 +386,7 @@ fn apps_create_dry_run_previews_systemd_commands() {
             "dry_run": true,
             "recipe": "recipe_id: nginx-site\nname: Nginx static site\nversion: 0.1.0\nparameters:\n  - key: app_id\n    label: App ID\n    type: string\n    default: demo-web\nresources:\n  - type: container\n    filename: \"{{ app_id }}.container\"\n    template: containers/nginx.container.tera\n",
             "templates": {
-                "containers/nginx.container.tera": "[Container]\nContainerName={{ app_id }}\n",
+                "containers/nginx.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=example/demo@sha256:1111111111111111111111111111111111111111111111111111111111111111\n",
             },
             "values": { "app_id": "demo-web" },
         }),
@@ -501,7 +501,7 @@ resources:
     template: containers/nginx.container.tera
 "#,
             "templates": {
-                "containers/nginx.container.tera": "[Container]\nContainerName={{ app_id }}\n"
+                "containers/nginx.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=example/demo@sha256:1111111111111111111111111111111111111111111111111111111111111111\n"
             }
         }),
     );
@@ -513,6 +513,6 @@ resources:
     assert_eq!(resources[0]["filename"], "demo-web.container");
     assert_eq!(
         resources[0]["contents"],
-        "[Container]\nContainerName=demo-web\n"
+        "[Container]\nContainerName=demo-web\nImage=example/demo@sha256:1111111111111111111111111111111111111111111111111111111111111111\n"
     );
 }

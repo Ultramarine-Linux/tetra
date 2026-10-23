@@ -17,6 +17,8 @@
 //! action that accepts a template bundle fetched from a remote catalog, so new
 //! recipes can be published without shipping a new Tetra build.
 
+pub mod verification;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -270,6 +272,7 @@ pub struct Resource {
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
     Container,
+    Image,
     Network,
     Volume,
     Pod,
@@ -287,6 +290,7 @@ impl ResourceKind {
     pub const fn ext(&self) -> &'static str {
         match self {
             Self::Container => ".container",
+            Self::Image => ".image",
             Self::Network => ".network",
             Self::Volume => ".volume",
             Self::Pod => ".pod",

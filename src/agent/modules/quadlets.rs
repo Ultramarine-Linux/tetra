@@ -76,7 +76,7 @@ const INFO: ModuleInfo = ModuleInfo {
 
 /// File extensions Podman recognizes as Quadlet units. Used both to validate
 /// incoming filenames and to classify listed files as Quadlet vs companion.
-const QUADLET_EXTENSIONS: &[&str] = &["container", "kube", "network", "pod", "volume"];
+const QUADLET_EXTENSIONS: &[&str] = &["container", "image", "kube", "network", "pod", "volume"];
 
 /// A single file within an `install` payload. The same shape is reused for
 /// both Quadlet `resources` and companion `files`; the surrounding payload
@@ -552,7 +552,7 @@ pub(crate) fn validate_quadlet(filename: &str, contents: &str) -> Result<()> {
     if !contents.lines().any(|line| {
         matches!(
             line.trim(),
-            "[Container]" | "[Kube]" | "[Network]" | "[Pod]" | "[Volume]"
+            "[Container]" | "[Image]" | "[Kube]" | "[Network]" | "[Pod]" | "[Volume]"
         )
     }) {
         bail!("Quadlet contents must include a Quadlet section");

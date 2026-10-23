@@ -132,6 +132,7 @@ Resources are the files Tetra produces from a recipe. Each resource declares a
 | `type` | Output extension | Typical use |
 |--------|------------------|-------------|
 | `container` | `.container` | Podman container Quadlet unit. |
+| `image` | `.image` | Digest-pinned image pull Quadlet unit. |
 | `network` | `.network` | Podman network Quadlet unit. |
 | `volume` | `.volume` | Podman volume Quadlet unit. |
 | `pod` | `.pod` | Podman pod Quadlet unit. |
@@ -208,7 +209,7 @@ After={{ app_id }}-redis.service
 
 [Container]
 ContainerName={{ app_id }}-app
-Image=docker.io/library/nextcloud:latest
+Image=docker.io/library/nextcloud:latest@sha256:301e07b7f661c122752cc2c01b76f15036a156f2b6d794c76621b7d0a6bb8a50
 Network={{ app_id }}-net.network
 {% if trusted_proxies %}Environment=TRUSTED_PROXIES={{ trusted_proxies }}
 {% endif %}
@@ -284,6 +285,73 @@ agent `recipes.render_inline` and `recipes.context_inline` actions (and
 
 This lets a remote catalog publish new recipes without updating Tetra, as long
 as the recipe schema is one the agent understands.
+
+## Install-time source verification and image pinning
+
+`apps.create/update` and `recipes.render/render_inline` accept
+`source: {catalog: "official"|"community"|"custom", url?, sha256}` and
+`allow_unpinned_images` (default false). `sha256` is 64 hex characters without a
+prefix. Supplied digests must match even for custom recipes. Omitted source means
+custom, **not** permission to use mutable tags. Official/community opt-out is an
+error. Verification happens before output/install writes, even in dry runs.
+Context-only actions and the CLI pure renderer do not enforce this install policy.
+Tetra never fetches catalogs, recipe URLs, or registry metadata.
+
+### Canonical bundle digest (v1)
+
+SHA-256 covers this byte stream:
+
+1. ASCII `tetra-recipe-bundle-v1` followed by one NUL byte.
+2. Recipe byte length (unsigned 64-bit big-endian), then exact UTF-8 recipe bytes.
+3. Template count (unsigned 64-bit big-endian).
+4. Templates in ascending UTF-8 name byte order: name byte length (u64 BE), exact
+   name bytes, body byte length (u64 BE), exact body bytes.
+
+No YAML reserialization, newline conversion, whitespace trimming, or Unicode
+normalization. Values, catalog classification, and URL are excluded. Inline
+bundles include **all** supplied templates, even unused entries. Disk bundles
+include unique `resources[].template` names, including conditional resources;
+paths must resolve under `templates_dir` without symlinks. Unreferenced disk files
+are excluded. Disk recipes/templates are snapshotted once; verification and
+rendering use the same bytes. Apps store that inline snapshot, so later updates
+never silently follow disk edits. Rust callers can use
+`catalog::verification::bundle_sha256` to compute the digest.
+
+This verifies integrity against the caller's expected digest, **not** publisher
+identity: official/community are caller-supplied claims. The dashboard must
+obtain the expected digest through a trusted catalog channel. `url` is audit
+metadata, not a fetching instruction or signature.
+
+### Rendered image policy
+
+Every `Image=` in container/image/image-backed-volume units must end in
+`@sha256:<64 hex>`. Repeated directives and systemd continuations are checked.
+`.image` is also available as recipe resource type `image`. `ImageTag=` aliases
+are not image pulls; consumers must still use a digest. References such as
+`Image=foo.image` or `foo.build` are refused; use registry digests directly.
+Container/image units must have an Image directive.
+
+Kube units require `Yaml=` naming a relative companion resource in the bundle.
+All YAML documents are parsed and every `image` key is checked, including
+containers, initContainers, and ephemeralContainers. External YAML paths/URLs
+are refused. Raw `PodmanArgs`/`GlobalArgs`, image mounts, build units, and pod
+units (implicit infra-image pulls) are unsupported by the pinned policy and
+require the explicit custom-only opt-out. This is an image policy, not a sandbox
+for arbitrary host configuration in administrator-supplied recipes.
+See [Quadlet documentation](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html).
+
+Bundled nginx:alpine, mariadb:11, nextcloud:latest, and redis:7-alpine use
+multi-platform index digests retrieved using `skopeo inspect --raw` on
+2026-10-23. Tags are retained for humans; Podman accepts `tag@digest` and pulls
+the digest (verified with `podman pull` for bundled nginx). Refresh these pins
+deliberately when updating templates; installation never resolves tags.
+
+`AppManifest.source` stores verified provenance with the computed lowercase
+digest; `allow_unpinned_images` records the policy. Old manifests load with no
+source and pinning enabled. On update, omitted fields retain existing provenance
+and policy when reusing the recipe. A replacement recipe without source becomes
+custom and resets the opt-out to false unless explicitly requested. Every update
+rechecks the stored/replacement bundle and newly rendered images.
 
 ## Packaging notes
 

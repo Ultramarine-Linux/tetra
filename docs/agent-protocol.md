@@ -571,6 +571,15 @@ Actions:
 - `context`
 - `context_inline`
 
+`render` and `render_inline` accept `source: {catalog: "official"|"community"|"custom",
+url?, sha256}` and `allow_unpinned_images: false`. The digest covers exact recipe
+and template bytes using the [canonical v1 algorithm](recipes.md#canonical-bundle-digest-v1).
+Omitted source means custom with pinning enforced. Only custom may explicitly
+opt out; official/community opt-out and any digest mismatch are errors before
+writes, including dry runs. Responses include verified `source` metadata and
+the computed digest. Context actions are unchanged. No catalog fetching occurs.
+See [image policy and limitations](recipes.md#rendered-image-policy).
+
 `render` payload:
 
 ```json
@@ -603,7 +612,7 @@ Response payload:
 ```
 
 Recipe resource kinds include Quadlet resources (`container`, `network`,
-`volume`, `pod`, `kube`) and `file` companion resources. Companion file
+`volume`, `image`, `pod`, `kube`) and `file` companion resources. Companion file
 resources are intended to be installed through `quadlets.install.files`, under
 the mutable companion-file bundle directory.
 
@@ -613,7 +622,7 @@ the mutable companion-file bundle directory.
 {
   "recipe": "recipe_id: nginx-site\nname: Nginx static site\nversion: 0.1.0\n...",
   "templates": {
-    "containers/nginx-site.container.tera": "[Container]\nContainerName={{ app_id }}\n"
+    "containers/nginx-site.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=docker.io/library/nginx:alpine@sha256:a3554c0d0b48177b1413c26e01f695334428020d9df01243fbae3e11cfd17417\n"
   },
   "values": {
     "app_id": "demo-web"
@@ -621,7 +630,7 @@ the mutable companion-file bundle directory.
 }
 ```
 
-The response holds the parsed `recipe` and the rendered `resources`.
+The response holds the parsed `recipe`, rendered `resources`, and verified `source`.
 `render_inline` writes nothing.
 
 This action is intended for recipe bundles fetched from a remote catalog by a
@@ -882,6 +891,16 @@ Actions:
 - `update` (privileged)
 - `remove` (privileged)
 
+`create`/`update` also accept `source: {catalog: "official"|"community"|"custom",
+url?, sha256}` and `allow_unpinned_images`. Pinning is enabled by default; only
+custom may explicitly opt out. Supplied source digests are always checked before
+install writes. Missing source on create/replacement means custom. On update
+without a replacement recipe, omitted source and opt-out retain the manifest
+policy; replacement resets policy unless explicitly supplied. The manifest
+records verified `source` (including computed digest) and `allow_unpinned_images`,
+and disk recipes are stored as inline snapshots. Old manifests deserialize with
+no source and pinning enabled. See [verification algorithm and image policy](recipes.md#install-time-source-verification-and-image-pinning).
+
 App names may contain letters, digits, `.`, `_`, and `-`, and must not start
 with `.` or `-`.
 
@@ -893,7 +912,7 @@ with `.` or `-`.
   "scope": "apps",
   "recipe": "id: nginx-site\n...",
   "templates": {
-    "app.container": "[Container]\nImage=docker.io/nginx:alpine\n"
+    "app.container": "[Container]\nImage=docker.io/library/nginx:alpine@sha256:a3554c0d0b48177b1413c26e01f695334428020d9df01243fbae3e11cfd17417\n"
   },
   "values": {
     "app_id": "my-site"

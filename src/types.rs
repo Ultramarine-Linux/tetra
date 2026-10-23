@@ -576,6 +576,43 @@ pub enum AppRecipeSource {
 }
 
 impl AppRecipeSource {
+    /// Snapshot disk bytes once, including all resource templates (even conditional
+    /// ones), so verification and rendering cannot observe different versions.
+    /// Inline bundles retain every supplied template, including unused entries.
+    pub fn snapshot(&self) -> Result<Self> {
+        match self {
+            Self::Inline { .. } => Ok(self.clone()),
+            Self::File {
+                recipe_path,
+                templates_dir,
+            } => {
+                let recipe = std::fs::read_to_string(recipe_path)?;
+                let parsed = AppRecipe::load_str(&recipe)?;
+                let mut templates = BTreeMap::new();
+                for resource in parsed.resources {
+                    let path = crate::agent::module_support::resolve_under(
+                        templates_dir,
+                        &resource.template,
+                    )?;
+                    templates.insert(resource.template, std::fs::read_to_string(path)?);
+                }
+                Ok(Self::Inline { recipe, templates })
+            }
+        }
+    }
+
+    /// Verify the exact snapshot and return provenance for the manifest.
+    pub fn verify(
+        &self,
+        source: Option<&crate::catalog::verification::RecipeSource>,
+        allow_unpinned: bool,
+    ) -> Result<crate::catalog::verification::RecipeSource> {
+        let Self::Inline { recipe, templates } = self else {
+            bail!("recipe verification requires a snapshot");
+        };
+        crate::catalog::verification::verify_source(recipe, templates, source, allow_unpinned)
+    }
+
     /// Parse the recipe.
     pub fn load(&self) -> Result<AppRecipe> {
         match self {
@@ -610,6 +647,9 @@ impl AppRecipeSource {
 /// that phase itself through the `services` module.
 #[derive(Debug, Deserialize)]
 pub struct AppCreateRequest {
+    pub source: Option<crate::catalog::verification::RecipeSource>,
+    #[serde(default)]
+    pub allow_unpinned_images: bool,
     pub name: String,
     #[serde(default)]
     pub scope: AppScope,
@@ -663,6 +703,8 @@ impl AppCreateRequest {
 /// recipe upgrade).
 #[derive(Debug, Deserialize)]
 pub struct AppUpdateRequest {
+    pub source: Option<crate::catalog::verification::RecipeSource>,
+    pub allow_unpinned_images: Option<bool>,
     pub name: String,
     #[serde(default)]
     pub scope: AppScope,
@@ -741,6 +783,12 @@ pub struct AppListRequest {
 /// root's or the apps account's) and is excluded from secret-free backups.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppManifest {
+    /// Verified catalog claim and computed recipe/template digest. Old manifests
+    /// have no provenance until their next update (implicit custom policy).
+    #[serde(default)]
+    pub source: Option<crate::catalog::verification::RecipeSource>,
+    #[serde(default)]
+    pub allow_unpinned_images: bool,
     /// Manifest schema version; currently 1.
     pub version: u32,
     pub name: String,
@@ -987,6 +1035,8 @@ mod tests {
     #[test]
     fn manifest_derives_service_names_from_unit_filenames() {
         let manifest = AppManifest {
+            source: None,
+            allow_unpinned_images: false,
             version: 1,
             name: "demo".into(),
             scope: AppScope::System,

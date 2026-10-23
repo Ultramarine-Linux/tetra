@@ -3,7 +3,7 @@ Description={{ name }} database
 
 [Container]
 ContainerName={{ app_id }}-db
-Image=docker.io/library/mariadb:11
+Image=docker.io/library/mariadb:11@sha256:f16d7a344413e519dff518f27bdb221388f84b0d274c97c4fb5f2cb0dc1b34fa
 Network={{ app_id }}-net.network
 Volume={{ app_id }}-db.volume:/var/lib/mysql
 Environment={{ ("MARIADB_DATABASE=" ~ database_name) | systemd_quote }}

@@ -210,18 +210,22 @@ actions!(Action [payload user] => {
             payload.name
         );
 
-        let source = payload.recipe_source()?;
+        let source = payload.recipe_source()?.snapshot()?;
+        let provenance = source.verify(payload.source.as_ref(), payload.allow_unpinned_images)?;
         // Inline values win over the optional values file, so a dashboard can
         // ship recipe defaults plus per-instance overrides in one call.
         let mut values = load_values(payload.values_path.as_ref())?;
         values.extend(payload.values);
         bundle.inject_dir(&mut values);
         let (recipe, resources) = source.render(&mut values)?;
+        crate::catalog::verification::verify_images(&resources, payload.allow_unpinned_images)?;
 
         let outcome = bundle.install(&resources, None, payload.dry_run)?;
         let now = epoch_secs();
         let secret_keys = recipe.secret_keys().map(str::to_owned).collect();
         let manifest = AppManifest {
+            source: Some(provenance),
+            allow_unpinned_images: payload.allow_unpinned_images,
             version: MANIFEST_VERSION,
             name: payload.name,
             scope: payload.scope,
@@ -273,7 +277,20 @@ actions!(Action [payload user] => {
         // values merge per-key so secrets collected earlier are not resent.
         if let Some(source) = payload.recipe_source()? {
             manifest.recipe = source;
+            // A replacement bundle without provenance is custom; never carry
+            // an old official/community claim onto new bytes.
+            manifest.source.clone_from(&payload.source);
+            manifest.allow_unpinned_images = payload.allow_unpinned_images.unwrap_or(false);
+        } else {
+            if let Some(source) = &payload.source {
+                manifest.source = Some(source.clone());
+            }
+            if let Some(allow) = payload.allow_unpinned_images {
+                manifest.allow_unpinned_images = allow;
+            }
         }
+        manifest.recipe = manifest.recipe.snapshot()?;
+        manifest.source = Some(manifest.recipe.verify(manifest.source.as_ref(), manifest.allow_unpinned_images)?);
         // `get` shows secrets as `REDACTED`; sent back unchanged, they keep
         // the stored value instead of replacing it.
         let is_secret = secrets(&manifest);
@@ -285,6 +302,7 @@ actions!(Action [payload user] => {
         manifest.values.extend(incoming);
         bundle.inject_dir(&mut manifest.values);
         let (recipe, resources) = manifest.recipe.render(&mut manifest.values)?;
+        crate::catalog::verification::verify_images(&resources, manifest.allow_unpinned_images)?;
         manifest.secret_keys.extend(recipe.secret_keys().map(str::to_owned));
         manifest.recipe_id = recipe.recipe_id;
         manifest.recipe_version = recipe.version;
@@ -836,7 +854,7 @@ resources:
 
     fn demo_templates() -> serde_json::Value {
         json!({
-            "containers/demo.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=example/demo:latest\n",
+            "containers/demo.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=example/demo:latest@sha256:1111111111111111111111111111111111111111111111111111111111111111\n",
             "files/index.html.tera": "<h1>{{ app_id }}</h1>\n",
         })
     }
@@ -1220,7 +1238,7 @@ resources:
         assert_eq!(response["systemd"], json!([]));
         assert_eq!(
             fs::read_to_string(base.path().join("demo-web.container")).unwrap(),
-            "[Container]\nContainerName=demo-web\nImage=example/demo:latest\n"
+            "[Container]\nContainerName=demo-web\nImage=example/demo:latest@sha256:1111111111111111111111111111111111111111111111111111111111111111\n"
         );
         let bundle = files.path().join("demo");
         assert_eq!(
@@ -1286,7 +1304,7 @@ resources:
 
     fn site_templates() -> serde_json::Value {
         json!({
-            "site.container.tera": "[Container]\nImage=docker.io/library/nginx:stable-alpine\nPublishPort={{ http_port }}:80\nVolume={{ bundle_dir }}/html:/usr/share/nginx/html:ro\n",
+            "site.container.tera": "[Container]\nImage=docker.io/library/nginx:alpine@sha256:a3554c0d0b48177b1413c26e01f695334428020d9df01243fbae3e11cfd17417\nPublishPort={{ http_port }}:80\nVolume={{ bundle_dir }}/html:/usr/share/nginx/html:ro\n",
         })
     }
 
@@ -1445,7 +1463,7 @@ resources:
         );
         let mut templates = demo_templates();
         templates["containers/demo.container.tera"] = json!(
-            "[Container]\nImage=example/demo:latest\nEnvironment=PW={{ db_password }}\n"
+            "[Container]\nImage=example/demo:latest@sha256:1111111111111111111111111111111111111111111111111111111111111111\nEnvironment=PW={{ db_password }}\n"
         );
         let mut create = create_payload(base.path(), files.path());
         create["recipe"] = json!(recipe);

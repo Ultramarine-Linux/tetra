@@ -94,7 +94,12 @@ Key concepts:
 
 Rendering is deterministic apart from generated parameter values. The engine is
 used by the CLI (`render` subcommand) and by the `recipes` and `apps` agent
-modules.
+modules. Before agent render/install writes, `catalog::verification` checks the
+exact recipe/template snapshot against caller-supplied SHA-256 provenance and
+enforces digest-pinned images (custom-only explicit opt-out). Tetra does not
+fetch catalogs or authenticate publishers. Apps persist verified inline snapshots,
+source metadata/digests, and image policy in their manifest; see
+[recipes.md](recipes.md#install-time-source-verification-and-image-pinning).
 
 ## The dispatcher (`agent::dispatcher`)
 

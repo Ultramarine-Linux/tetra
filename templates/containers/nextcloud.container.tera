@@ -8,7 +8,7 @@ After={{ app_id }}-redis.service
 
 [Container]
 ContainerName={{ app_id }}-app
-Image=docker.io/library/nextcloud:latest
+Image=docker.io/library/nextcloud:latest@sha256:301e07b7f661c122752cc2c01b76f15036a156f2b6d794c76621b7d0a6bb8a50
 Network={{ app_id }}-net.network
 Volume={{ app_id }}-data.volume:/var/www/html
 Environment={{ ("NEXTCLOUD_TRUSTED_DOMAINS=" ~ domain) | systemd_quote }}
