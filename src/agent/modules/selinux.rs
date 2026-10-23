@@ -291,7 +291,7 @@ mod tests {
             return;
         }
 
-        let response = Status.handle(None).unwrap();
+        let response = Status {}.handle(None).unwrap();
         assert!(response["selinux"].is_object());
         assert!(response["command"].as_str().unwrap().contains("sestatus"));
     }
@@ -302,7 +302,7 @@ mod tests {
             return;
         }
 
-        let response = Enforce.handle(None).unwrap();
+        let response = Enforce {}.handle(None).unwrap();
         assert!(response["mode"].is_string());
         let mode = response["mode"].as_str().unwrap();
         assert!(mode == "Enforcing" || mode == "Permissive" || mode == "Disabled");

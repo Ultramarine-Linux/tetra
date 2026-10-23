@@ -4,8 +4,16 @@
 //! Ultramarine Server dashboard can provision reverse proxies for hosted
 //! services (e.g. point `app.example.com` at a container's `127.0.0.1:8080`)
 //! without editing the main Caddyfile by hand. Each site is a small
-//! `*.caddy` file with a `reverse_proxy` block; the main Caddyfile is
-//! expected to `import` the managed directory.
+//! `*.caddyfile` file with a `reverse_proxy` block in
+//! `/etc/caddy/Caddyfile.d`, which terra-caddy's default Caddyfile already
+//! imports (`import Caddyfile.d/*.caddyfile`). Operator files in the same
+//! directory are left alone: Tetra only rewrites files it wrote. Sites that
+//! released versions wrote to [`LEGACY_CONFIG_DIR`] are moved here when the
+//! agent starts ([`migrate_legacy_sites`]).
+//!
+//! The same directory holds two sites Tetra writes itself rather than
+//! through module actions: the dashboard's site (`access.set`) and, until
+//! setup completes, the OOBE's site on port 6623.
 //!
 //! Registered behind the `reverse-proxy` cargo feature. Mutating actions
 //! (`write`, `delete`) accept `dry_run` and an optional `reload` flag that
@@ -14,10 +22,11 @@
 use crate::prelude::*;
 
 use crate::agent::module_support::safe_join;
+pub use crate::auth::dns::DnsValue;
 
 /// Agent module that manages Caddy reverse proxy snippets.
 ///
-/// Stateless: all persisted state lives as `*.caddy` files under the
+/// Stateless: all persisted state lives as `*.caddyfile` files under the
 /// configured `config_dir`, with site metadata embedded in a header comment
 /// so the module can list and round-trip sites without a separate database.
 #[derive(Clone, Copy, Debug)]
@@ -43,12 +52,16 @@ const INFO: ModuleInfo = ModuleInfo {
     privileged_actions: &["write", "delete", "reload"],
 };
 
-/// Directory where managed site snippets live. Overridable per request via
-/// `config_dir` (used by tests and deployments that keep Caddy config
-/// elsewhere). The main Caddyfile is expected to `import` this directory.
-const DEFAULT_CONFIG_DIR: &str = "/etc/caddy/tetra-sites";
+/// Directory where managed site snippets live: terra-caddy's drop-in
+/// directory.
+///
+/// Overridable per request via `config_dir` (administrators only; used by
+/// tests and deployments that keep Caddy config elsewhere).
+pub const DEFAULT_CONFIG_DIR: &str = crate::auth::service::CADDY_SITES_DIR;
+/// Extension terra-caddy's Caddyfile imports from [`DEFAULT_CONFIG_DIR`].
+const SITE_EXTENSION: &str = "caddyfile";
 /// Sentinel first line written to every managed file. `list_sites` uses this
-/// to distinguish Tetra-managed snippets from any other `*.caddy` files the
+/// to distinguish Tetra-managed snippets from any other `*.caddyfile` files the
 /// operator may have placed in the same directory, so we never touch files
 /// we didn't write.
 const MANAGED_HEADER: &str = "# Managed by Tetra reverse_proxy";
@@ -271,19 +284,19 @@ fn validate_upstream(upstream: &str) -> Result<String> {
 /// Map a (validated) domain to a safe on-disk snippet filename.
 ///
 /// `*` (wildcard site labels) becomes `wildcard` and `.` becomes `_`, so
-/// `*.example.com` -> `wildcard_example_com.caddy`. The domain is already
+/// `*.example.com` -> `wildcard_example_com.caddyfile`. The domain is already
 /// validated to contain only `[a-z0-9-.]`, so no further escaping is needed.
 ///
-/// A domain whose filename would be the dashboard's own site (such as
+/// A domain whose filename would be one of Tetra's own sites (such as
 /// `00-ultramarine-dashboard`) is refused.
 fn site_filename(domain: &str) -> Result<String> {
     let filename = format!(
-        "{}.caddy",
+        "{}.{SITE_EXTENSION}",
         domain.replace('*', "wildcard").replace('.', "_")
     );
     ensure!(
-        filename != DASHBOARD_SITE_FILE,
-        "`{domain}` is reserved for the dashboard site"
+        filename != DASHBOARD_SITE_FILE && filename != SETUP_SITE_FILE,
+        "`{domain}` is reserved for Tetra's own sites"
     );
     Ok(filename)
 }
@@ -298,15 +311,13 @@ fn ensure_managed(path: &Path) -> Result<()> {
         ),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to read `{}`", path.display()))
-        }
+        Err(error) => Err(error).with_context(|| format!("failed to read `{}`", path.display())),
     }
 }
 
 /// List Tetra-managed sites in `config_dir`.
 ///
-/// Skips any `*.caddy` file that doesn't start with `MANAGED_HEADER`, so
+/// Skips any `*.caddyfile` file that doesn't start with `MANAGED_HEADER`, so
 /// operator-authored files in the same directory are neither reported nor
 /// touched. Metadata is recovered from the `# tetra:` comment line; files
 /// without a parseable header are silently ignored. Results are sorted by
@@ -322,7 +333,7 @@ fn list_sites(config_dir: &Path) -> Result<Vec<Value>> {
     {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("caddy") {
+        if path.extension().and_then(|ext| ext.to_str()) != Some(SITE_EXTENSION) {
             continue;
         }
 
@@ -348,6 +359,60 @@ fn list_sites(config_dir: &Path) -> Result<Vec<Value>> {
     Ok(sites)
 }
 
+/// Where released versions (up to 0.2.3) kept app sites, as `<name>.caddy`.
+pub const LEGACY_CONFIG_DIR: &str = "/etc/caddy/tetra-sites";
+
+/// Move the app sites `write` left in `legacy_dir` to `config_dir`.
+///
+/// `tetra agent-serve` passes [`LEGACY_CONFIG_DIR`] and
+/// [`DEFAULT_CONFIG_DIR`], the directory `list`, `write`, and `delete` use.
+///
+/// Released versions kept them in [`LEGACY_CONFIG_DIR`] as `<name>.caddy`;
+/// they become `<name>.caddyfile`, which terra-caddy imports. Files Tetra did not write, and ones whose new name
+/// is taken or reserved, stay where they are. Returns the files moved.
+///
+/// # Errors
+/// Fails when a directory cannot be read or created or a file moved; the
+/// files moved before stay moved.
+pub fn migrate_legacy_sites(legacy_dir: &Path, config_dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(legacy_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read `{}`", legacy_dir.display()));
+        }
+    };
+    let mut moved = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(stem) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|_| path.extension().is_some_and(|ext| ext == "caddy"))
+        else {
+            continue;
+        };
+        let filename = format!("{stem}.{SITE_EXTENSION}");
+        let target = config_dir.join(&filename);
+        let managed = entry.file_type()?.is_file()
+            && fs::read_to_string(&path).is_ok_and(|contents| contents.starts_with(MANAGED_HEADER));
+        if !managed
+            || filename == DASHBOARD_SITE_FILE
+            || filename == SETUP_SITE_FILE
+            || fs::symlink_metadata(&target).is_ok()
+        {
+            continue;
+        }
+        fs::create_dir_all(config_dir)
+            .with_context(|| format!("failed to create `{}`", config_dir.display()))?;
+        fs::rename(&path, &target)
+            .with_context(|| format!("failed to move `{}`", path.display()))?;
+        moved.push(target);
+    }
+    Ok(moved)
+}
+
 /// Reload Caddy via systemd so new or removed sites take effect without
 /// restarting (which would drop active connections). Dry runs report the
 /// command that would run without invoking systemctl.
@@ -361,16 +426,58 @@ fn reload_caddy(action: &str, dry_run: bool, user: Option<&str>) -> Result<Value
 /// It does not start with the `MANAGED_HEADER` line, so `list` (which reports
 /// app sites) skips it, and `write` and `delete` refuse its name. The `00-` prefix keeps
 /// it first in the import order.
-pub const DASHBOARD_SITE_FILE: &str = "00-ultramarine-dashboard.caddy";
+pub const DASHBOARD_SITE_FILE: &str = "00-ultramarine-dashboard.caddyfile";
 const DASHBOARD_HEADER: &str = "# Managed by Tetra access.set: Ultramarine Server dashboard";
 
 /// How the dashboard site gets its certificate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DashboardTls {
-    /// Caddy's automatic HTTPS (Let's Encrypt, or Tailscale for `ts.net`).
+    /// Caddy's automatic HTTPS (Let's Encrypt, or Tailscale for `ts.net`),
+    /// with the HTTP-01 challenge.
     Automatic,
     /// Caddy's local CA (`tls internal`), for IP mode.
     Internal,
+    /// Automatic HTTPS with the DNS-01 challenge through a caddy-dns module.
+    Dns {
+        /// The module, such as `cloudflare`.
+        provider: &'static str,
+        /// The provider block's settings and secret placeholders; never a
+        /// credential.
+        fields: Vec<(&'static str, DnsValue)>,
+    },
+}
+
+/// One `key value` line of a DNS provider block. Keys are lowercase words;
+/// secrets become a `{env.NAME}` placeholder and settings a quoted literal
+/// that cannot close the quote or a block.
+fn render_dns_field(key: &str, value: &DnsValue) -> Result<String> {
+    ensure!(
+        !key.is_empty() && key.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+        "invalid DNS provider key `{key}`"
+    );
+    let value = match value {
+        DnsValue::Env(name) => {
+            ensure!(
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                "invalid environment variable for DNS provider key `{key}`"
+            );
+            format!("{{env.{name}}}")
+        }
+        DnsValue::Literal(text) => {
+            ensure!(
+                !text.is_empty()
+                    && !text.chars().any(|c| {
+                        matches!(c, '"' | '\\' | '{' | '}') || c.is_control() || c.is_whitespace()
+                    }),
+                "invalid value for DNS provider key `{key}`"
+            );
+            format!("\"{text}\"")
+        }
+    };
+    Ok(format!("\t\t\t{key} {value}\n"))
 }
 
 /// The dashboard's site block.
@@ -403,9 +510,21 @@ impl DashboardSite {
             self.address
         );
         let upstream = validate_upstream(&self.upstream)?;
-        let tls = match self.tls {
-            DashboardTls::Automatic => "",
-            DashboardTls::Internal => "\ttls internal\n",
+        let tls = match &self.tls {
+            DashboardTls::Automatic => String::new(),
+            DashboardTls::Internal => "\ttls internal\n".to_owned(),
+            DashboardTls::Dns { provider, fields } => {
+                ensure!(
+                    !provider.is_empty() && provider.chars().all(|c| c.is_ascii_alphanumeric()),
+                    "invalid DNS provider `{provider}`"
+                );
+                let mut block = format!("\ttls {{\n\t\tdns {provider} {{\n");
+                for (key, value) in fields {
+                    block.push_str(&render_dns_field(key, value)?);
+                }
+                block.push_str("\t\t}\n\t}\n");
+                block
+            }
         };
         let public = match &self.public_root {
             Some(root) => {
@@ -430,39 +549,80 @@ impl DashboardSite {
     }
 }
 
-/// Write the dashboard site into `config_dir`, replacing any previous one,
-/// and optionally reload Caddy.
+/// Write the dashboard site, as rendered by [`DashboardSite::render`], into
+/// `config_dir`, replacing any previous one. Does not reload Caddy.
 ///
 /// # Errors
-/// Fails when the site is invalid or cannot be written. A failed reload is
-/// reported in the result instead, like the `write` action does.
-pub fn write_dashboard_site(
-    config_dir: &Path,
-    site: &DashboardSite,
-    dry_run: bool,
-    reload: bool,
-) -> Result<Value> {
-    let contents = site.render()?;
+/// Fails when the file cannot be written.
+pub fn write_dashboard_site(config_dir: &Path, contents: &str) -> Result<Value> {
     let path = safe_join(config_dir, DASHBOARD_SITE_FILE)?;
-    if !dry_run {
-        fs::create_dir_all(config_dir)
-            .with_context(|| format!("failed to create `{}`", config_dir.display()))?;
-        fs::write(&path, &contents)
-            .with_context(|| format!("failed to write `{}`", path.display()))?;
-    }
-    let (reload, reload_error) = if reload {
-        match reload_caddy("write", dry_run, None) {
-            Ok(result) => (Some(result), None),
-            Err(error) => (None, Some(error.to_string())),
-        }
-    } else {
-        (None, None)
-    };
-    Ok(jsonf! { path, contents, "written": !dry_run, dry_run, reload, reload_error })
+    let changed = crate::auth::store::replace_if_changed(&path, contents.as_bytes(), SITE_MODE)?;
+    Ok(jsonf! { path, contents, changed })
+}
+
+/// Mode of the sites Tetra writes itself: Caddy runs as `caddy` and only
+/// needs to read them.
+const SITE_MODE: u32 = 0o644;
+
+/// Filename of the OOBE's site, written while setup is incomplete.
+pub const SETUP_SITE_FILE: &str = "00-ultramarine-setup.caddyfile";
+const SETUP_HEADER: &str = "# Managed by Tetra setup: Ultramarine Server setup (OOBE)";
+pub use crate::auth::access::{SETUP_PORT, SETUP_UPSTREAM_PORT};
+
+/// The OOBE's site: HTTPS on [`SETUP_PORT`] for any address or name the
+/// browser uses, with a certificate from Caddy's internal CA, proxied to the
+/// OOBE on port [`SETUP_UPSTREAM_PORT`] of `127.0.0.1`.
+///
+/// The site has no host, so Caddy cannot know names up front: certificates
+/// are issued on demand, which Caddy allows without an `ask` endpoint because
+/// only the internal issuer is used. Caddy listens on the port on every
+/// address, IPv4 and IPv6 (a dual-stack wildcard socket), and still starts
+/// on hosts with IPv6 disabled, so the site does not `bind` explicitly.
+///
+/// Accepted risk: without `ask`, any client that reaches the port can make
+/// Caddy issue (and store under its data directory) an internal certificate
+/// for any SNI name it sends. An `ask` endpoint or a `permission` module can
+/// only be set in the global options of terra-caddy's main Caddyfile, not in
+/// this drop-in, and the server's addresses are not known when this file is
+/// written at boot (DHCP, Wi-Fi joined during setup), so they cannot be
+/// listed instead. The risk is disk and CPU use, not impersonation: the
+/// certificates and their keys never leave Caddy, which serves them only on
+/// this port; only the internal CA signs (no public CA is asked); each
+/// certificate is small; and the site exists only until setup completes.
+#[must_use]
+pub fn render_setup_site() -> String {
+    format!(
+        "{SETUP_HEADER}\n\
+         https://:{SETUP_PORT} {{\n\
+         \ttls internal {{\n\
+         \t\ton_demand\n\
+         \t}}\n\
+         \treverse_proxy 127.0.0.1:{SETUP_UPSTREAM_PORT}\n\
+         }}\n"
+    )
+}
+
+/// Write the OOBE's site into `config_dir`. Returns whether it changed.
+///
+/// # Errors
+/// Fails when the file cannot be written.
+pub fn write_setup_site(config_dir: &Path) -> Result<bool> {
+    let path = safe_join(config_dir, SETUP_SITE_FILE)?;
+    crate::auth::store::replace_if_changed(&path, render_setup_site().as_bytes(), SITE_MODE)
+}
+
+/// Remove the OOBE's site. Returns whether it existed.
+///
+/// # Errors
+/// Fails when the file exists but cannot be removed.
+pub fn remove_setup_site(config_dir: &Path) -> Result<bool> {
+    crate::auth::store::remove_if_exists(&safe_join(config_dir, SETUP_SITE_FILE)?)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     #[test]
@@ -524,7 +684,9 @@ mod tests {
         };
         assert_eq!(
             domain.render().unwrap(),
-            format!("{DASHBOARD_HEADER}\nserver.example.com {{\n\treverse_proxy 127.0.0.1:3972\n}}\n")
+            format!(
+                "{DASHBOARD_HEADER}\nserver.example.com {{\n\treverse_proxy 127.0.0.1:3972\n}}\n"
+            )
         );
         let ip = DashboardSite {
             address: "https://[2001:db8::1]".into(),
@@ -532,7 +694,11 @@ mod tests {
             upstream: "127.0.0.1:3972".into(),
             public_root: None,
         };
-        assert!(ip.render().unwrap().contains("https://[2001:db8::1] {\n\ttls internal\n"));
+        assert!(
+            ip.render()
+                .unwrap()
+                .contains("https://[2001:db8::1] {\n\ttls internal\n")
+        );
         let injected = DashboardSite {
             address: "evil.example.com {\n".into(),
             ..domain.clone()
@@ -553,6 +719,125 @@ mod tests {
     }
 
     #[test]
+    fn renders_dns_01_dashboard_sites_with_placeholders_only() {
+        let site = DashboardSite {
+            address: "server.example.com".into(),
+            tls: DashboardTls::Dns {
+                provider: "powerdns",
+                fields: vec![
+                    ("server_url", DnsValue::Literal("https://ns.example.com".into())),
+                    ("api_token", DnsValue::Env("TETRA_DNS_API_TOKEN".into())),
+                ],
+            },
+            upstream: "127.0.0.1:3972".into(),
+            public_root: None,
+        };
+        assert_eq!(
+            site.render().unwrap(),
+            format!(
+                "{DASHBOARD_HEADER}\nserver.example.com {{\n\ttls {{\n\t\tdns powerdns {{\n\
+                 \t\t\tserver_url \"https://ns.example.com\"\n\
+                 \t\t\tapi_token {{env.TETRA_DNS_API_TOKEN}}\n\
+                 \t\t}}\n\t}}\n\treverse_proxy 127.0.0.1:3972\n}}\n"
+            )
+        );
+        for (key, value) in [
+            ("api_token", DnsValue::Env("HOME}".into())),
+            ("api_token", DnsValue::Env(String::new())),
+            ("api_token", DnsValue::Literal("a\" }\n".into())),
+            ("api_token", DnsValue::Literal("with space".into())),
+            ("api_token", DnsValue::Literal("{env.HOME}".into())),
+            ("api_token", DnsValue::Literal(String::new())),
+            ("Key", DnsValue::Literal("x".into())),
+        ] {
+            let site = DashboardSite {
+                tls: DashboardTls::Dns {
+                    provider: "cloudflare",
+                    fields: vec![(key, value)],
+                },
+                ..site.clone()
+            };
+            site.render().unwrap_err();
+        }
+    }
+
+    #[test]
+    fn setup_site_serves_the_oobe_with_the_internal_ca() {
+        assert_eq!(
+            render_setup_site(),
+            format!(
+                "{SETUP_HEADER}\nhttps://:6623 {{\n\ttls internal {{\n\t\ton_demand\n\t}}\n\
+                 \treverse_proxy 127.0.0.1:6624\n}}\n"
+            )
+        );
+        let dir = tempfile::tempdir().unwrap();
+        assert!(write_setup_site(dir.path()).unwrap());
+        assert!(!write_setup_site(dir.path()).unwrap());
+        assert!(dir.path().join(SETUP_SITE_FILE).exists());
+        // Not an app site.
+        assert_eq!(list_sites(dir.path()).unwrap().len(), 0);
+        assert!(remove_setup_site(dir.path()).unwrap());
+        assert!(!remove_setup_site(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn sites_use_terra_caddys_drop_in_directory() {
+        assert_eq!(DEFAULT_CONFIG_DIR, "/etc/caddy/Caddyfile.d");
+        assert_eq!(
+            site_filename("app.example.com").unwrap(),
+            "app_example_com.caddyfile"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        // Files with other extensions (such as the `*.caddy` sites of
+        // released versions, see `migrate_legacy_sites`) are not imported,
+        // so not listed.
+        fs::write(
+            dir.path().join("old_example_com.caddy"),
+            format!("{MANAGED_HEADER}\n# tetra: {{\"domain\":\"old.example.com\",\"upstream\":\"127.0.0.1:1\",\"tls\":true}}\n"),
+        )
+        .unwrap();
+        assert_eq!(list_sites(dir.path()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn sites_of_released_versions_are_moved_to_the_drop_in_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("tetra-sites");
+        let sites = dir.path().join("Caddyfile.d");
+        let site = |domain: &str| {
+            SiteMetadata::new(domain, "127.0.0.1:8080", true).unwrap().render().unwrap()
+        };
+        // Missing: nothing to do.
+        assert_eq!(migrate_legacy_sites(&legacy, &sites).unwrap(), Vec::<PathBuf>::new());
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("app_example_com.caddy"), site("app.example.com")).unwrap();
+        // The operator's own files stay, and so does a site whose new name
+        // is taken.
+        fs::write(legacy.join("mine.caddy"), "mine.example.com {\n}\n").unwrap();
+        fs::write(legacy.join("taken_example_com.caddy"), site("taken.example.com")).unwrap();
+        fs::create_dir_all(&sites).unwrap();
+        fs::write(sites.join("taken_example_com.caddyfile"), "operator's\n").unwrap();
+
+        let moved = migrate_legacy_sites(&legacy, &sites).unwrap();
+        assert_eq!(moved, [sites.join("app_example_com.caddyfile")]);
+        assert!(!legacy.join("app_example_com.caddy").exists());
+        assert!(legacy.join("mine.caddy").exists());
+        assert!(legacy.join("taken_example_com.caddy").exists());
+        assert_eq!(fs::read_to_string(sites.join("taken_example_com.caddyfile")).unwrap(), "operator's\n");
+        // `list` sees them in its directory, which is where `agent-serve`
+        // migrates to: `DEFAULT_CONFIG_DIR` unless a request names another.
+        let listed = ReverseProxyModule
+            .handle("list", serde_json::json!({ "config_dir": sites }), None)
+            .unwrap();
+        assert_eq!(listed["sites"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["sites"][0]["domain"], "app.example.com");
+        let default: List = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(default.config_dir, Path::new(DEFAULT_CONFIG_DIR));
+        // Once moved, there is nothing left to do.
+        assert_eq!(migrate_legacy_sites(&legacy, &sites).unwrap(), Vec::<PathBuf>::new());
+    }
+
+    #[test]
     fn dashboard_site_is_not_listed_as_an_app_site() {
         let dir = tempfile::tempdir().unwrap();
         let site = DashboardSite {
@@ -561,8 +846,15 @@ mod tests {
             upstream: "127.0.0.1:3972".into(),
             public_root: None,
         };
-        write_dashboard_site(dir.path(), &site, false, false).unwrap();
-        assert!(dir.path().join(DASHBOARD_SITE_FILE).exists());
+        let written = write_dashboard_site(dir.path(), &site.render().unwrap()).unwrap();
+        assert_eq!(written["changed"], true);
+        let path = dir.path().join(DASHBOARD_SITE_FILE);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            SITE_MODE
+        );
+        let again = write_dashboard_site(dir.path(), &site.render().unwrap()).unwrap();
+        assert_eq!(again["changed"], false);
         assert_eq!(list_sites(dir.path()).unwrap().len(), 0);
     }
 
@@ -584,11 +876,13 @@ mod tests {
             reload: false,
         };
 
-        // The dashboard site's name is reserved, even before it exists.
-        write("00-ultramarine-dashboard").handle(None).unwrap_err();
-        delete("00-ultramarine-dashboard").handle(None).unwrap_err();
+        // Tetra's own sites' names are reserved, even before they exist.
+        for reserved in ["00-ultramarine-dashboard", "00-ultramarine-setup"] {
+            write(reserved).handle(None).unwrap_err();
+            delete(reserved).handle(None).unwrap_err();
+        }
 
-        let operator = dir.path().join("mine_example_com.caddy");
+        let operator = dir.path().join("mine_example_com.caddyfile");
         fs::write(&operator, "mine.example.com {\n}\n").unwrap();
         write("mine.example.com").handle(None).unwrap_err();
         delete("mine.example.com").handle(None).unwrap_err();
@@ -601,13 +895,13 @@ mod tests {
         write("app.example.com").handle(None).unwrap();
         write("app.example.com").handle(None).unwrap();
         delete("app.example.com").handle(None).unwrap();
-        assert!(!dir.path().join("app_example_com.caddy").exists());
+        assert!(!dir.path().join("app_example_com.caddyfile").exists());
     }
 
     #[test]
     fn dry_run_write_does_not_create_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("demo_example_com.caddy");
+        let path = dir.path().join("demo_example_com.caddyfile");
         let response = Write {
             config_dir: dir.path().to_path_buf(),
             domain: "demo.example.com".into(),

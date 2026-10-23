@@ -88,8 +88,105 @@ pub struct NetworkConfigureRequest {
     pub ipv4: Ipv4Config,
     #[serde(default)]
     pub ipv6: Ipv6Config,
+    /// Wired 802.1X authentication, written to the keyfile's `[802-1x]`
+    /// section.
+    #[serde(default)]
+    pub wired_8021x: Option<Box<Wired8021x>>,
     #[serde(default)]
     pub dry_run: bool,
+}
+
+/// `wired_8021x` for [`NetworkConfigureRequest`], also used for
+/// `wpa-enterprise` Wi-Fi. `Debug` leaves out the passwords.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Wired8021x {
+    pub eap: EapMethod,
+    pub identity: String,
+    /// Outer identity for tunneled methods (`peap`, `ttls`).
+    #[serde(default)]
+    pub anonymous_identity: Option<String>,
+    /// Required for `peap`, `ttls`, `pwd` and `md5`.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// CA certificate that signed the authentication server's certificate.
+    /// This and the client certificate and key are each an absolute path or
+    /// PEM contents, which Tetra stores root-only and refers to by path.
+    #[serde(default)]
+    pub ca_cert: Option<String>,
+    /// Client certificate and key, required for `tls`.
+    #[serde(default)]
+    pub client_cert: Option<String>,
+    #[serde(default)]
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub private_key_password: Option<String>,
+    /// Accept only an authentication server whose certificate names this
+    /// domain or a subdomain of it (`802-1x.domain-suffix-match`).
+    #[serde(default)]
+    pub domain_suffix_match: Option<String>,
+    /// Inner authentication for `peap` and `ttls` (default `mschapv2`).
+    #[serde(default)]
+    pub phase2: Option<Phase2Method>,
+}
+
+impl std::fmt::Debug for Wired8021x {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // PEM contents are not shown, only paths.
+        let shown = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(|value| if is_pem(value) { "<pem>" } else { value }.to_owned())
+        };
+        // The private key could be in any encoding (a BOM before the PEM,
+        // base64 DER, ...), so only a plain absolute path is shown.
+        let private_key = self.private_key.as_deref().map(|value| {
+            if Path::new(value).is_absolute() && !value.chars().any(char::is_control) {
+                value
+            } else {
+                "<redacted>"
+            }
+        });
+        f.debug_struct("Wired8021x")
+            .field("eap", &self.eap)
+            .field("identity", &self.identity)
+            .field("ca_cert", &shown(&self.ca_cert))
+            .field("client_cert", &shown(&self.client_cert))
+            .field("private_key", &private_key)
+            .field("domain_suffix_match", &self.domain_suffix_match)
+            .field("phase2", &self.phase2)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Whether an 802.1X certificate or key field holds PEM contents rather than
+/// a path.
+#[must_use]
+pub fn is_pem(value: &str) -> bool {
+    value.trim_start().starts_with("-----BEGIN ")
+}
+
+/// EAP method for [`Wired8021x`] (NetworkManager `802-1x.eap`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EapMethod {
+    Tls,
+    Peap,
+    Ttls,
+    Pwd,
+    Md5,
+}
+
+/// Inner method for [`Wired8021x`] (NetworkManager `802-1x.phase2-auth`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase2Method {
+    Mschapv2,
+    Mschap,
+    Pap,
+    Chap,
+    Gtc,
+    Md5,
 }
 
 /// `ipv4.method` for [`NetworkConfigureRequest`].
@@ -169,6 +266,62 @@ pub type Ipv6Config = IpConfig<Ipv6Method, std::net::Ipv6Addr>;
 #[derive(Debug, Deserialize)]
 pub struct NetworkConfirmRequest {
     pub token: String,
+}
+
+/// Payload for `network.scan_wifi`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkScanWifiRequest {
+    /// Wireless interface to scan with, e.g. `wlan0`.
+    pub interface: String,
+    /// `true` always rescans, `false` never does; by default NetworkManager
+    /// rescans when its last scan is older than 30 seconds.
+    #[serde(default)]
+    pub rescan: Option<bool>,
+}
+
+/// Payload for `network.connect_wifi`: a Wi-Fi profile for one interface
+/// that Tetra renders into a NetworkManager keyfile and activates.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkConnectWifiRequest {
+    /// Wireless interface, e.g. `wlan0`.
+    pub interface: String,
+    pub ssid: String,
+    /// Probe for a network that does not broadcast its SSID. Networks the
+    /// last scan did not see are treated as hidden anyway.
+    #[serde(default)]
+    pub hidden: bool,
+    pub security: WifiSecurity,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `security` for [`NetworkConnectWifiRequest`], tagged by `type`.
+/// `Debug` leaves out the passwords.
+#[derive(Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum WifiSecurity {
+    /// A struct variant so that stray fields are refused.
+    #[allow(clippy::empty_enum_variants_with_brackets)]
+    Open {},
+    /// WPA2 or WPA3 with a passphrase.
+    WpaPersonal { password: String },
+    /// WPA2 or WPA3 Enterprise (802.1X), with the same settings as
+    /// [`Wired8021x`].
+    WpaEnterprise(Box<Wired8021x>),
+}
+
+impl std::fmt::Debug for WifiSecurity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open {} => f.write_str("Open"),
+            Self::WpaPersonal { .. } => f.debug_struct("WpaPersonal").finish_non_exhaustive(),
+            Self::WpaEnterprise(settings) => {
+                f.debug_tuple("WpaEnterprise").field(settings).finish()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,7 +446,8 @@ pub struct ServiceListRequest {
     pub scope: ServiceScope,
 }
 
-const fn default_true() -> bool {
+/// `true`, for `#[serde(default = "crate::types::default_true")]`.
+pub(crate) const fn default_true() -> bool {
     true
 }
 
@@ -635,6 +789,30 @@ mod tests {
         };
         write.write().unwrap();
         assert_eq!(FileReadRequest { path }.read().unwrap(), "written");
+    }
+
+    #[test]
+    fn wired_8021x_debug_shows_only_a_private_key_path() {
+        let debug = |private_key: &str| {
+            let settings: Wired8021x = serde_json::from_value(json!({
+                "eap": "tls",
+                "identity": "host",
+                "private_key": private_key,
+            }))
+            .unwrap();
+            format!("{settings:?}")
+        };
+        assert!(debug("/etc/pki/tls/private/host.key").contains("/etc/pki/tls/private/host.key"));
+        for secret in [
+            "-----BEGIN PRIVATE KEY-----\nS3CRET\n-----END PRIVATE KEY-----\n",
+            "\u{feff}-----BEGIN PRIVATE KEY-----\nS3CRET\n-----END PRIVATE KEY-----\n",
+            "MIIEvS3CRETbase64DER",
+            "/S3CRET\nline",
+        ] {
+            let shown = debug(secret);
+            assert!(!shown.contains("S3CRET"), "{shown}");
+            assert!(shown.contains("<redacted>"), "{shown}");
+        }
     }
 
     #[test]

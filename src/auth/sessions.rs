@@ -94,6 +94,10 @@ pub struct Session {
     pub created_at: i64,
     pub expires_at: i64,
     pub last_seen: i64,
+    /// Accounts `users.create` made in this setup session: the only ones it
+    /// may set the password or SSH keys of.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_accounts: Vec<String>,
     #[serde(flatten)]
     extra: Extra,
 }
@@ -233,6 +237,7 @@ impl SessionStore {
             created_at: now,
             expires_at: now.saturating_add(lifetime),
             last_seen: now,
+            created_accounts: Vec::new(),
             extra: Extra::new(),
         };
         let mut state = self.lock();
@@ -293,6 +298,29 @@ impl SessionStore {
         };
         drop(state);
         persisted.map(|()| revoked)
+    }
+
+    /// Record that the session `id` created the account `name`.
+    ///
+    /// # Errors
+    /// Fails when the session is gone or the session file cannot be written.
+    pub fn add_created_account(&self, id: &str, name: &str) -> Result<()> {
+        let mut state = self.lock();
+        let session = state
+            .sessions
+            .values_mut()
+            .find(|session| session.id == id)
+            .context("the session has ended")?;
+        if !session
+            .created_accounts
+            .iter()
+            .any(|created| created == name)
+        {
+            session.created_accounts.push(name.to_owned());
+        }
+        let persisted = self.persist(&mut state);
+        drop(state);
+        persisted
     }
 
     /// Live sessions matching `select`, oldest first.

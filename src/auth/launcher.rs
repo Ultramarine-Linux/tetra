@@ -709,11 +709,14 @@ mod tests {
 
     fn access(mode: AccessMode, hostname: &str, port: Option<u16>) -> AccessConfig {
         AccessConfig::from_request(
-            AccessRequest {
+            &AccessRequest {
                 mode,
                 hostname: hostname.into(),
                 port,
                 dashboard_upstream: None,
+                challenge: crate::auth::access::AcmeChallenge::Http01,
+                dns_provider: None,
+                dns_credentials: None,
             },
             DEFAULT_DASHBOARD_UPSTREAM,
         )

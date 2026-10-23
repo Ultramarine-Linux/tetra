@@ -23,6 +23,9 @@ default = [
     "users",
     "storage",
     "network",
+    "power",
+    "updates",
+    "remote-access",
 ]
 apps = ["quadlets", "services"]
 files = []
@@ -34,6 +37,9 @@ samba = []
 nfs = []
 network = []
 podman = []
+power = []
+updates = []
+remote-access = []
 quadlets = []
 reverse-proxy = []
 users = []

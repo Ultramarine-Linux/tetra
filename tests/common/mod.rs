@@ -86,3 +86,36 @@ pub async fn login(service: &AuthService, username: &str) -> String {
     assert_eq!(result["status"], "authenticated", "{result}");
     result["token"].as_str().unwrap().to_owned()
 }
+
+/// A fresh host with no accounts and no administrator yet.
+pub fn fresh(dir: &std::path::Path) -> TestHost {
+    TestHost::new(dir).unwrap()
+}
+
+/// Redeem the setup code from `192.0.2.50`, returning a setup session's
+/// token and public ID.
+pub async fn setup_session(host: &TestHost) -> (String, String) {
+    let code = host.service.publish_setup_code().unwrap().unwrap();
+    let session = ok(
+        &host.service,
+        Oobe,
+        None,
+        "setup.redeem",
+        json!({"code": code, "remote_addr": "192.0.2.50"}),
+    )
+    .await;
+    (
+        session["token"].as_str().unwrap().to_owned(),
+        session["session"]["id"].as_str().unwrap().to_owned(),
+    )
+}
+
+/// A setup session's token.
+pub async fn setup_token(host: &TestHost) -> String {
+    setup_session(host).await.0
+}
+
+/// `access.set` from the OOBE with `token`.
+pub async fn access_set(host: &TestHost, token: &str, params: Value) -> Response {
+    call(&host.service, Oobe, Some(token), "access.set", params).await
+}

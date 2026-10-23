@@ -201,7 +201,8 @@ fn next_sequence() -> u64 {
     SEQUENCE.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The owner of a login ceremony: the browser's IP address.
+/// The owner of a login ceremony (and the setup-code throttle's key): the
+/// browser's IP address, given as `ip`, `[ipv6]`, `ip:port` or `[ipv6]:port`.
 ///
 /// IPv6 is grouped by `/64`, what one host typically controls. `None` when
 /// the dashboard sent no address or one that is not an IP address, so a
@@ -209,7 +210,11 @@ fn next_sequence() -> u64 {
 #[must_use]
 pub fn source_owner(remote_addr: Option<&str>) -> Option<String> {
     let remote_addr = remote_addr?.trim();
-    let ip = remote_addr
+    let unbracketed = remote_addr
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(remote_addr);
+    let ip = unbracketed
         .parse::<IpAddr>()
         .or_else(|_| remote_addr.parse::<SocketAddr>().map(|addr| addr.ip()))
         .ok()?;
@@ -272,6 +277,14 @@ mod tests {
         assert_eq!(owner("2001:db8:1:2::1"), owner("2001:db8:1:2:ffff::9"));
         assert_ne!(owner("2001:db8:1:2::1"), owner("2001:db8:1:3::1"));
         assert_eq!(owner("::ffff:192.0.2.1"), owner("192.0.2.1"));
+        // Any source port, with or without brackets, is the same source.
+        assert_eq!(owner("198.51.100.7:51234").as_deref(), Some("198.51.100.7"));
+        assert_eq!(owner("198.51.100.7:51235"), owner("198.51.100.7"));
+        assert_eq!(
+            owner("[2001:db8:1:2::7]:51234").as_deref(),
+            Some("2001:db8:1:2::/64")
+        );
+        assert_eq!(owner("[2001:db8:1:2::8]"), owner("[2001:db8:1:2::7]:1"));
         // Not an address: no owner, rather than one per distinct string.
         assert_eq!(owner("x, 192.0.2.1"), None);
         assert_eq!(source_owner(None), None);

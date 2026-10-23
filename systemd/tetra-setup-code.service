@@ -5,15 +5,20 @@ Documentation=https://github.com/Ultramarine-Linux/tetra/blob/main/docs/auth-pro
 ConditionPathExists=!/var/lib/tetra/setup-complete
 # The store key may be sealed to the TPM.
 After=tpm2.target
-# Before the login prompts read /run/issue.d.
-Before=systemd-user-sessions.service getty.target
+# Before the login prompts read /run/issue.d, and before Caddy loads the
+# OOBE's site (/etc/caddy/Caddyfile.d/00-ultramarine-setup.caddyfile, written
+# here too).
+Before=systemd-user-sessions.service getty.target caddy.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 # Generates the code on first boot (sealed in /var/lib/tetra) and writes it
 # to /run/tetra/setup-code and /run/issue.d. The same code is republished on
-# every boot until setup completes.
+# every boot until setup completes. Also writes the OOBE's Caddy site (port
+# 6623, tls internal); setup.complete disables this unit again.
+# A drop-in that moves Tetra's directories for tetra.service
+# (TETRA_STATE_DIR, TETRA_CADDY_SITES_DIR) must set them here too.
 ExecStart=/usr/bin/tetra setup code --publish
 StateDirectory=tetra
 StateDirectoryMode=0700
