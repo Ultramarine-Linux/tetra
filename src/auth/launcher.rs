@@ -709,7 +709,7 @@ mod tests {
 
     fn access(mode: AccessMode, hostname: &str, port: Option<u16>) -> AccessConfig {
         AccessConfig::from_request(
-            AccessRequest {
+            &AccessRequest {
                 mode,
                 hostname: hostname.into(),
                 port,

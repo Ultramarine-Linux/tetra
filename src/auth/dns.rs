@@ -204,22 +204,34 @@ pub fn env_var(key: &str) -> String {
     format!("TETRA_DNS_{}", key.to_ascii_uppercase())
 }
 
-/// `(key, Caddyfile value)` pairs for the site's `dns` block: a runtime
-/// placeholder for secrets, a quoted literal for settings. Expects validated
-/// credentials.
+/// A value in the site's `dns` provider block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsValue {
+    /// A secret: Caddy's runtime placeholder for this environment variable
+    /// (see [`env_var`]), never the credential.
+    Env(String),
+    /// A setting, written literally (quoted).
+    Literal(String),
+}
+
+/// `(key, value)` pairs for the site's `dns` block: an environment variable
+/// for secrets, a literal for settings. Expects validated credentials.
 #[must_use]
-pub fn caddy_fields(provider: DnsProvider, credentials: &DnsCredentials) -> Vec<(String, String)> {
+pub fn caddy_fields(
+    provider: DnsProvider,
+    credentials: &DnsCredentials,
+) -> Vec<(&'static str, DnsValue)> {
     provider
         .fields()
         .iter()
         .filter_map(|field| {
             let value = credentials.0.get(field.name)?;
-            let rendered = if field.secret {
-                format!("{{env.{}}}", env_var(field.name))
+            let value = if field.secret {
+                DnsValue::Env(env_var(field.name))
             } else {
-                format!("\"{value}\"")
+                DnsValue::Literal(value.clone())
             };
-            Some((field.name.to_owned(), rendered))
+            Some((field.name, value))
         })
         .collect()
 }
@@ -337,19 +349,14 @@ mod tests {
         }));
         validate(DnsProvider::Acmedns, &acmedns).unwrap();
         let fields = caddy_fields(DnsProvider::Acmedns, &acmedns);
+        let literal = |value: &str| DnsValue::Literal(value.into());
         assert_eq!(
             fields,
             [
-                ("server_url".into(), "\"https://auth.acme-dns.io\"".into()),
-                (
-                    "subdomain".into(),
-                    "\"d420c923-bbd7-4056-ab64-c3ca54c9b3cf\"".into()
-                ),
-                (
-                    "username".into(),
-                    "\"c36f50e8-4632-44f0-83fe-e070fef28a10\"".into()
-                ),
-                ("password".into(), "{env.TETRA_DNS_PASSWORD}".into()),
+                ("server_url", literal("https://auth.acme-dns.io")),
+                ("subdomain", literal("d420c923-bbd7-4056-ab64-c3ca54c9b3cf")),
+                ("username", literal("c36f50e8-4632-44f0-83fe-e070fef28a10")),
+                ("password", DnsValue::Env("TETRA_DNS_PASSWORD".into())),
             ]
         );
         let env = env_file(DnsProvider::Acmedns, &acmedns);

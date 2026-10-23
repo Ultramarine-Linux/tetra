@@ -132,6 +132,27 @@ pub struct SelinuxOptions {
     pub recursive: bool,
 }
 
+/// The payload of an action that takes none: an object, whose fields are
+/// ignored as other payloads ignore unknown ones. [`parse_action`] reads an
+/// omitted payload (`null`) as `{}`.
+// Braces, because a unit struct deserializes from `null` but not `{}`.
+#[allow(clippy::empty_structs_with_brackets)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct NoPayload {}
+
+/// Decode `action` and its `payload` into an action enum.
+///
+/// The enum's variants are named after the actions in snake case
+/// (`{"<action>": <payload>}`). An omitted payload (`null`) is read as `{}`, so an action whose payload
+/// fields all have defaults may leave it out.
+///
+/// # Errors
+/// Errs on an unknown action or a payload the action does not accept.
+pub fn parse_action<T: serde::de::DeserializeOwned>(action: &str, payload: Value) -> Result<T> {
+    let payload = if payload.is_null() { json!({}) } else { payload };
+    Ok(serde_json::from_value(json!({ action: payload }))?)
+}
+
 /// Deserialize a typed payload from a [`serde_json::Value`] with a consistent
 /// "invalid command payload" error message. Centralizing this keeps the
 /// per-module error surface uniform.
@@ -294,6 +315,62 @@ where
     })
 }
 
+/// Run `program` with `input` on its stdin, as Tetra's own user.
+///
+/// For a secret that must not appear on a command line, where any local user
+/// can read it. `display` stands in for the command in the result and in
+/// errors, so it must not contain the secret either.
+///
+/// # Errors
+/// Fails when the command cannot start, or exits with a non-zero status.
+pub fn run_command_with_input(
+    program: &str,
+    args: &[&str],
+    input: &[u8],
+    display: String,
+    dry_run: bool,
+) -> Result<CommandResult> {
+    use std::{io::Write as _, process::Stdio};
+    if dry_run {
+        return Ok(CommandResult {
+            command: display,
+            status: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            dry_run: true,
+        });
+    }
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to run `{program}`"))?;
+    // A command that exits without reading closes the pipe; its status says
+    // more than the failed write.
+    let written = child.stdin.take().context("no stdin")?.write_all(input);
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to run `{program}`"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let code = output.status.code();
+    ensure!(
+        output.status.success(),
+        "`{display}` failed with status {code:?}: {}",
+        stderr.trim()
+    );
+    written.with_context(|| format!("failed to write to `{display}`"))?;
+    Ok(CommandResult {
+        command: display,
+        status: code,
+        stdout,
+        stderr,
+        dry_run: false,
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn current_uid_is_root() -> bool {
     // SAFETY: `geteuid` has no preconditions and only reads process credentials.
@@ -401,6 +478,49 @@ pub fn apply_selinux(
     Ok(operations)
 }
 
+/// Run `restorecon <flags> <path>` so `path` gets the policy's default
+/// label.
+///
+/// Skipped on hosts without SELinux, except in a dry run, which always
+/// previews it. Returns the commands run, as module responses list them.
+///
+/// # Errors
+/// Fails when `restorecon` fails.
+pub fn restorecon(path: &Path, flags: &[&str], dry_run: bool) -> Result<Vec<Value>> {
+    if !dry_run && !Path::new("/sys/fs/selinux/enforce").exists() {
+        return Ok(Vec::new());
+    }
+    let path = path.to_string_lossy();
+    let mut args = flags.to_vec();
+    args.push(&path);
+    Ok(vec![cmd!((dry_run) "restorecon" &args ; json)?])
+}
+
+/// Whether `systemctl is-enabled` reports `unit` as `enabled`.
+#[must_use]
+pub fn unit_enabled(unit: &str) -> bool {
+    cmd!("systemctl" ["is-enabled", unit]).is_ok_and(|result| result.stdout.trim() == "enabled")
+}
+
+/// Tetra's drop-in for `unit` in `systemd_dir`
+/// (`<systemd_dir>/<unit>.d/50-tetra.conf`).
+#[must_use]
+pub fn drop_in(systemd_dir: &Path, unit: &str) -> PathBuf {
+    systemd_dir.join(format!("{unit}.d")).join("50-tetra.conf")
+}
+
+/// Install the drop-in at `path` (mode `0644`) with `contents`, returning
+/// whether it changed. A dry run only compares.
+///
+/// # Errors
+/// Fails when the drop-in cannot be written.
+pub fn install_drop_in(path: &Path, contents: &str, dry_run: bool) -> Result<bool> {
+    if dry_run {
+        return Ok(fs::read(path).ok().as_deref() != Some(contents.as_bytes()));
+    }
+    crate::auth::store::replace_if_changed(path, contents.as_bytes(), 0o644)
+}
+
 /// Join `name` onto `base`, rejecting absolute paths or any component that
 /// would escape `base` (`..`, Windows prefixes).
 ///
@@ -446,6 +566,86 @@ pub struct CommandResult {
     pub dry_run: bool,
 }
 
+/// Runs a program with arguments, for [`Commands`].
+type Runner<'a> = dyn FnMut(&str, &[&str]) -> Result<CommandResult> + 'a;
+
+/// The commands one action runs (or plans, in a dry run), in order, for its
+/// response: each as its [`CommandResult`], or `{command, error}` when it
+/// failed.
+pub struct Commands<'a> {
+    dry_run: bool,
+    runner: Box<Runner<'a>>,
+    /// What ran so far.
+    pub done: Vec<Value>,
+}
+
+impl<'a> Commands<'a> {
+    /// Run commands as root with [`run_command_output_as`].
+    #[must_use]
+    pub fn new(dry_run: bool) -> Self {
+        Self::with_runner(dry_run, move |program, args| {
+            run_command_output_as(program, args, dry_run, None)
+        })
+    }
+
+    /// Run commands with `runner` (a fake, in tests).
+    pub fn with_runner<F>(dry_run: bool, runner: F) -> Self
+    where
+        F: FnMut(&str, &[&str]) -> Result<CommandResult> + 'a,
+    {
+        Self {
+            dry_run,
+            runner: Box::new(runner),
+            done: Vec::new(),
+        }
+    }
+
+    /// A fake for tests: every command succeeds, except the command line
+    /// `failing`.
+    #[cfg(test)]
+    #[must_use]
+    pub fn fake(dry_run: bool, failing: &'a str) -> Self {
+        Self::with_runner(dry_run, move |program, args| {
+            let command = command_display(program, args);
+            ensure!(command != failing, "`{command}` failed");
+            Ok(CommandResult {
+                command,
+                status: (!dry_run).then_some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                dry_run,
+            })
+        })
+    }
+
+    #[must_use]
+    pub const fn dry_run(&self) -> bool {
+        self.dry_run
+    }
+
+    /// Run a command and record it, failed or not.
+    ///
+    /// # Errors
+    /// Fails when the command does.
+    pub fn run(&mut self, program: &str, args: &[&str]) -> Result<()> {
+        let result = (self.runner)(program, args);
+        self.done.push(match &result {
+            Ok(result) => serde_json::to_value(result)?,
+            Err(error) => json!({
+                "command": command_display(program, args),
+                "error": error.to_string(),
+            }),
+        });
+        result.map(drop)
+    }
+
+    /// Run a command whose failure does not stop the action (cleanup of
+    /// state that may not exist). Returns whether it succeeded.
+    pub fn run_ignoring_failure(&mut self, program: &str, args: &[&str]) -> bool {
+        self.run(program, args).is_ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -477,6 +677,51 @@ mod tests {
         assert!(error.to_string().contains("invalid command payload"));
     }
 
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(rename_all = "snake_case")]
+    enum Action {
+        Status(NoPayload),
+        Disable {
+            #[serde(default)]
+            dry_run: bool,
+        },
+        Remove {
+            name: String,
+        },
+    }
+
+    #[test]
+    fn actions_take_null_for_an_empty_payload() {
+        for payload in [Value::Null, json!({}), json!({ "x": 1 })] {
+            let action: Action = parse_action("status", payload).unwrap();
+            assert_eq!(action, Action::Status(NoPayload {}));
+        }
+        for payload in [json!(""), json!(false), json!([1])] {
+            parse_action::<Action>("status", payload).unwrap_err();
+        }
+        // Defaulted fields may be left out with the whole payload.
+        let action: Action = parse_action("disable", Value::Null).unwrap();
+        assert_eq!(action, Action::Disable { dry_run: false });
+        // Required ones may not.
+        parse_action::<Action>("remove", Value::Null).unwrap_err();
+        parse_action::<Action>("other", Value::Null).unwrap_err();
+    }
+
+    #[test]
+    fn drop_ins_are_installed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = drop_in(dir.path(), "example.service");
+        assert_eq!(path, dir.path().join("example.service.d/50-tetra.conf"));
+        // A dry run only compares.
+        assert!(install_drop_in(&path, "[Service]\n", true).unwrap());
+        assert!(!path.exists());
+        assert!(install_drop_in(&path, "[Service]\n", false).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[Service]\n");
+        assert!(!install_drop_in(&path, "[Service]\n", true).unwrap());
+        assert!(!install_drop_in(&path, "[Service]\n", false).unwrap());
+        assert!(install_drop_in(&path, "[Unit]\n", false).unwrap());
+    }
+
     #[test]
     fn safe_join_rejects_paths_that_escape_base() {
         let base = Path::new("/tmp/base");
@@ -494,6 +739,56 @@ mod tests {
             command_display("systemctl", ["status", "nginx.service"]),
             "systemctl status nginx.service"
         );
+    }
+
+    #[test]
+    fn commands_record_failures_too() {
+        let mut commands = Commands::fake(false, "systemctl stop b");
+        commands.run("systemctl", &["stop", "a"]).unwrap();
+        let error = commands.run("systemctl", &["stop", "b"]).unwrap_err();
+        assert!(error.to_string().contains("systemctl stop b"));
+        assert!(!commands.run_ignoring_failure("systemctl", &["stop", "b"]));
+        assert!(commands.run_ignoring_failure("systemctl", &["stop", "c"]));
+        assert_eq!(commands.done[0]["command"], "systemctl stop a");
+        assert_eq!(commands.done[0]["status"], 0);
+        for failed in &commands.done[1..3] {
+            assert_eq!(failed["command"], "systemctl stop b");
+            assert_eq!(failed["error"], "`systemctl stop b` failed");
+        }
+        assert_eq!(commands.done[3]["command"], "systemctl stop c");
+
+        let mut plan = Commands::new(true);
+        assert!(plan.dry_run());
+        plan.run("definitely-not-a-real-command", &["x"]).unwrap();
+        assert_eq!(plan.done[0]["dry_run"], true);
+    }
+
+    #[test]
+    fn input_goes_to_stdin_and_stays_out_of_the_result() {
+        let display = || "cat <secret>".to_owned();
+        let result = run_command_with_input("cat", &[], b"hunter2", display(), false).unwrap();
+        assert_eq!(result.stdout, "hunter2");
+        assert_eq!(result.command, "cat <secret>");
+        assert_eq!(result.status, Some(0));
+
+        let error = run_command_with_input(
+            "sh",
+            &["-c", "cat >/dev/null; echo nope >&2; exit 3"],
+            b"hunter2",
+            "sh <secret>".into(),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("`sh <secret>` failed"), "{error}");
+        assert!(error.contains("nope"), "{error}");
+        assert!(!error.contains("hunter2") && !error.contains("cat"), "{error}");
+
+        let result =
+            run_command_with_input("definitely-not-a-real-command", &[], b"x", display(), true)
+                .unwrap();
+        assert!(result.dry_run);
+        assert_eq!(result.command, "cat <secret>");
     }
 
     #[test]

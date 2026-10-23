@@ -273,8 +273,9 @@ with the setup session.
      `users.add_admin {name}` (adds `ultramarine-admin`; refused once an
      administrator exists). Optionally `users.set_authorized_keys {name, keys}`
      to install SSH keys. The setup session may only set the password and keys
-     of accounts it created itself (never `root` or an existing administrator),
-     and may not pass `home` to `users.create`;
+     of accounts it created itself, and only make those administrators (never
+     `root`, an existing administrator or any other existing account), and may
+     not pass `home` to `users.create`;
    - hostname (`settings.set_hostname`) and network: `network.interfaces` and
      `network.status` to show the current state; for Wi-Fi,
      `network.scan_wifi {interface}` and `network.connect_wifi {interface,
@@ -293,24 +294,38 @@ with the setup session.
      funnel}` (serve defaults to `true`, funnel to `false`; it returns the
      node's `*.ts.net` `hostname`, which goes to `access.set` so the dashboard
      works over the tailnet) and
-     `remote_access.cloudflared_set_token {token}`. Tetra keeps the
-     credentials; drop them from the OOBE's memory and state once sent.
-     `remote_access.status` shows what is on;
+     `remote_access.cloudflared_set_token {token}`. Tetra seals the tunnel
+     token and does not keep the Tailscale auth key at all (tailscaled keeps
+     its own node key); drop both from the OOBE's memory and state once sent.
+     `remote_access.status` shows what is on. Tailscale forwards the
+     dashboard's port as it is when `tailscale_up` runs (443 unless
+     `access.set` set another), and while Tailscale is set up `access.set`
+     refuses to change the port (`conflict`) until
+     `remote_access.tailscale_disable`. So for a port other than 443, pass it
+     to `access.set` before `tailscale_up`, and keep it when setting the
+     `*.ts.net` hostname;
    - `power.reboot` and `power.poweroff` answer first and act 3 seconds later.
-4. Set the access mode with `access.set {mode, hostname, port?}`; in domain
+4. Set the access mode with `access.set {mode, hostname, port?}` (`port`
+   may not be 0, 80, 2019, 6623, 6624 or the dashboard's own port, 3972 by
+   default); in domain
    mode add `challenge: "http-01"`, or `challenge: "dns-01"` with
    `dns_provider` and `dns_credentials` (keys as in the caddy-dns module's
    config, listed in [auth-protocol.md](auth-protocol.md#access-and-setup-completion)).
    Tetra writes the dashboard's Caddy site, hands DNS credentials to Caddy
    without writing them into any Caddyfile, writes the dashboard's `ORIGIN`
-   and returns `dashboard_url`.
+   and returns `dashboard_url`. A `bad_request` (for example credentials that
+   do not match the provider) changes nothing; a failed Caddy reload or
+   `ORIGIN` update is reported in `caddy.error` or `dashboard_env.error` of a
+   successful result, so check those.
 5. Call `setup.complete`. This fails with `setup_incomplete` until an eligible
    administrator exists. On success the setup code no longer works, setup
    sessions end, the console stops showing the code, and Tetra starts the
-   dashboard. The result is `{complete, dashboard_url, handoff_in_seconds,
+   dashboard without waiting for it (its first start may pull the image and
+   take minutes). The result is `{complete, dashboard_url, handoff_in_seconds,
    handoff}`: show a final screen pointing at `dashboard_url`, because Tetra
    stops and disables the OOBE (and removes its Caddy site) after
-   `handoff_in_seconds`.
+   `handoff_in_seconds`, and tell the user the dashboard may need a moment to
+   come up.
 
 The setup session is limited to these actions and to the operations
 `session.info`, `session.logout`, `setup.status`, `setup.complete`,

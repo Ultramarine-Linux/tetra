@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use kameo::actor::Spawn as _;
 use tokio::sync::watch;
 
 use tetra::{
@@ -114,9 +115,21 @@ enum SetupCommand {
 
 #[derive(Debug, Parser)]
 struct SetupCompleteCli {
+    #[command(flatten)]
+    paths: ConsolePaths,
+}
+
+/// Where a console setup command finds Tetra's state and Caddy's sites; the
+/// same options as `agent-serve`.
+#[derive(Debug, clap::Args)]
+struct ConsolePaths {
     /// Tetra state directory.
-    #[arg(long, env = "TETRA_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
+    #[arg(long, env = "TETRA_STATE_DIR", default_value = auth::service::DEFAULT_STATE_DIR)]
     state_dir: PathBuf,
+
+    /// Caddy site directory for the OOBE's and the dashboard's sites.
+    #[arg(long, env = "TETRA_CADDY_SITES_DIR", default_value = auth::service::CADDY_SITES_DIR)]
+    caddy_sites_dir: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -136,7 +149,7 @@ struct ResetSecondFactorCli {
     passkeys: bool,
 
     /// Tetra state directory.
-    #[arg(long, env = "TETRA_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
+    #[arg(long, env = "TETRA_STATE_DIR", default_value = auth::service::DEFAULT_STATE_DIR)]
     state_dir: PathBuf,
 }
 
@@ -151,13 +164,9 @@ struct SetupCodeCli {
     #[arg(long, conflicts_with = "publish")]
     json: bool,
 
-    /// Tetra state directory.
-    #[arg(long, env = "TETRA_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
-    state_dir: PathBuf,
+    #[command(flatten)]
+    paths: ConsolePaths,
 }
-
-/// Root-only state: credentials, grants, sessions, the setup marker.
-const DEFAULT_STATE_DIR: &str = "/var/lib/tetra";
 
 #[derive(Debug, Parser)]
 struct RenderCli {
@@ -202,7 +211,7 @@ struct AgentServeCli {
     identity_dir: PathBuf,
 
     /// Root-only state directory for credentials, grants and sessions.
-    #[arg(long, env = "TETRA_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
+    #[arg(long, env = "TETRA_STATE_DIR", default_value = auth::service::DEFAULT_STATE_DIR)]
     state_dir: PathBuf,
 
     /// Account whose UID identifies the dashboard on the local socket.
@@ -219,7 +228,7 @@ struct AgentServeCli {
 
     /// Caddy site directory where `access.set` writes the dashboard site
     /// (terra-caddy's Caddyfile imports `Caddyfile.d/*.caddyfile`).
-    #[arg(long, default_value = auth::service::CADDY_SITES_DIR)]
+    #[arg(long, env = "TETRA_CADDY_SITES_DIR", default_value = auth::service::CADDY_SITES_DIR)]
     caddy_sites_dir: PathBuf,
 
     /// Where the dashboard container listens, used for the dashboard's Caddy
@@ -350,7 +359,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Render(cli) => render(cli),
-        Commands::AgentServe(cli) => agent_serve(cli).await,
+        Commands::AgentServe(cli) => Box::pin(agent_serve(cli)).await,
         Commands::AgentDispatch(cli) => agent_dispatch(cli).await,
         Commands::AgentVsockServe(cli) => cli.serve(),
         Commands::AgentConnect(cli) => agent_connect(cli).await,
@@ -434,26 +443,23 @@ fn reset_second_factor(cli: &ResetSecondFactorCli) -> Result<()> {
 }
 
 /// The auth service for a one-shot console command.
-fn console_auth(state_dir: PathBuf) -> Result<AuthService> {
-    let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), 1);
-    system_auth(
-        AuthConfig::system(state_dir),
-        tetra_pam::DEFAULT_SERVICE.into(),
-        queue,
-    )
+fn console_auth(paths: ConsolePaths) -> Result<AuthService> {
+    let config = AuthConfig {
+        caddy_sites_dir: paths.caddy_sites_dir,
+        ..AuthConfig::system(paths.state_dir)
+    };
+    let queue = DispatchQueue::spawn(AgentBackend::spawn(config.dispatcher()), 1);
+    system_auth(config, tetra_pam::DEFAULT_SERVICE.into(), queue)
 }
 
 fn setup_complete(cli: SetupCompleteCli) -> Result<()> {
     require_root("tetra setup complete")?;
-    let handoff = console_auth(cli.state_dir)?.complete_setup_from_console()?;
+    let handoff = console_auth(cli.paths)?.complete_setup_from_console()?;
     println!("setup completed; the setup code is disabled");
-    if handoff["dashboard_started"] != true {
-        eprintln!(
-            "the dashboard did not start: {}",
-            handoff["dashboard_error"].as_str().unwrap_or_default()
-        );
+    if let Some(error) = handoff.dashboard_error {
+        eprintln!("the dashboard did not start: {error}");
     }
-    if let Some(error) = handoff["oobe_error"].as_str() {
+    if let Some(error) = handoff.oobe_error {
         eprintln!("the OOBE was not stopped: {error}");
     }
     Ok(())
@@ -461,7 +467,7 @@ fn setup_complete(cli: SetupCompleteCli) -> Result<()> {
 
 fn setup_finish_handoff(cli: SetupCompleteCli) -> Result<()> {
     require_root("tetra setup finish-handoff")?;
-    console_auth(cli.state_dir)?.finish_handoff()?;
+    console_auth(cli.paths)?.finish_handoff()?;
     eprintln!("the OOBE is stopped; the dashboard has taken over");
     Ok(())
 }
@@ -470,7 +476,7 @@ fn setup_code(cli: SetupCodeCli) -> Result<()> {
     require_root("tetra setup code")?;
     // Printing must not create a code that the console does not show, so
     // every form publishes; `--publish` (the boot unit) only skips printing.
-    let auth = console_auth(cli.state_dir)?;
+    let auth = console_auth(cli.paths)?;
     let code = auth.publish_setup_code()?;
     // Caddy creates its internal CA the first time it serves the OOBE's
     // site, so right after the first boot there may be none yet.
@@ -542,6 +548,35 @@ async fn agent_dispatch(cli: AgentDispatchCli) -> Result<()> {
     Ok(())
 }
 
+/// Move the app sites released versions kept in
+/// [`LEGACY_CONFIG_DIR`](tetra::agent::modules::reverse_proxy::LEGACY_CONFIG_DIR)
+/// to the module's own
+/// [`DEFAULT_CONFIG_DIR`](tetra::agent::modules::reverse_proxy::DEFAULT_CONFIG_DIR),
+/// where `reverse_proxy.list`, `write`, and `delete` look for them (not
+/// `--caddy-sites-dir`, which only holds Tetra's own sites), and have Caddy
+/// pick them up. Failures are logged.
+#[cfg(feature = "reverse-proxy")]
+fn migrate_legacy_proxy_sites() {
+    use std::path::Path;
+    use tetra::agent::{module_support::run_command_output_as, modules::reverse_proxy};
+
+    let legacy = Path::new(reverse_proxy::LEGACY_CONFIG_DIR);
+    let sites_dir = Path::new(reverse_proxy::DEFAULT_CONFIG_DIR);
+    match reverse_proxy::migrate_legacy_sites(legacy, sites_dir) {
+        Ok(moved) if moved.is_empty() => {}
+        Ok(moved) => {
+            for path in &moved {
+                eprintln!("moved a reverse_proxy site to `{}`", path.display());
+            }
+            let reload = ["--no-block", "try-reload-or-restart", "caddy.service"];
+            if let Err(error) = run_command_output_as("systemctl", reload, false, None) {
+                eprintln!("failed to reload Caddy: {error:#}");
+            }
+        }
+        Err(error) => eprintln!("failed to move the reverse_proxy sites of `{}`: {error:#}", legacy.display()),
+    }
+}
+
 /// How often in-memory session activity is written to disk.
 const SESSION_FLUSH_INTERVAL: Duration = Duration::from_mins(1);
 
@@ -551,17 +586,22 @@ async fn agent_serve(cli: AgentServeCli) -> Result<()> {
     eprintln!("host identity: {}", identity.path().display());
     eprintln!("host fingerprint: {host_fingerprint}");
 
-    let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), DEFAULT_QUEUE_CAPACITY);
-    let auth = system_auth(
-        AuthConfig {
-            caddy_sites_dir: cli.caddy_sites_dir,
-            dashboard_upstream: cli.dashboard_upstream,
-            public_dir: cli.public_dir,
-            ..AuthConfig::system(cli.state_dir)
-        },
-        cli.pam_service,
-        queue.clone(),
-    )?;
+    let config = AuthConfig {
+        caddy_sites_dir: cli.caddy_sites_dir,
+        dashboard_upstream: cli.dashboard_upstream,
+        public_dir: cli.public_dir,
+        ..AuthConfig::system(cli.state_dir)
+    };
+    #[cfg(feature = "reverse-proxy")]
+    migrate_legacy_proxy_sites();
+    let queue = DispatchQueue::spawn(
+        AgentBackend::spawn(config.dispatcher()),
+        DEFAULT_QUEUE_CAPACITY,
+    );
+    let auth = system_auth(config, cli.pam_service, queue.clone())?;
+    // Off the serving path: it waits for systemctl.
+    let resume = auth.clone();
+    tokio::task::spawn_blocking(move || resume.resume_handoff());
     let audit = auth.audit();
     let server = LocalServer {
         auth: auth.clone(),

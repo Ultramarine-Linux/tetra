@@ -1,9 +1,9 @@
 //! Credentials Tetra holds for other services: `/var/lib/tetra/secrets`.
 //!
-//! DNS-01 credentials for Caddy, the Tailscale auth key and the Cloudflare
-//! Tunnel token are each sealed with the [`Sealer`] (`systemd-creds encrypt`,
-//! bound to the TPM2 when there is one) under their credential name and kept
-//! as `<name>.cred`, root-only. Because the file is an ordinary encrypted
+//! DNS-01 credentials for Caddy and the Cloudflare Tunnel token are each
+//! sealed with the [`Sealer`] (`systemd-creds encrypt`, bound to the TPM2
+//! when there is one) under their credential name and kept as
+//! `<name>.cred`, root-only. Because the file is an ordinary encrypted
 //! systemd credential, a unit can load it directly with
 //! `LoadCredentialEncrypted=<name>:<path>` without Tetra ever writing the
 //! plain value to disk; Tetra unseals it again when it needs the value itself.
@@ -14,13 +14,8 @@ use crate::prelude::*;
 
 use super::{seal::Sealer, store};
 
-/// Default location, under Tetra's root-only state directory.
-pub const DEFAULT_SECRETS_DIR: &str = "/var/lib/tetra/secrets";
-
 /// Credential name of the DNS-01 credentials for the dashboard's site.
 pub const DNS_CREDENTIALS: &str = "tetra-dns-credentials";
-/// Credential name of the Tailscale auth key.
-pub const TAILSCALE_AUTH_KEY: &str = "tetra-tailscale-auth-key";
 /// Credential name of the Cloudflare Tunnel token.
 pub const CLOUDFLARED_TOKEN: &str = "tetra-cloudflared-token";
 
@@ -84,12 +79,6 @@ impl SecretStore {
             .map(Some)
     }
 
-    /// Whether `name` is stored.
-    #[must_use]
-    pub fn contains(&self, name: &str) -> bool {
-        self.path(name).is_ok_and(|path| path.exists())
-    }
-
     /// Forget `name`. Missing is fine.
     ///
     /// # Errors
@@ -137,12 +126,11 @@ mod tests {
                 .unwrap(),
             b"token-value"
         );
-        fs::copy(&path, secrets.path(TAILSCALE_AUTH_KEY).unwrap()).unwrap();
-        secrets.get(&FakeSealer, TAILSCALE_AUTH_KEY).unwrap_err();
+        fs::copy(&path, secrets.path(DNS_CREDENTIALS).unwrap()).unwrap();
+        secrets.get(&FakeSealer, DNS_CREDENTIALS).unwrap_err();
 
         secrets.remove(CLOUDFLARED_TOKEN).unwrap();
         secrets.remove(CLOUDFLARED_TOKEN).unwrap();
-        assert!(!secrets.contains(CLOUDFLARED_TOKEN));
         assert_eq!(secrets.get(&FakeSealer, CLOUDFLARED_TOKEN).unwrap(), None);
     }
 

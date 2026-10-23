@@ -3,14 +3,9 @@
 
 mod common;
 
-use common::{Dashboard, Oobe, call, fails, login, ok};
+use common::{Dashboard, Oobe, access_set, call, fails, fresh, login, ok};
 use serde_json::json;
 use tetra::auth::{api::ErrorCode, testing::TestHost};
-
-/// A fresh host with no administrator yet.
-fn fresh(dir: &std::path::Path) -> TestHost {
-    TestHost::new(dir).unwrap()
-}
 
 fn published_code(host: &TestHost) -> String {
     std::fs::read_to_string(host.config.run_dir.join("setup-code"))
@@ -75,14 +70,13 @@ async fn the_oobe_redeems_the_published_code_for_a_limited_session() {
     .await;
     #[cfg(feature = "users")]
     assert_eq!(created["dry_run"], true);
-    ok(
-        &host.service,
-        Oobe,
-        Some(&token),
-        "access.set",
+    let response = access_set(
+        &host,
+        &token,
         json!({"mode": "ip", "hostname": "192.0.2.10"}),
     )
     .await;
+    assert!(response.ok, "{:?}", response.error);
     // ...everything else is not.
     for (module, action) in [
         ("files", "write"),

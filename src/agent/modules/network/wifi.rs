@@ -5,15 +5,16 @@
 //! renders a `type=wifi` keyfile ([`render`]) that is written and activated
 //! like a `network.configure` profile. The passphrase or 802.1X password is
 //! only ever written into that keyfile (`0600`): never into a command line,
-//! a response ([`render_redacted`]) or an error.
+//! an error, or this module's responses ([`render_redacted`]).
+//! (`network.get_config` returns keyfiles as stored, passwords included.)
 
 use std::{collections::BTreeMap, fmt::Write as _};
 
 use serde::Serialize;
 
-use super::keyfile::{REDACTED, keyfile_value, render_8021x, validate_8021x, validate_interface};
+use super::keyfile::{CertRoots, REDACTED, keyfile_value, render_8021x, validate_8021x};
 use crate::prelude::*;
-use crate::types::{NetworkConnectWifiRequest, WifiSecurity};
+use crate::types::{EapMethod, NetworkConnectWifiRequest, WifiSecurity};
 
 /// The longest SSID 802.11 allows, in bytes.
 const MAX_SSID_BYTES: usize = 32;
@@ -23,14 +24,16 @@ const MAX_SAE_PASSWORD_LEN: usize = 128;
 /// The fields `nmcli device wifi list` prints for [`parse_scan`].
 pub const SCAN_FIELDS: &str = "IN-USE,SSID-HEX,SIGNAL,FREQ,SECURITY,WPA-FLAGS,RSN-FLAGS";
 
-/// The security of a scanned network, as the OOBE names it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// The security of a scanned network, as the OOBE names it, from least to
+/// most demanding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Security {
     Open,
     WpaPersonal,
     WpaEnterprise,
-    /// WEP, OWE and anything else Tetra cannot connect to.
+    /// WEP, OWE, WPA3-Enterprise 192-bit and anything else Tetra cannot
+    /// connect to.
     Unknown,
 }
 
@@ -97,7 +100,7 @@ pub fn parse_scan(output: &str) -> Vec<Network> {
                 }
                 // An SSID with a mix of security types is shown as its most
                 // demanding one.
-                existing.security = existing.security.max_with(network.security);
+                existing.security = existing.security.max(network.security);
             })
             .or_insert(network);
     }
@@ -106,26 +109,15 @@ pub fn parse_scan(output: &str) -> Vec<Network> {
     networks
 }
 
-impl Security {
-    const fn rank(self) -> u8 {
-        match self {
-            Self::Open => 0,
-            Self::WpaPersonal => 1,
-            Self::WpaEnterprise => 2,
-            Self::Unknown => 3,
-        }
-    }
-
-    const fn max_with(self, other: Self) -> Self {
-        if other.rank() > self.rank() { other } else { self }
-    }
-}
-
 /// Classify an access point from nmcli's `SECURITY` text and its WPA/RSN
 /// key management flags (`psk`, `sae`, `802.1X`, `owe`, ...).
 fn classify(security: &str, flags: &[&str]) -> Security {
-    if flags.iter().any(|flag| flag.eq_ignore_ascii_case("802.1X") || *flag == "eap_suite_b_192") {
+    if flags.iter().any(|flag| flag.eq_ignore_ascii_case("802.1X")) {
         Security::WpaEnterprise
+    } else if flags.contains(&"eap_suite_b_192") {
+        // WPA3-Enterprise 192-bit only: the profile Tetra writes uses
+        // `wpa-eap`, which such a network refuses.
+        Security::Unknown
     } else if flags.iter().any(|flag| matches!(*flag, "psk" | "sae")) {
         Security::WpaPersonal
     } else if security.trim().is_empty() || security.trim() == "--" {
@@ -179,22 +171,33 @@ pub fn connection_name(interface: &str) -> String {
     format!("wifi-{interface}")
 }
 
-/// Validate a `network.connect_wifi` request without touching the host.
-/// Errors name the field, never a password.
+/// Validate a `network.connect_wifi` request without changing the host,
+/// except for its interface, which the caller checks before scanning
+/// ([`super::keyfile::validate_interface`]). 802.1X certificate and key
+/// paths must be regular files `cert_roots` allows, and are replaced with
+/// their resolved paths ([`super::keyfile::validate`]). Errors name the
+/// field, never a password.
 ///
 /// # Errors
 /// Errs with a message naming the offending field.
-pub fn validate(request: &NetworkConnectWifiRequest, key_management: KeyManagement) -> Result<()> {
-    validate_interface(&request.interface)?;
+pub fn validate(
+    request: &mut NetworkConnectWifiRequest,
+    key_management: KeyManagement,
+    cert_roots: &CertRoots<'_>,
+) -> Result<()> {
     ensure!(
         (1..=MAX_SSID_BYTES).contains(&request.ssid.len())
             && !request.ssid.chars().any(char::is_control),
         "ssid must be 1 to {MAX_SSID_BYTES} bytes with no control characters"
     );
-    match &request.security {
+    match &mut request.security {
         WifiSecurity::Open {} => {}
         WifiSecurity::WpaPersonal { password } => validate_password(password, key_management)?,
-        WifiSecurity::WpaEnterprise(settings) => validate_8021x("security", settings)?,
+        WifiSecurity::WpaEnterprise(settings) => {
+            // EAP-MD5 derives no keys to encrypt the link with.
+            ensure!(settings.eap != EapMethod::Md5, "security.eap md5 cannot be used with Wi-Fi");
+            validate_8021x("security", settings, cert_roots)?;
+        }
     }
     Ok(())
 }
@@ -313,6 +316,11 @@ mod tests {
  :FF:10:2412 MHz::(none):(none)
 ";
 
+    /// Roots no path is under.
+    fn no_roots() -> CertRoots<'static> {
+        CertRoots { pki: Path::new("/nonexistent"), tetra: Path::new("/nonexistent"), profile: "wifi-wlan0" }
+    }
+
     fn request(security: &Value) -> NetworkConnectWifiRequest {
         serde_json::from_value(json!({
             "interface": "wlan0",
@@ -364,8 +372,8 @@ mod tests {
 
     #[test]
     fn wpa_personal_renders_the_passphrase_only_into_the_keyfile() {
-        let request = request(&json!({"type": "wpa-personal", "password": "correct horse"}));
-        validate(&request, KeyManagement::WpaPsk).unwrap();
+        let mut request = request(&json!({"type": "wpa-personal", "password": "correct horse"}));
+        validate(&mut request, KeyManagement::WpaPsk, &no_roots()).unwrap();
         let keyfile = render(&request, KeyManagement::WpaPsk, false, "u");
         assert_eq!(
             keyfile,
@@ -390,21 +398,41 @@ mod tests {
 
     #[test]
     fn wpa_enterprise_uses_the_8021x_section() {
-        let request = request(&json!({
+        let store = tempfile::tempdir().unwrap();
+        let ca = store.path().join("corp.pem");
+        fs::write(&ca, "-----BEGIN CERTIFICATE-----\n").unwrap();
+        let mut request = request(&json!({
             "type": "wpa-enterprise",
             "eap": "peap",
             "identity": "alice",
             "password": "hunter22",
-            "ca_cert": "/etc/pki/corp.pem",
+            "ca_cert": ca,
         }));
-        validate(&request, KeyManagement::WpaPsk).unwrap();
+        validate(&mut request, KeyManagement::WpaPsk, &CertRoots { pki: store.path(), ..no_roots() }).unwrap();
         let keyfile = render(&request, KeyManagement::WpaPsk, false, "u");
-        assert!(keyfile.contains(
+        assert!(keyfile.contains(&format!(
             "[wifi-security]\nkey-mgmt=wpa-eap\n\n[802-1x]\neap=peap;\nidentity=alice\n\
-             ca-cert=/etc/pki/corp.pem\npassword=hunter22\nphase2-auth=mschapv2\n"
-        ));
+             ca-cert={}\npassword=hunter22\nphase2-auth=mschapv2\n",
+            ca.display()
+        )));
         assert!(!render_redacted(&request, KeyManagement::WpaPsk, false, "u").contains("hunter22"));
         assert!(!format!("{request:?}").contains("hunter22"));
+        // EAP-MD5 cannot key a Wi-Fi link.
+        let mut md5 = self::request(&json!({
+            "type": "wpa-enterprise", "eap": "md5", "identity": "alice", "password": "hunter22",
+        }));
+        let error = validate(&mut md5, KeyManagement::WpaPsk, &no_roots()).unwrap_err().to_string();
+        assert!(error.contains("md5"), "{error}");
+    }
+
+    #[test]
+    fn wpa3_enterprise_192_bit_networks_are_unsupported() {
+        let networks = parse_scan(
+            " :436F7270:70:5500 MHz:WPA3 802.1X:(none):pair_gcmp256 group_gcmp256 eap_suite_b_192\n\
+             \x20:4D6978:60:5500 MHz:WPA2 WPA3 802.1X:(none):pair_ccmp group_ccmp 802.1X eap_suite_b_192\n",
+        );
+        let security: Vec<_> = networks.iter().map(|network| (network.ssid.as_str(), network.security)).collect();
+        assert_eq!(security, [("Corp", Security::Unknown), ("Mix", Security::WpaEnterprise)]);
     }
 
     #[test]
@@ -418,12 +446,12 @@ mod tests {
         ] {
             let mut request = request(&security);
             request.ssid = ssid.to_owned();
-            let error = validate(&request, KeyManagement::WpaPsk).unwrap_err().to_string();
+            let error = validate(&mut request, KeyManagement::WpaPsk, &no_roots()).unwrap_err().to_string();
             assert!(!error.contains("short") && !error.contains("bad"), "{error}");
         }
         // SAE passwords are not limited to WPA-PSK's 8-63 characters.
-        let request = request(&json!({"type": "wpa-personal", "password": "short"}));
-        validate(&request, KeyManagement::Sae).unwrap();
+        let mut request = request(&json!({"type": "wpa-personal", "password": "short"}));
+        validate(&mut request, KeyManagement::Sae, &no_roots()).unwrap();
         // Unknown fields and security types are refused.
         for security in [
             json!({"type": "wep", "password": "x"}),

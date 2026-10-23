@@ -107,10 +107,13 @@ pub trait Act: Deserialize<'static> {
 /// });
 /// ```
 ///
-/// An action without a payload uses a unit struct. A typed action may use a
-/// named struct, tuple payload, or any type that implements `Deserialize`.
-/// The generated action enum is deserialized from an object whose key is the
-/// action name in snake case, matching the wire protocol.
+/// An action without a payload uses an empty struct, which accepts any
+/// object. A typed action may use a named struct, tuple payload, or any type
+/// that implements `Deserialize`. The generated action enum is deserialized
+/// from an object whose key is the action name in snake case, matching the
+/// wire protocol; an omitted payload (`null`) is read as `{}`, so actions
+/// whose fields all have defaults accept it (see
+/// [`parse_action`](super::module_support::parse_action)).
 #[macro_export]
 macro_rules! actions {
     ($Action:ident [$payload:ident $user:ident] => {$($inner:tt)*}) => {
@@ -130,8 +133,9 @@ macro_rules! actions {
         $crate::actions!(@[$payload $user $Action]{$($rest)*}[$($done)* $a]);
     };
     (@[$payload:ident $user:ident $Action:ident]{$a:ident => $body:expr, $($rest:tt)*}[$($done:ident)*]) => {
+        // Takes no payload: any object (or `null`, see `parse_action`).
         #[derive(Debug, ::serde::Deserialize)]
-        struct $a;
+        struct $a {}
         impl $crate::prelude::Act for $a {
             // fn is_priviledged(&self) -> bool { false }
             fn handle(self, user: Option<&str>) -> Result<Value> {
@@ -169,10 +173,40 @@ macro_rules! actions {
         }
         impl $Action {
             fn from_payload(action: &str, payload: Value) -> Result<impl Act> {
-                let act = ::serde_json::Value::Object([(action.into(), payload)].into_iter().collect());
-                let act: $Action = ::serde_json::from_value(act)?;
-                Ok(act)
+                $crate::agent::module_support::parse_action::<$Action>(action, payload)
             }
         }
     } };
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    actions!(Action [payload user] => {
+        Ping => Ok(json!("pong")),
+        Echo { value: i64 } => Ok(json!(payload.value)),
+        Stop {
+            #[serde(default)]
+            dry_run: bool,
+        } => Ok(json!(payload.dry_run)),
+    });
+
+    #[test]
+    fn payload_less_actions_take_null_or_an_object() {
+        for payload in [Value::Null, json!({}), json!({ "x": 1 })] {
+            let response = Action::from_payload("ping", payload).unwrap().handle(None);
+            assert_eq!(response.unwrap(), "pong");
+        }
+        assert!(Action::from_payload("ping", json!("")).is_err());
+        assert!(Action::from_payload("ping", json!([1])).is_err());
+        // A payload whose fields all have defaults may be left out.
+        let response = Action::from_payload("stop", Value::Null).unwrap().handle(None);
+        assert_eq!(response.unwrap(), false);
+        assert!(Action::from_payload("echo", Value::Null).is_err());
+        let response = Action::from_payload("echo", json!({ "value": 7 })).unwrap().handle(None);
+        assert_eq!(response.unwrap(), 7);
+    }
 }

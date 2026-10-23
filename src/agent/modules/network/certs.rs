@@ -12,11 +12,12 @@
 //! restore) points at. Once a change settles, [`prune`] removes every file
 //! the profile on disk no longer names, and the directory with the last one.
 
-use std::{fmt::Write as _, io, os::unix::fs::PermissionsExt as _};
+use std::{io, os::unix::fs::PermissionsExt as _};
 
 use sha2::{Digest as _, Sha256};
 
 use super::paths::write_keyfile;
+use crate::auth::sessions::hex;
 use crate::prelude::*;
 use crate::types::{Wired8021x, is_pem};
 
@@ -49,12 +50,7 @@ pub fn externalize(settings: &mut Wired8021x, dir: &Path) -> Vec<PemFile> {
             continue;
         };
         let digest = Sha256::digest(pem.as_bytes());
-        let mut name = format!("{stem}-");
-        for byte in &digest[..16] {
-            let _ok: std::fmt::Result = write!(name, "{byte:02x}");
-        }
-        name.push_str(".pem");
-        let path = dir.join(name);
+        let path = dir.join(format!("{stem}-{}.pem", hex(&digest[..16])));
         *value = Some(path.to_string_lossy().into_owned());
         files.push(PemFile {
             path,
@@ -96,7 +92,9 @@ fn create_private_dir(dir: &Path) -> Result<()> {
 }
 
 /// Remove the files in `dir` that `keyfile` (the profile now on disk, if
-/// any) does not name, and `dir` itself once it is empty. Failures are
+/// any) does not name, by their path in `dir` or their resolved path (how
+/// validation renders a path the request gave), and `dir` itself once it is
+/// empty. Failures are
 /// logged, not returned: the profile change itself has already happened.
 pub fn prune(dir: &Path, keyfile: Option<&[u8]>) {
     let keyfile = keyfile.map(String::from_utf8_lossy).unwrap_or_default();
@@ -110,7 +108,8 @@ pub fn prune(dir: &Path, keyfile: Option<&[u8]>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if keyfile.contains(&*path.to_string_lossy()) {
+        let named = |path: &Path| keyfile.contains(&*path.to_string_lossy());
+        if named(&path) || fs::canonicalize(&path).is_ok_and(|real| named(&real)) {
             continue;
         }
         if let Err(error) = fs::remove_file(&path) {
@@ -189,5 +188,22 @@ mod tests {
         prune(&dir, None);
         assert!(!dir.exists());
         prune(&dir, None);
+    }
+
+    #[test]
+    fn prune_keeps_files_the_profile_names_by_their_resolved_path() {
+        // The store reached through a symlink, as `/etc/pki` could be.
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("real"), root.path().join("pki")).unwrap();
+        let dir = root.path().join("pki/tetra/eth0");
+        let mut settings = settings();
+        write(&externalize(&mut settings, &dir)).unwrap();
+        let key = fs::canonicalize(settings.private_key.unwrap()).unwrap();
+        let keyfile = format!("[802-1x]\nprivate-key={}\n", key.display());
+
+        prune(&dir, Some(keyfile.as_bytes()));
+        assert!(key.exists());
+        assert!(!Path::new(&settings.ca_cert.unwrap()).exists());
     }
 }

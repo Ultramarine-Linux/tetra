@@ -132,18 +132,27 @@ pub struct Wired8021x {
 
 impl std::fmt::Debug for Wired8021x {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // PEM contents (above all a private key) are not shown, only paths.
+        // PEM contents are not shown, only paths.
         let shown = |value: &Option<String>| {
             value
                 .as_deref()
                 .map(|value| if is_pem(value) { "<pem>" } else { value }.to_owned())
         };
+        // The private key could be in any encoding (a BOM before the PEM,
+        // base64 DER, ...), so only a plain absolute path is shown.
+        let private_key = self.private_key.as_deref().map(|value| {
+            if Path::new(value).is_absolute() && !value.chars().any(char::is_control) {
+                value
+            } else {
+                "<redacted>"
+            }
+        });
         f.debug_struct("Wired8021x")
             .field("eap", &self.eap)
             .field("identity", &self.identity)
             .field("ca_cert", &shown(&self.ca_cert))
             .field("client_cert", &shown(&self.client_cert))
-            .field("private_key", &shown(&self.private_key))
+            .field("private_key", &private_key)
             .field("domain_suffix_match", &self.domain_suffix_match)
             .field("phase2", &self.phase2)
             .finish_non_exhaustive()
@@ -437,7 +446,8 @@ pub struct ServiceListRequest {
     pub scope: ServiceScope,
 }
 
-const fn default_true() -> bool {
+/// `true`, for `#[serde(default = "crate::types::default_true")]`.
+pub(crate) const fn default_true() -> bool {
     true
 }
 
@@ -779,6 +789,30 @@ mod tests {
         };
         write.write().unwrap();
         assert_eq!(FileReadRequest { path }.read().unwrap(), "written");
+    }
+
+    #[test]
+    fn wired_8021x_debug_shows_only_a_private_key_path() {
+        let debug = |private_key: &str| {
+            let settings: Wired8021x = serde_json::from_value(json!({
+                "eap": "tls",
+                "identity": "host",
+                "private_key": private_key,
+            }))
+            .unwrap();
+            format!("{settings:?}")
+        };
+        assert!(debug("/etc/pki/tls/private/host.key").contains("/etc/pki/tls/private/host.key"));
+        for secret in [
+            "-----BEGIN PRIVATE KEY-----\nS3CRET\n-----END PRIVATE KEY-----\n",
+            "\u{feff}-----BEGIN PRIVATE KEY-----\nS3CRET\n-----END PRIVATE KEY-----\n",
+            "MIIEvS3CRETbase64DER",
+            "/S3CRET\nline",
+        ] {
+            let shown = debug(secret);
+            assert!(!shown.contains("S3CRET"), "{shown}");
+            assert!(shown.contains("<redacted>"), "{shown}");
+        }
     }
 
     #[test]

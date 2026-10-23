@@ -15,11 +15,16 @@ mod common;
 
 use std::os::unix::fs::PermissionsExt;
 
-use common::{Oobe, call, fails, ok};
+use common::{Oobe, access_set, call, fails, fresh, ok, setup_session, setup_token};
 use serde_json::{Value, json};
 use tetra::{
-    agent::Dispatcher,
+    agent::{
+        Dispatcher,
+        module_support::{ModuleInfo, ModuleStatus},
+        modules::Mod,
+    },
     auth::{
+        AuthService,
         api::{ErrorCode, Response},
         authz,
         testing::TestHost,
@@ -27,30 +32,26 @@ use tetra::{
 };
 
 const DNS_TOKEN: &str = "cf-api-token-S3CRET-value";
+/// Caddy's drop-in under `systemd_dir`, loading the DNS-01 environment.
+const CADDY_DROP_IN: &str = "caddy.service.d/50-tetra.conf";
+/// The sealed DNS-01 credentials under `secrets_dir()`.
+const SEALED_DNS: &str = "tetra-dns-credentials.cred";
 
-fn fresh(dir: &std::path::Path) -> TestHost {
-    TestHost::new(dir).unwrap()
-}
-
-async fn setup_token(host: &TestHost) -> String {
-    setup_session(host).await.0
-}
-
-/// A setup session's token and public ID.
-async fn setup_session(host: &TestHost) -> (String, String) {
-    let code = host.service.publish_setup_code().unwrap().unwrap();
-    let session = ok(
-        &host.service,
+async fn dispatch_on(
+    service: &AuthService,
+    token: &str,
+    module: &str,
+    action: &str,
+    payload: Value,
+) -> Response {
+    call(
+        service,
         Oobe,
-        None,
-        "setup.redeem",
-        json!({"code": code, "remote_addr": "192.0.2.50"}),
+        Some(token),
+        "module.dispatch",
+        json!({"module": module, "action": action, "payload": payload}),
     )
-    .await;
-    (
-        session["token"].as_str().unwrap().to_owned(),
-        session["session"]["id"].as_str().unwrap().to_owned(),
-    )
+    .await
 }
 
 async fn dispatch(
@@ -60,12 +61,29 @@ async fn dispatch(
     action: &str,
     payload: Value,
 ) -> Response {
-    call(
-        &host.service,
-        Oobe,
-        Some(token),
-        "module.dispatch",
-        json!({"module": module, "action": action, "payload": payload}),
+    dispatch_on(&host.service, token, module, action, payload).await
+}
+
+/// A dry-run `users.set_password` for `name`.
+async fn set_password(service: &AuthService, token: &str, name: &str) -> Response {
+    dispatch_on(
+        service,
+        token,
+        "users",
+        "set_password",
+        json!({"name": name, "password_hash": "$y$j9T$hash", "dry_run": true}),
+    )
+    .await
+}
+
+/// A dry-run `users.add_admin` for `name`.
+async fn add_admin(host: &TestHost, token: &str, name: &str) -> Response {
+    dispatch(
+        host,
+        token,
+        "users",
+        "add_admin",
+        json!({"name": name, "dry_run": true}),
     )
     .await
 }
@@ -89,7 +107,7 @@ async fn the_setup_session_is_denied_every_action_not_on_the_allowlist() {
     actions.push(("nope".into(), "nope".into()));
     let mut denied = 0;
     for (module, action) in &actions {
-        if authz::setup_allows(module, action) {
+        if authz::SETUP_ALLOWED.contains(&(module.as_str(), action.as_str())) {
             continue;
         }
         let response = dispatch(&host, &token, module, action, json!({"dry_run": true})).await;
@@ -152,7 +170,8 @@ async fn the_setup_session_is_denied_every_action_not_on_the_allowlist() {
 async fn the_setup_session_may_run_the_new_oobe_actions() {
     let dir = tempfile::tempdir().unwrap();
     let host = fresh(dir.path());
-    let token = setup_token(&host).await;
+    let (token, session) = setup_session(&host).await;
+    host.record_setup_account(&session, "admin").unwrap();
     for (module, action, payload) in [
         (
             "settings",
@@ -224,21 +243,14 @@ async fn the_setup_session_may_run_the_new_oobe_actions() {
 async fn add_admin_is_only_for_the_first_administrator() {
     let dir = tempfile::tempdir().unwrap();
     let host = fresh(dir.path());
-    let token = setup_token(&host).await;
-    let add_admin = || {
-        dispatch(
-            &host,
-            &token,
-            "users",
-            "add_admin",
-            json!({"name": "admin", "dry_run": true}),
-        )
-    };
-    assert!(add_admin().await.ok);
+    let (token, session) = setup_session(&host).await;
+    host.record_setup_account(&session, "admin").unwrap();
+    let response = add_admin(&host, &token, "admin").await;
+    assert!(response.ok, "{:?}", response.error);
     // Once an eligible administrator exists (made by the OOBE or Readymade),
     // the setup code cannot make more.
     host.accounts.add("admin", 1001, &["ultramarine-admin"]);
-    let response = add_admin().await;
+    let response = add_admin(&host, &token, "admin").await;
     assert_eq!(response.error.unwrap().code, ErrorCode::Forbidden);
     // users.update could change group memberships, so it is not on the list.
     let response = dispatch(
@@ -253,6 +265,29 @@ async fn add_admin_is_only_for_the_first_administrator() {
 }
 
 #[tokio::test]
+async fn add_admin_only_promotes_accounts_the_setup_session_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = fresh(dir.path());
+    let (token, session) = setup_session(&host).await;
+    // Accounts that existed before setup: the installer's user, a service
+    // account, root. None is an administrator yet.
+    host.accounts.add("installer", 1000, &[]);
+    host.accounts.add("postgres", 26, &[]);
+    host.accounts.add("root", 0, &["root"]);
+    for name in ["installer", "postgres", "root", "nobody-here"] {
+        let response = add_admin(&host, &token, name).await;
+        assert_eq!(response.error.unwrap().code, ErrorCode::Forbidden, "{name}");
+    }
+    host.record_setup_account(&session, "newadmin").unwrap();
+    let response = add_admin(&host, &token, "newadmin").await;
+    assert!(response.ok, "{:?}", response.error);
+    // Root stays off limits even if the session somehow recorded it.
+    host.record_setup_account(&session, "root").unwrap();
+    let response = add_admin(&host, &token, "root").await;
+    assert_eq!(response.error.unwrap().code, ErrorCode::Forbidden);
+}
+
+#[tokio::test]
 async fn the_setup_session_only_sets_up_accounts_it_created() {
     let dir = tempfile::tempdir().unwrap();
     let host = fresh(dir.path());
@@ -260,15 +295,7 @@ async fn the_setup_session_only_sets_up_accounts_it_created() {
     // An administrator Readymade created, and root.
     host.accounts.add("admin", 1001, &["ultramarine-admin"]);
     host.accounts.add("root", 0, &["root"]);
-    let set_password = |name: &'static str| {
-        dispatch(
-            &host,
-            &token,
-            "users",
-            "set_password",
-            json!({"name": name, "password_hash": "$y$j9T$hash", "dry_run": true}),
-        )
-    };
+    let set_password = |name: &'static str| set_password(&host.service, &token, name);
     let set_keys = |name: &'static str| {
         dispatch(
             &host,
@@ -314,31 +341,64 @@ async fn the_setup_session_only_sets_up_accounts_it_created() {
 
     // The record is kept with the session, across a Tetra restart.
     let service = host.restart().unwrap();
-    let response = call(
-        &service,
-        Oobe,
-        Some(&token),
-        "module.dispatch",
-        json!({
-            "module": "users",
-            "action": "set_password",
-            "payload": {"name": "alice", "password_hash": "$y$j9T$hash", "dry_run": true},
-        }),
-    )
-    .await;
+    let response = self::set_password(&service, &token, "alice").await;
     assert!(response.ok, "{:?}", response.error);
 
     // A new setup session starts with no accounts of its own.
     let (token, _) = setup_session(&host).await;
-    let response = dispatch(
-        &host,
-        &token,
-        "users",
-        "set_password",
-        json!({"name": "alice", "password_hash": "$y$j9T$hash", "dry_run": true}),
-    )
-    .await;
+    let response = self::set_password(&host.service, &token, "alice").await;
     assert_eq!(response.error.unwrap().code, ErrorCode::Forbidden);
+}
+
+/// A `users` module that pretends to run `useradd`: `create` fails for
+/// `taken`, everything else succeeds.
+struct StubUsers;
+
+impl Mod for StubUsers {
+    fn info(&self) -> ModuleInfo {
+        ModuleInfo {
+            name: "users",
+            feature: "users",
+            description: "Stub users module",
+            status: ModuleStatus::Available,
+            actions: &["create", "set_password"],
+            privileged_actions: &[],
+        }
+    }
+
+    fn handle(&self, action: &str, payload: Value, _user: Option<&str>) -> anyhow::Result<Value> {
+        if action == "create" && payload["name"] == "taken" {
+            anyhow::bail!("useradd: user 'taken' already exists");
+        }
+        Ok(json!({ "action": action }))
+    }
+}
+
+#[tokio::test]
+async fn a_successful_users_create_makes_the_account_the_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let host =
+        TestHost::with_dispatcher(dir.path(), |dispatcher| dispatcher.with_module(StubUsers))
+            .unwrap();
+    let (token, _) = setup_session(&host).await;
+    let create =
+        |name: &'static str| dispatch(&host, &token, "users", "create", json!({"name": name}));
+
+    let response = create("alice").await;
+    assert!(response.ok, "{:?}", response.error);
+    let response = set_password(&host.service, &token, "alice").await;
+    assert!(response.ok, "{:?}", response.error);
+
+    let response = create("taken").await;
+    assert_eq!(response.error.unwrap().code, ErrorCode::ActionFailed);
+    assert_eq!(
+        set_password(&host.service, &token, "taken")
+            .await
+            .error
+            .unwrap()
+            .code,
+        ErrorCode::Forbidden
+    );
 }
 
 #[tokio::test]
@@ -371,15 +431,16 @@ async fn one_noisy_address_is_throttled_before_the_global_counter() {
             json!({"code": code, "remote_addr": addr}),
         )
     };
-    for _ in 0..3 {
-        let response = redeem("WRONG", "198.51.100.7").await;
+    for port in 0..3 {
+        let response = redeem("WRONG", &format!("198.51.100.7:{}", 50000 + port)).await;
         assert_eq!(response.error.unwrap().code, ErrorCode::InvalidCredentials);
     }
     host.clock.advance(1);
-    // The noisy address now waits on its own, and its attempts no longer
-    // count against the code.
-    for _ in 0..20 {
-        let error = redeem("WRONG", "198.51.100.7").await.error.unwrap();
+    // The noisy address now waits on its own, whatever its source port, and
+    // its attempts no longer count against the code.
+    for port in 0..20 {
+        let addr = format!("198.51.100.7:{}", 40000 + port);
+        let error = redeem("WRONG", &addr).await.error.unwrap();
         assert_eq!(error.code, ErrorCode::RateLimited);
         assert!(error.retry_after.unwrap() >= 29, "{error:?}");
     }
@@ -397,6 +458,43 @@ async fn one_noisy_address_is_throttled_before_the_global_counter() {
     )
     .await;
     assert!(response.ok, "{:?}", response.error);
+}
+
+#[tokio::test]
+async fn ports_and_unparseable_addresses_do_not_dodge_the_address_throttle() {
+    // One IPv6 /64 behind brackets and ports, and strings that are not
+    // addresses: each group is one bucket, refused after three failures.
+    for addrs in [
+        [
+            "[2001:db8:1:2::7]:1",
+            "[2001:db8:1:2::8]:2",
+            "2001:db8:1:2::9",
+            "[2001:db8:1:2::a]",
+        ],
+        ["not an address", "x1", "x2", "x3"],
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let host = fresh(dir.path());
+        host.service.publish_setup_code().unwrap();
+        let redeem = |addr: &str| {
+            call(
+                &host.service,
+                Oobe,
+                None,
+                "setup.redeem",
+                json!({"code": "WRONG", "remote_addr": addr}),
+            )
+        };
+        for addr in &addrs[..3] {
+            let response = redeem(addr).await;
+            assert_eq!(response.error.unwrap().code, ErrorCode::InvalidCredentials);
+        }
+        // Past the global counter's first (one second) wait.
+        host.clock.advance(1);
+        let error = redeem(addrs[3]).await.error.unwrap();
+        assert_eq!(error.code, ErrorCode::RateLimited, "{addrs:?}");
+        assert!(error.retry_after.unwrap() >= 29, "{addrs:?}: {error:?}");
+    }
 }
 
 #[tokio::test]
@@ -450,14 +548,13 @@ async fn setup_complete_hands_over_to_the_dashboard() {
     let dir = tempfile::tempdir().unwrap();
     let host = fresh(dir.path());
     let token = setup_token(&host).await;
-    ok(
-        &host.service,
-        Oobe,
-        Some(&token),
-        "access.set",
+    let response = access_set(
+        &host,
+        &token,
         json!({"mode": "ip", "hostname": "2001:db8::10"}),
     )
     .await;
+    assert!(response.ok, "{:?}", response.error);
     host.accounts.add("admin", 1001, &["ultramarine-admin"]);
     // The handoff only runs once setup is complete.
     host.service.finish_handoff().unwrap_err();
@@ -476,16 +573,20 @@ async fn setup_complete_hands_over_to_the_dashboard() {
     assert_eq!(result["handoff_in_seconds"], 5);
     assert_eq!(result["handoff"]["dashboard_started"], true);
     assert_eq!(result["handoff"]["oobe_stop_scheduled"], true);
-    // The dashboard is started now; the OOBE is stopped by a timer, after
-    // this response has reached it.
+    // The dashboard is started now, without waiting for its image; the
+    // OOBE is stopped by a timer, after this response has reached it, with
+    // this service's directories.
     assert_eq!(
         host.host.calls(),
         [
-            "systemctl start ultramarine-dashboard.service".to_owned(),
-            "systemd-run --on-active=5 --unit=tetra-setup-handoff \
-             --description=Hand over from the Ultramarine Server setup to the dashboard \
-             --collect /usr/bin/tetra setup finish-handoff"
-                .to_owned(),
+            "systemctl --no-block start ultramarine-dashboard.service".to_owned(),
+            format!(
+                "systemd-run --on-active=5 --unit=tetra-setup-handoff \
+                 --description=Hand over from the Ultramarine Server setup to the dashboard \
+                 --collect /usr/bin/tetra setup finish-handoff --state-dir {} --caddy-sites-dir {}",
+                host.config.state_dir.display(),
+                host.config.caddy_sites_dir.display()
+            ),
         ]
     );
     assert!(host.config.caddy_sites_dir.join(SETUP_SITE_FILE).exists());
@@ -497,7 +598,8 @@ async fn setup_complete_hands_over_to_the_dashboard() {
     assert_eq!(
         host.host.calls(),
         [
-            "systemctl disable --now ultramarine-server-oobe.service tetra-setup-code.service",
+            "systemctl disable --now ultramarine-server-oobe.service",
+            "systemctl disable --now tetra-setup-code.service",
             "systemctl try-reload-or-restart caddy.service",
         ]
     );
@@ -515,13 +617,48 @@ async fn setup_complete_hands_over_to_the_dashboard() {
 }
 
 #[tokio::test]
+async fn a_restart_finishes_a_handoff_its_timer_did_not() {
+    use tetra::agent::modules::reverse_proxy::SETUP_SITE_FILE;
+    let dir = tempfile::tempdir().unwrap();
+    let host = fresh(dir.path());
+    let site = host.config.caddy_sites_dir.join(SETUP_SITE_FILE);
+    let token = setup_token(&host).await;
+    host.service.publish_setup_code().unwrap();
+    assert!(site.exists());
+    // During setup, the OOBE stays.
+    host.host.clear();
+    host.restart().unwrap().resume_handoff();
+    assert_eq!(host.host.calls(), Vec::<String>::new());
+
+    // Setup completes, but the timer never runs (say, the host reboots).
+    host.accounts.add("admin", 1001, &["wheel"]);
+    ok(&host.service, Oobe, Some(&token), "setup.complete", json!({})).await;
+    assert!(site.exists());
+    host.host.clear();
+    host.restart().unwrap().resume_handoff();
+    assert_eq!(
+        host.host.calls(),
+        [
+            "systemctl disable --now ultramarine-server-oobe.service",
+            "systemctl disable --now tetra-setup-code.service",
+            "systemctl try-reload-or-restart caddy.service",
+        ]
+    );
+    assert!(!site.exists());
+    // Once it is done, a restart does nothing.
+    host.host.clear();
+    host.restart().unwrap().resume_handoff();
+    assert_eq!(host.host.calls(), Vec::<String>::new());
+}
+
+#[tokio::test]
 async fn a_failed_dashboard_start_is_reported_but_setup_stays_complete() {
     let dir = tempfile::tempdir().unwrap();
     let host = fresh(dir.path());
     let token = setup_token(&host).await;
     host.accounts.add("admin", 1001, &["wheel"]);
     host.host
-        .fail("systemctl start ultramarine-dashboard.service");
+        .fail("systemctl --no-block start ultramarine-dashboard.service");
     let result = ok(
         &host.service,
         Oobe,
@@ -543,6 +680,44 @@ async fn a_failed_dashboard_start_is_reported_but_setup_stays_complete() {
 }
 
 #[tokio::test]
+async fn a_failed_session_revocation_does_not_stop_the_handoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = fresh(dir.path());
+    let token = setup_token(&host).await;
+    host.accounts.add("admin", 1001, &["wheel"]);
+    // The session file can no longer be replaced.
+    let sessions = host.config.auth_dir().join("sessions.json");
+    std::fs::remove_file(&sessions).unwrap();
+    std::fs::create_dir_all(&sessions).unwrap();
+    host.host.clear();
+
+    let result = ok(
+        &host.service,
+        Oobe,
+        Some(&token),
+        "setup.complete",
+        json!({}),
+    )
+    .await;
+    assert_eq!(result["complete"], true);
+    assert_eq!(result["handoff"]["dashboard_started"], true);
+    assert_eq!(
+        host.host.calls()[0],
+        "systemctl --no-block start ultramarine-dashboard.service"
+    );
+    // The setup session is still over.
+    fails(
+        &host.service,
+        Oobe,
+        Some(&token),
+        "session.info",
+        json!({}),
+        ErrorCode::Unauthenticated,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn completing_setup_from_the_console_stops_the_oobe_right_away() {
     let dir = tempfile::tempdir().unwrap();
     let host = fresh(dir.path());
@@ -550,15 +725,82 @@ async fn completing_setup_from_the_console_stops_the_oobe_right_away() {
     host.accounts.add("admin", 1001, &["wheel"]);
     host.host.clear();
     let handoff = host.service.complete_setup_from_console().unwrap();
-    assert_eq!(handoff["dashboard_started"], true);
+    assert!(handoff.dashboard_started);
+    assert_eq!(handoff.oobe_error, None);
     assert_eq!(
         host.host.calls(),
         [
-            "systemctl start ultramarine-dashboard.service",
-            "systemctl disable --now ultramarine-server-oobe.service tetra-setup-code.service",
+            "systemctl --no-block start ultramarine-dashboard.service",
+            "systemctl disable --now ultramarine-server-oobe.service",
+            "systemctl disable --now tetra-setup-code.service",
             "systemctl try-reload-or-restart caddy.service",
         ]
     );
+}
+
+#[tokio::test]
+async fn finishing_the_handoff_tolerates_a_missing_oobe_unit() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = fresh(dir.path());
+    host.service.publish_setup_code().unwrap();
+    host.accounts.add("admin", 1001, &["wheel"]);
+    let oobe = "systemctl disable --now ultramarine-server-oobe.service";
+    let setup_code = "systemctl disable --now tetra-setup-code.service";
+    // As systemctl reports it on a host without the OOBE installed.
+    host.host.fail_with(
+        oobe,
+        "Failed to disable unit: Unit file ultramarine-server-oobe.service does not exist.",
+    );
+    host.host.clear();
+    let handoff = host.service.complete_setup_from_console().unwrap();
+    assert_eq!(handoff.oobe_error, None);
+    // The setup-code unit is still stopped.
+    assert!(host.host.calls().iter().any(|call| call == setup_code));
+
+    // Any other failure is reported, and the other unit still stopped.
+    host.host.fail(oobe);
+    host.host.clear();
+    let error = host.service.finish_handoff().unwrap_err().to_string();
+    assert!(error.contains("ultramarine-server-oobe.service"), "{error}");
+    assert!(host.host.calls().iter().any(|call| call == setup_code));
+}
+
+#[tokio::test]
+async fn a_failed_oobe_stop_keeps_the_site_so_a_restart_retries() {
+    use tetra::agent::modules::reverse_proxy::SETUP_SITE_FILE;
+    let dir = tempfile::tempdir().unwrap();
+    let host = fresh(dir.path());
+    let site = host.config.caddy_sites_dir.join(SETUP_SITE_FILE);
+    host.service.publish_setup_code().unwrap();
+    host.accounts.add("admin", 1001, &["wheel"]);
+    let oobe = "systemctl disable --now ultramarine-server-oobe.service";
+    host.host.fail(oobe);
+    host.host.clear();
+    let handoff = host.service.complete_setup_from_console().unwrap();
+    assert!(handoff.oobe_error.unwrap().contains("ultramarine-server-oobe.service"));
+    // The site marks the handoff as unfinished, so Caddy is left alone.
+    assert!(site.exists());
+    assert!(!host.host.calls().iter().any(|call| call.contains("caddy")));
+
+    // Showing the code again (none, now) leaves the site alone.
+    host.host.clear();
+    assert_eq!(host.service.publish_setup_code().unwrap(), None);
+    assert!(site.exists());
+    assert_eq!(host.host.calls(), Vec::<String>::new());
+
+    // A restart retries it.
+    host.host.succeed(oobe);
+    host.host.clear();
+    host.restart().unwrap().resume_handoff();
+    assert_eq!(
+        host.host.calls(),
+        [
+            oobe,
+            "systemctl disable --now tetra-setup-code.service",
+            "systemctl try-reload-or-restart caddy.service",
+        ]
+    );
+    assert!(!site.exists());
 }
 
 /// The Caddy-related commands the service ran.
@@ -601,15 +843,10 @@ async fn dns_01_credentials_reach_caddy_only_through_its_environment() {
     let host = fresh(dir.path());
     let token = setup_token(&host).await;
     host.host.clear();
-    let request = dns_request();
-    let result = ok(
-        &host.service,
-        Oobe,
-        Some(&token),
-        "access.set",
-        request.clone(),
-    )
-    .await;
+    let result = access_set(&host, &token, dns_request())
+        .await
+        .result
+        .unwrap();
     assert!(!result.to_string().contains(DNS_TOKEN), "{result}");
     assert_eq!(result["access"]["challenge"], "dns-01");
     assert_eq!(result["access"]["dns_provider"], "cloudflare");
@@ -640,23 +877,13 @@ async fn dns_01_credentials_reach_caddy_only_through_its_environment() {
         use std::os::unix::fs::MetadataExt;
         assert_eq!((metadata.uid(), metadata.gid()), (0, caddy.gid.as_raw()));
     }
-    let drop_in = std::fs::read_to_string(
-        host.config
-            .systemd_dir
-            .join("caddy.service.d/50-tetra.conf"),
-    )
-    .unwrap();
+    let drop_in = std::fs::read_to_string(host.config.systemd_dir.join(CADDY_DROP_IN)).unwrap();
     assert!(drop_in.contains(&format!(
         "EnvironmentFile=-{}\n",
         host.config.caddy_env_file.display()
     )));
     // Sealed in Tetra's store; not in access.json or the action log.
-    assert!(
-        host.config
-            .secrets_dir()
-            .join("tetra-dns-credentials.cred")
-            .exists()
-    );
+    assert!(host.config.secrets_dir().join(SEALED_DNS).exists());
     assert!(
         !std::fs::read_to_string(host.config.access_path())
             .unwrap()
@@ -679,14 +906,7 @@ async fn stored_dns_credentials_are_reused_and_forgotten_with_dns_01() {
     let host = fresh(dir.path());
     let token = setup_token(&host).await;
     let request = dns_request();
-    ok(
-        &host.service,
-        Oobe,
-        Some(&token),
-        "access.set",
-        request.clone(),
-    )
-    .await;
+    assert!(access_set(&host, &token, request.clone()).await.ok);
 
     // The same settings again only reload, and the stored credentials are
     // reused when left out.
@@ -694,7 +914,7 @@ async fn stored_dns_credentials_are_reused_and_forgotten_with_dns_01() {
     let mut again = request.clone();
     again.as_object_mut().unwrap().remove("dns_credentials");
     again["port"] = json!(8443);
-    ok(&host.service, Oobe, Some(&token), "access.set", again).await;
+    assert!(access_set(&host, &token, again).await.ok);
     assert_eq!(
         caddy_calls(&host),
         ["systemctl try-reload-or-restart caddy.service"]
@@ -702,44 +922,24 @@ async fn stored_dns_credentials_are_reused_and_forgotten_with_dns_01() {
     assert!(read_tree(&host.config.caddy_sites_dir).contains("server.example.com:8443 {"));
 
     // Another provider needs its own credentials.
-    let mut other = request.clone();
+    let mut other = request;
     other["dns_provider"] = json!("desec");
     other.as_object_mut().unwrap().remove("dns_credentials");
-    fails(
-        &host.service,
-        Oobe,
-        Some(&token),
-        "access.set",
-        other,
-        ErrorCode::BadRequest,
-    )
-    .await;
+    let response = access_set(&host, &token, other).await;
+    assert_eq!(response.error.unwrap().code, ErrorCode::BadRequest);
 
     // Switching to HTTP-01 forgets them.
     host.host.clear();
-    ok(
-        &host.service,
-        Oobe,
-        Some(&token),
-        "access.set",
+    let response = access_set(
+        &host,
+        &token,
         json!({"mode": "domain", "hostname": "server.example.com", "challenge": "http-01"}),
     )
     .await;
+    assert!(response.ok, "{:?}", response.error);
     assert!(!host.config.caddy_env_file.exists());
-    assert!(
-        !host
-            .config
-            .systemd_dir
-            .join("caddy.service.d/50-tetra.conf")
-            .exists()
-    );
-    assert!(
-        !host
-            .config
-            .secrets_dir()
-            .join("tetra-dns-credentials.cred")
-            .exists()
-    );
+    assert!(!host.config.systemd_dir.join(CADDY_DROP_IN).exists());
+    assert!(!host.config.secrets_dir().join(SEALED_DNS).exists());
     assert!(!read_tree(&host.config.caddy_sites_dir).contains("dns cloudflare"));
     assert_eq!(
         caddy_calls(&host),
@@ -751,6 +951,95 @@ async fn stored_dns_credentials_are_reused_and_forgotten_with_dns_01() {
 }
 
 #[tokio::test]
+async fn invalid_dns_credentials_are_refused_before_anything_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = fresh(dir.path());
+    let token = setup_token(&host).await;
+    assert!(access_set(&host, &token, dns_request()).await.ok);
+    let before = read_tree(dir.path());
+    host.host.clear();
+
+    let with_credentials = |credentials: Value| {
+        let mut request = dns_request();
+        request["hostname"] = json!("other.example.com");
+        request["dns_credentials"] = credentials;
+        request
+    };
+    for request in [
+        // Another provider's keys, none at all, an unknown key, a secret
+        // that is too long or spans lines.
+        with_credentials(json!({"token": "desec-token"})),
+        with_credentials(json!({})),
+        with_credentials(json!({"api_token": "t", "zone": "example.com"})),
+        with_credentials(json!({"api_token": "x".repeat(5000)})),
+        with_credentials(json!({"api_token": "a\nTETRA_DNS_X=1"})),
+        // Credentials without DNS-01.
+        json!({"mode": "domain", "hostname": "other.example.com",
+               "dns_credentials": {"api_token": DNS_TOKEN}}),
+        json!({"mode": "domain", "hostname": "other.example.com", "challenge": "http-01",
+               "dns_provider": "cloudflare"}),
+    ] {
+        let response = access_set(&host, &token, request.clone()).await;
+        assert!(!response.ok, "{request} was accepted");
+        let error = response.error.unwrap();
+        assert_eq!(error.code, ErrorCode::BadRequest, "{request}");
+        assert!(!error.message.contains(DNS_TOKEN), "{}", error.message);
+    }
+    // Nothing was written, sealed, forgotten or reloaded.
+    assert_eq!(read_tree(dir.path()), before);
+    assert_eq!(host.host.calls(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_dashboard_env_failure_is_reported_after_the_access_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut host = fresh(dir.path());
+    // A name the file can be read under, but whose temporary file for the
+    // atomic replace is too long, so only the write fails (even as root).
+    host.config.dashboard_env_file = dir.path().join("e".repeat(240));
+    std::fs::write(
+        &host.config.dashboard_env_file,
+        "ORIGIN=https://old.example.com\n",
+    )
+    .unwrap();
+    let service = host.restart().unwrap();
+    let code = service.publish_setup_code().unwrap().unwrap();
+    let token = ok(&service, Oobe, None, "setup.redeem", json!({"code": code})).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    host.host.clear();
+
+    let result = ok(
+        &service,
+        Oobe,
+        Some(&token),
+        "access.set",
+        json!({"mode": "domain", "hostname": "server.example.com"}),
+    )
+    .await;
+    assert_eq!(result["dashboard_env"]["changed"], false);
+    assert!(result["dashboard_env"]["error"].is_string(), "{result}");
+    // Caddy, access.json and the relying party still moved to the new name
+    // together.
+    assert_eq!(result["caddy"]["reloaded"], true);
+    assert_eq!(result["passkeys_available"], true);
+    assert!(read_tree(&host.config.caddy_sites_dir).contains("server.example.com {"));
+    assert!(
+        std::fs::read_to_string(host.config.access_path())
+            .unwrap()
+            .contains("server.example.com")
+    );
+    assert!(
+        !host
+            .host
+            .calls()
+            .iter()
+            .any(|call| call.contains("ultramarine-dashboard"))
+    );
+}
+
+#[tokio::test]
 async fn access_set_writes_the_dashboard_origin() {
     let dir = tempfile::tempdir().unwrap();
     let host = fresh(dir.path());
@@ -758,21 +1047,26 @@ async fn access_set_writes_the_dashboard_origin() {
     let env = &host.config.dashboard_env_file;
     std::fs::create_dir_all(env.parent().unwrap()).unwrap();
     std::fs::write(env, "BODY_SIZE_LIMIT=10M\nORIGIN=https://old.example.com\n").unwrap();
+    // It may hold the dashboard's secrets: its mode is kept.
+    std::fs::set_permissions(env, std::fs::Permissions::from_mode(0o640)).unwrap();
     host.host.clear();
 
-    let result = ok(
-        &host.service,
-        Oobe,
-        Some(&token),
-        "access.set",
+    let result = access_set(
+        &host,
+        &token,
         json!({"mode": "ip", "hostname": "[2001:db8::10]", "port": 8443}),
     )
-    .await;
+    .await
+    .result
+    .unwrap();
     assert_eq!(
         std::fs::read_to_string(env).unwrap(),
         "BODY_SIZE_LIMIT=10M\nORIGIN=https://[2001:db8::10]:8443\n"
     );
+    let mode = |path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(env), 0o640);
     assert_eq!(result["dashboard_env"]["changed"], true);
+    assert_eq!(result["dashboard_env"]["error"], Value::Null);
     assert_eq!(result["dashboard_url"], "https://[2001:db8::10]:8443");
     // The dashboard is restarted only if it is running, without waiting (it
     // may be the caller).
@@ -784,14 +1078,13 @@ async fn access_set_writes_the_dashboard_origin() {
 
     // Unchanged: no restart.
     host.host.clear();
-    ok(
-        &host.service,
-        Oobe,
-        Some(&token),
-        "access.set",
+    let response = access_set(
+        &host,
+        &token,
         json!({"mode": "ip", "hostname": "2001:db8::10", "port": 8443}),
     )
     .await;
+    assert!(response.ok, "{:?}", response.error);
     assert!(
         !host
             .host
@@ -799,4 +1092,59 @@ async fn access_set_writes_the_dashboard_origin() {
             .iter()
             .any(|call| call.contains("ultramarine-dashboard"))
     );
+
+    // A new file is root-only.
+    std::fs::remove_file(env).unwrap();
+    let response = access_set(
+        &host,
+        &token,
+        json!({"mode": "ip", "hostname": "192.0.2.10"}),
+    )
+    .await;
+    assert!(response.ok, "{:?}", response.error);
+    assert_eq!(mode(env), 0o600);
+}
+
+#[tokio::test]
+async fn the_port_tailscale_forwards_cannot_change_under_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = fresh(dir.path());
+    let token = setup_token(&host).await;
+    let request = |port: u16| json!({"mode": "ip", "hostname": "192.0.2.10", "port": port});
+    assert!(access_set(&host, &token, request(8443)).await.ok);
+    // `tailscale_up` forwards the port in this host's `access.json`.
+    let response = dispatch(
+        &host,
+        &token,
+        "remote_access",
+        "tailscale_up",
+        json!({"auth_key": "tskey-auth-SECRET", "dry_run": true}),
+    )
+    .await;
+    assert_eq!(response.result.unwrap()["target"], "tcp://127.0.0.1:8443");
+
+    // What `tailscale_up` leaves while Tailscale is set up.
+    let drop_in = host
+        .config
+        .systemd_dir
+        .join("tailscaled.service.d/50-tetra.conf");
+    std::fs::create_dir_all(drop_in.parent().unwrap()).unwrap();
+    std::fs::write(&drop_in, "").unwrap();
+    let access = std::fs::read(host.config.access_path()).unwrap();
+    let response = access_set(&host, &token, request(443)).await;
+    let error = response.error.unwrap();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(
+        error.message.contains("remote_access.tailscale_disable"),
+        "{}",
+        error.message
+    );
+    assert_eq!(std::fs::read(host.config.access_path()).unwrap(), access);
+    // The same port, under the node's tailnet name, is fine.
+    let tailnet = json!({"mode": "domain", "hostname": "server.tail1234.ts.net", "port": 8443});
+    assert!(access_set(&host, &token, tailnet).await.ok);
+
+    // After `tailscale_disable`, the port may change.
+    std::fs::remove_file(&drop_in).unwrap();
+    assert!(access_set(&host, &token, request(443)).await.ok);
 }

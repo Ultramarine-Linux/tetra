@@ -17,6 +17,8 @@ RemainAfterExit=yes
 # to /run/tetra/setup-code and /run/issue.d. The same code is republished on
 # every boot until setup completes. Also writes the OOBE's Caddy site (port
 # 6623, tls internal); setup.complete disables this unit again.
+# A drop-in that moves Tetra's directories for tetra.service
+# (TETRA_STATE_DIR, TETRA_CADDY_SITES_DIR) must set them here too.
 ExecStart=/usr/bin/tetra setup code --publish
 StateDirectory=tetra
 StateDirectoryMode=0700

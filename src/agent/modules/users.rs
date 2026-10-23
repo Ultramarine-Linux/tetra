@@ -9,8 +9,10 @@
 //!   (`--home-dir` vs `--home`); the arg-building code below mirrors that
 //!   difference on purpose.
 //! - `set_password` never sees a plaintext password. The caller supplies a
-//!   pre-hashed value (`$y$…`, `$6$…`, …) which is passed straight to
-//!   `usermod --password`, matching how `/etc/shadow` stores it.
+//!   pre-hashed value (`$y$…`, `$6$…`, …) which is fed to
+//!   `chpasswd --encrypted` on stdin, matching how `/etc/shadow` stores it.
+//!   Not on the command line, where any local user could read it, and not in
+//!   the reported command or errors, which end up in the action log.
 //! - `create`/`update` deliberately omit flags the caller did not set, so
 //!   shadow-utils defaults apply for anything left unspecified.
 //! - `add_admin` adds a user to `ultramarine-admin`, the group that makes an
@@ -21,6 +23,9 @@
 //!   directory handles opened with `O_NOFOLLOW`, and the file is renamed into
 //!   place: a symlink planted at `.ssh` or `authorized_keys` makes the action
 //!   fail or is replaced, never followed.
+//! - Account and group names are validated ([`validate_name`]) before they
+//!   reach a command line, so a name such as `--help` cannot be read as an
+//!   option.
 
 use std::{
     io::Write as _,
@@ -43,6 +48,8 @@ const MAX_KEYS: usize = 100;
 /// Longest accepted key line (large RSA keys with options fit easily).
 const MAX_KEY_LEN: usize = 16 * 1024;
 const AUTHORIZED_KEYS: &str = "authorized_keys";
+/// Longest accepted account or group name (the `utmp` limit).
+const MAX_NAME_LEN: usize = 32;
 
 /// Marker type for the users module. Stateless; all behavior lives in the
 /// [`Mod`] impl and the static [`INFO`] descriptor.
@@ -91,7 +98,10 @@ impl Mod for UsersModule {
 actions!(Action [payload user] => {
     List => Ok(jsonf! { "users": parse_passwd(&read_file("/etc/passwd")?) }),
     Groups => Ok(jsonf! { "groups": parse_group(&read_file("/etc/group")?) }),
-    Status { name: String } => crate::cmd!({ &INFO, "status", user } "id" [&payload.name] json),
+    Status { name: String } => {
+        validate_name(&payload.name)?;
+        crate::cmd!({ &INFO, "status", user } "id" [&payload.name] json)
+    },
     Create {
         name: String,
         shell: Option<String>,
@@ -101,6 +111,7 @@ actions!(Action [payload user] => {
         #[serde(default)]
         dry_run: bool,
     } => {
+        validate_name(&payload.name)?;
         let mut args = Vec::new();
         // `useradd` spells the home flag `--home-dir` (unlike
         // `usermod`'s `--home` below).
@@ -116,9 +127,11 @@ actions!(Action [payload user] => {
         #[serde(default)]
         dry_run: bool,
     } => {
+        validate_name(&payload.name)?;
         let mut args = Vec::new();
         flag!(args payload: [shell] [home]);
         if let Some(groups) = payload.groups {
+            groups.iter().try_for_each(|group| validate_name(group))?;
             args.extend(["--groups".into(), groups.join(",")]);
         }
         args.push(payload.name);
@@ -128,13 +141,29 @@ actions!(Action [payload user] => {
         name: String,
         #[serde(default)]
         dry_run: bool,
-    } => crate::cmd!((payload.dry_run) { &INFO, "delete", user } "userdel" [&payload.name] json),
+    } => {
+        validate_name(&payload.name)?;
+        crate::cmd!((payload.dry_run) { &INFO, "delete", user } "userdel" [&payload.name] json)
+    },
     SetPassword {
         name: String,
         password_hash: String,
         #[serde(default)]
         dry_run: bool,
-    } => crate::cmd!((payload.dry_run) { &INFO, "set_password", user } "usermod" ["--password", &payload.password_hash, &payload.name] json),
+    } => {
+        validate_name(&payload.name)?;
+        validate_password_hash(&payload.password_hash)?;
+        let line = format!("{}:{}\n", payload.name, payload.password_hash);
+        let display = format!("chpasswd --encrypted <<< '{}:<password hash>'", payload.name);
+        let result = crate::agent::module_support::run_command_with_input(
+            "chpasswd",
+            &["--encrypted"],
+            line.as_bytes(),
+            display,
+            payload.dry_run,
+        )?;
+        Ok(serde_json::json!(result))
+    },
     SetAuthorizedKeys {
         name: String,
         /// OpenSSH public key lines; an empty list clears the file.
@@ -142,6 +171,7 @@ actions!(Action [payload user] => {
         #[serde(default)]
         dry_run: bool,
     } => {
+        validate_name(&payload.name)?;
         let contents = authorized_keys(&payload.keys)?;
         let account = nix::unistd::User::from_name(&payload.name)
             .with_context(|| format!("failed to look up `{}`", payload.name))?
@@ -151,13 +181,11 @@ actions!(Action [payload user] => {
             write_authorized_keys(&account.dir, account.uid, account.gid, contents.as_bytes())?;
         }
         // Default labels (ssh_home_t), so sshd may read the file.
-        let selinux = if payload.dry_run || Path::new("/sys/fs/selinux/enforce").exists() {
-            let ssh_dir = account.dir.join(".ssh");
-            let ssh_dir = ssh_dir.to_string_lossy();
-            vec![crate::cmd!((payload.dry_run) "restorecon" ["-R", &*ssh_dir] json)?]
-        } else {
-            Vec::new()
-        };
+        let selinux = crate::agent::module_support::restorecon(
+            &account.dir.join(".ssh"),
+            &["-R"],
+            payload.dry_run,
+        )?;
         Ok(jsonf! {
             payload.name, path,
             "keys": payload.keys.len(),
@@ -169,8 +197,42 @@ actions!(Action [payload user] => {
         name: String,
         #[serde(default)]
         dry_run: bool,
-    } => crate::cmd!((payload.dry_run) { &INFO, "add_admin", user } "usermod" ["--append", "--groups", ADMIN_GROUP, &payload.name] json),
+    } => {
+        validate_name(&payload.name)?;
+        crate::cmd!((payload.dry_run) { &INFO, "add_admin", user } "usermod" ["--append", "--groups", ADMIN_GROUP, &payload.name] json)
+    },
 });
+
+/// Accept only portable account and group names: 1 to [`MAX_NAME_LEN`]
+/// characters from `A-Z a-z 0-9 _ . -`, not starting with `-` or `.`, not
+/// all digits (which `id` would read as a UID), with an optional trailing
+/// `$` for machine accounts. Every name passed to shadow-utils goes through
+/// this, so it can never be taken for an option.
+fn validate_name(name: &str) -> Result<()> {
+    let base = name.strip_suffix('$').unwrap_or(name);
+    ensure!(
+        (1..=MAX_NAME_LEN).contains(&name.len())
+            && !base.starts_with(['-', '.'])
+            && !base.bytes().all(|byte| byte.is_ascii_digit())
+            && base
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')),
+        "`{name}` is not a valid account or group name: use 1 to {MAX_NAME_LEN} letters, \
+         digits, `_`, `.` and `-`, not starting with `-` or `.` and not only digits"
+    );
+    Ok(())
+}
+
+/// Accept a `crypt(3)` hash as `/etc/shadow` stores it (or a locked `!…`):
+/// printable ASCII without spaces or `:`, so it stays one field of one
+/// `chpasswd` line.
+fn validate_password_hash(hash: &str) -> Result<()> {
+    ensure!(
+        !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_graphic() && byte != b':'),
+        "password_hash must be a crypt(3) hash: printable ASCII without spaces or `:`"
+    );
+    Ok(())
+}
 
 /// Validate key lines and join them into an `authorized_keys` file.
 fn authorized_keys(keys: &[String]) -> Result<String> {
@@ -344,6 +406,37 @@ mod tests {
     }
 
     #[test]
+    fn set_password_keeps_the_hash_out_of_the_command() {
+        let hash = "$y$j9T$salt$hash";
+        let response = SetPassword {
+            name: "alice".into(),
+            password_hash: hash.into(),
+            dry_run: true,
+        }
+        .handle(None)
+        .unwrap();
+        assert_eq!(
+            response["command"],
+            "chpasswd --encrypted <<< 'alice:<password hash>'"
+        );
+        assert_eq!(response["dry_run"], true);
+        assert!(!response.to_string().contains(hash));
+
+        // The hash cannot add a field or a line for another account.
+        for bad in ["", "$y$x:0", "$y$x\nroot:$y$y", "$y$ x", "$y$\tx"] {
+            let error = SetPassword {
+                name: "alice".into(),
+                password_hash: bad.into(),
+                dry_run: true,
+            }
+            .handle(None)
+            .unwrap_err();
+            assert!(error.to_string().contains("password_hash"), "{bad:?}: {error}");
+        }
+        validate_password_hash("!$6$rounds=5000$salt$hash").unwrap();
+    }
+
+    #[test]
     fn add_admin_appends_the_admin_group() {
         let response = AddAdmin {
             name: "alice".into(),
@@ -356,6 +449,60 @@ mod tests {
             "usermod --append --groups ultramarine-admin alice"
         );
         assert!(INFO.is_privileged("add_admin"));
+    }
+
+    #[test]
+    fn names_are_validated() {
+        for good in ["alice", "Bob_2", "svc-web.01", "_apt", "host1$", "a"] {
+            validate_name(good).unwrap();
+        }
+        for bad in [
+            "",
+            "--help",
+            "-x",
+            ".hidden",
+            "1000",
+            "$",
+            "al ice",
+            "alice,wheel",
+            "a:b",
+            "a/b",
+            "élise",
+            &"a".repeat(MAX_NAME_LEN + 1),
+        ] {
+            validate_name(bad).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn every_action_taking_a_name_refuses_an_option() {
+        for action in [
+            "status",
+            "create",
+            "update",
+            "delete",
+            "set_authorized_keys",
+            "add_admin",
+        ] {
+            let error = UsersModule
+                .handle(
+                    action,
+                    serde_json::json!({"name": "--help", "keys": [], "dry_run": true}),
+                    None,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("not a valid"), "{action}: {error}");
+        }
+        let set_password = serde_json::json!({
+            "name": "--help", "password_hash": "$y$x", "dry_run": true
+        });
+        UsersModule
+            .handle("set_password", set_password, None)
+            .unwrap_err();
+        let groups = serde_json::json!({
+            "name": "alice", "groups": ["wheel,root"], "dry_run": true
+        });
+        UsersModule.handle("update", groups, None).unwrap_err();
     }
 
     const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq1 alice@laptop";

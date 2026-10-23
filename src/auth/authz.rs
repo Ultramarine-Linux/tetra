@@ -22,7 +22,8 @@
 //! - The setup session may only use the operations in [`SETUP_OPERATIONS`]
 //!   and run the module actions in [`SETUP_ALLOWED`], each named
 //!   individually; actions in [`SETUP_ONLY_WITHOUT_ADMIN`] only while no
-//!   eligible administrator exists.
+//!   eligible administrator exists, and actions in
+//!   [`SETUP_OWN_ACCOUNTS_ONLY`] only on accounts the session created.
 //! - Remote controllers (the outbound mTLS control plane) may run everything;
 //!   their actions are recorded in the audit log.
 
@@ -289,9 +290,13 @@ pub const SETUP_ONLY_WITHOUT_ADMIN: &[(&str, &str)] = &[("users", "add_admin")];
 ///
 /// The `name` must be an account `users.create` made in that session, and
 /// never `root`, so the setup code cannot take over an existing account (for
-/// example an administrator Readymade created).
-pub const SETUP_OWN_ACCOUNTS_ONLY: &[(&str, &str)] =
-    &[("users", "set_password"), ("users", "set_authorized_keys")];
+/// example an administrator Readymade created) or, before an administrator
+/// exists, make one of root, a service account or the installer's user.
+pub const SETUP_OWN_ACCOUNTS_ONLY: &[(&str, &str)] = &[
+    ("users", "set_password"),
+    ("users", "set_authorized_keys"),
+    ("users", "add_admin"),
+];
 
 /// The socket operations (other than login and `setup.redeem`) the setup
 /// session may use.
@@ -344,32 +349,6 @@ pub fn requirement(module: &str, action: &str) -> Requirement {
         .map_or(AdminOnly, |(_, _, requirement)| *requirement)
 }
 
-/// Whether the setup session may run `module.action`.
-#[must_use]
-pub fn setup_allows(module: &str, action: &str) -> bool {
-    SETUP_ALLOWED
-        .iter()
-        .any(|(m, a)| *m == module && *a == action)
-}
-
-/// Whether the setup session may only run `module.action` while no eligible
-/// administrator exists.
-#[must_use]
-pub fn setup_needs_no_admin(module: &str, action: &str) -> bool {
-    SETUP_ONLY_WITHOUT_ADMIN
-        .iter()
-        .any(|(m, a)| *m == module && *a == action)
-}
-
-/// Whether the setup session may run `module.action` only on accounts it
-/// created.
-#[must_use]
-pub fn setup_own_accounts_only(module: &str, action: &str) -> bool {
-    SETUP_OWN_ACCOUNTS_ONLY
-        .iter()
-        .any(|(m, a)| *m == module && *a == action)
-}
-
 /// Whether the setup session may use the socket operation `op`.
 #[must_use]
 pub fn setup_allows_operation(op: &str) -> bool {
@@ -412,7 +391,7 @@ impl Principal {
     pub fn allows(&self, module: &str, action: &str) -> bool {
         match self {
             Self::RemoteController => true,
-            Self::Setup => setup_allows(module, action),
+            Self::Setup => SETUP_ALLOWED.contains(&(module, action)),
             Self::User {
                 admin, permissions, ..
             } => {
@@ -710,9 +689,6 @@ mod tests {
 
     #[test]
     fn setup_allowlist_names_individual_actions() {
-        for (module, action) in SETUP_ALLOWED {
-            assert_ne!(*action, "*", "{module}.* must not be allowed as a whole");
-        }
         let setup = Principal::Setup;
         for (module, action) in [
             ("settings", "set_keymap"),
@@ -746,11 +722,11 @@ mod tests {
         ] {
             assert!(!setup.allows(module, action), "{module}.{action}");
         }
-        assert!(setup_needs_no_admin("users", "add_admin"));
-        assert!(!setup_needs_no_admin("users", "create"));
-        assert!(setup_own_accounts_only("users", "set_password"));
-        assert!(setup_own_accounts_only("users", "set_authorized_keys"));
-        assert!(!setup_own_accounts_only("users", "create"));
+        assert_eq!(SETUP_ONLY_WITHOUT_ADMIN, [("users", "add_admin")]);
+        for action in ["set_password", "set_authorized_keys", "add_admin"] {
+            assert!(SETUP_OWN_ACCOUNTS_ONLY.contains(&("users", action)));
+        }
+        assert!(!SETUP_OWN_ACCOUNTS_ONLY.contains(&("users", "create")));
         assert_eq!(
             admin_only_field("users", &serde_json::json!({"home": "/root"})),
             Some("home")

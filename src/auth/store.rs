@@ -205,9 +205,36 @@ fn parent_of(path: &Path) -> Result<&Path> {
 /// # Errors
 /// Fails when the file exists but cannot be removed.
 pub fn remove(path: &Path) -> Result<()> {
+    remove_if_exists(path).map(drop)
+}
+
+/// Atomically replace `path` with `contents` unless it already holds them.
+///
+/// For files outside the store, such as Caddy sites and unit drop-ins: the
+/// file is created with `mode`, and missing parent directories with the
+/// default mode. Returns whether the file changed.
+///
+/// # Errors
+/// Fails when a directory cannot be created or the file cannot be written.
+pub fn replace_if_changed(path: &Path, contents: &[u8], mode: u32) -> Result<bool> {
+    if fs::read(path).is_ok_and(|existing| existing == contents) {
+        return Ok(false);
+    }
+    let parent = parent_of(path)?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create `{}`", parent.display()))?;
+    replace(path, contents, mode)?;
+    Ok(true)
+}
+
+/// Remove `path`. Returns whether it existed.
+///
+/// # Errors
+/// Fails when the file exists but cannot be removed.
+pub fn remove_if_exists(path: &Path) -> Result<bool> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error).with_context(|| format!("failed to remove `{}`", path.display())),
     }
 }
@@ -342,6 +369,22 @@ mod tests {
             serde_json::to_value(&unknown).unwrap(),
             json!({"kind": "new", "x": 1})
         );
+    }
+
+    #[test]
+    fn replaces_only_changed_files_and_removes_missing_ones_quietly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/site.caddyfile");
+        assert!(replace_if_changed(&path, b"a", 0o644).unwrap());
+        assert!(!replace_if_changed(&path, b"a", 0o644).unwrap());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert!(replace_if_changed(&path, b"b", 0o644).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"b");
+        assert!(remove_if_exists(&path).unwrap());
+        assert!(!remove_if_exists(&path).unwrap());
     }
 
     #[test]

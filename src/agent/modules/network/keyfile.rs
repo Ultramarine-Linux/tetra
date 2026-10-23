@@ -10,7 +10,11 @@
 //! An optional `wired_8021x` section becomes the keyfile's `[802-1x]`
 //! section. Its passwords are stored in the keyfile (which is `0600`, like
 //! NetworkManager's own), and [`render_redacted`] gives the copy that is
-//! returned to callers.
+//! returned to callers. Certificate and key paths must name regular files
+//! in a certificate store ([`PKI_DIR`]), since NetworkManager reads them as
+//! root, and not files Tetra stores for another profile ([`CertRoots`]).
+//! Validation replaces each such path with the resolved one it checked, so
+//! the keyfile names exactly that file.
 
 use std::{
     collections::HashSet,
@@ -39,6 +43,9 @@ const MAX_NAME_LEN: usize = 64;
 const MAX_8021X_VALUE_LEN: usize = 256;
 /// Upper bound on one PEM certificate (chain) or key.
 const MAX_PEM_BYTES: usize = 64 * 1024;
+/// The host's certificate store: 802.1X certificate and key paths must be
+/// under it ([`CertRoots`]).
+pub(super) const PKI_DIR: &str = "/etc/pki";
 pub(super) const REDACTED: &str = "<redacted>";
 
 /// An address family as it appears in a `network.configure` payload.
@@ -150,19 +157,49 @@ pub fn connection_name(request: &NetworkConfigureRequest) -> &str {
     request.name.as_deref().unwrap_or(&request.interface)
 }
 
-/// Validate a `network.configure` request without touching the host.
+/// Where a profile's 802.1X certificate and key paths may point.
+#[derive(Clone, Copy, Debug)]
+pub struct CertRoots<'a> {
+    /// The host's certificate store ([`PKI_DIR`]).
+    pub pki: &'a Path,
+    /// Where Tetra stores PEM contents, one directory per profile
+    /// ([`super::certs::CERTS_DIR`], inside `pki` except in tests). Each
+    /// directory is pruned to what its own profile names, so a path in it
+    /// is only accepted for that profile.
+    pub tetra: &'a Path,
+    /// The profile being validated, which names its directory in `tetra`.
+    pub profile: &'a str,
+}
+
+impl CertRoots<'_> {
+    /// Whether `real` (a resolved path) is a file this profile may use.
+    fn allow(&self, real: &Path) -> bool {
+        let under = |root: &Path| fs::canonicalize(root).is_ok_and(|root| real.starts_with(root));
+        if under(self.tetra) {
+            under(&self.tetra.join(self.profile))
+        } else {
+            under(self.pki)
+        }
+    }
+}
+
+/// Validate a `network.configure` request without changing the host.
+/// 802.1X certificate and key paths must be regular files `cert_roots`
+/// allows, and are replaced with their resolved paths (no symlinks, `.` or
+/// `//`), so the keyfile names the very file checked, by the path
+/// [`super::certs::prune`] looks for.
 ///
 /// # Errors
 /// Errs with a message naming the offending field.
-pub fn validate(request: &NetworkConfigureRequest) -> Result<()> {
+pub fn validate(request: &mut NetworkConfigureRequest, cert_roots: &CertRoots<'_>) -> Result<()> {
     validate_interface(&request.interface)?;
     if let Some(name) = &request.name {
         validate_name(name)?;
     }
     let ipv4_routable = validate_family(&request.ipv4)?;
     let ipv6_routable = validate_family(&request.ipv6)?;
-    if let Some(wired) = &request.wired_8021x {
-        validate_8021x("wired_8021x", wired)?;
+    if let Some(wired) = &mut request.wired_8021x {
+        validate_8021x("wired_8021x", wired, cert_roots)?;
     }
     ensure!(
         ipv4_routable || ipv6_routable,
@@ -209,9 +246,18 @@ fn validate_8021x_value(section: &str, field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// A certificate or key: PEM contents, or an absolute path. Errors never
-/// show the value (it may be a private key).
-fn validate_8021x_file(section: &str, field: &str, value: &str) -> Result<()> {
+/// A certificate or key: PEM contents, or the absolute path of a regular
+/// file `cert_roots` allows. NetworkManager reads it as root, so a path may
+/// not name just any host file (another service's private key, say), nor a
+/// FIFO or device it would block on; symlinks are followed before checking.
+/// Returns the resolved path of a path, `None` for PEM contents. Errors
+/// never show the value (it may be a private key).
+fn validate_8021x_file(
+    section: &str,
+    field: &str,
+    value: &str,
+    cert_roots: &CertRoots<'_>,
+) -> Result<Option<String>> {
     if is_pem(value) {
         ensure!(
             value.len() <= MAX_PEM_BYTES
@@ -221,7 +267,7 @@ fn validate_8021x_file(section: &str, field: &str, value: &str) -> Result<()> {
                     .all(|c| c.is_ascii_graphic() || matches!(c, ' ' | '\n' | '\r' | '\t')),
             "{section}.{field} must be PEM text of at most {MAX_PEM_BYTES} bytes"
         );
-        return Ok(());
+        return Ok(None);
     }
     let path = Path::new(value);
     ensure!(
@@ -232,7 +278,18 @@ fn validate_8021x_file(section: &str, field: &str, value: &str) -> Result<()> {
                 .any(|component| matches!(component, std::path::Component::ParentDir)),
         "{section}.{field} must be an absolute path or PEM contents"
     );
-    Ok(())
+    let real = fs::canonicalize(path)
+        .ok()
+        .filter(|real| real.is_file() && cert_roots.allow(real))
+        .and_then(|real| real.into_os_string().into_string().ok());
+    ensure!(
+        real.is_some(),
+        "{section}.{field} must be a regular file under {}, and not in another \
+         profile's directory in {}",
+        cert_roots.pki.display(),
+        cert_roots.tetra.display(),
+    );
+    Ok(real)
 }
 
 /// `domain_suffix_match`: a DNS name, matched case-insensitively.
@@ -248,8 +305,14 @@ fn validate_domain(section: &str, domain: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate 802.1X settings; `section` names them in errors.
-pub(super) fn validate_8021x(section: &str, wired: &Wired8021x) -> Result<()> {
+/// Validate 802.1X settings; `section` names them in errors. Certificate
+/// and key paths must be files `cert_roots` allows, and are replaced with
+/// their resolved paths ([`validate`]).
+pub(super) fn validate_8021x(
+    section: &str,
+    wired: &mut Wired8021x,
+    cert_roots: &CertRoots<'_>,
+) -> Result<()> {
     validate_8021x_value(section, "identity", &wired.identity)?;
     if let Some(anonymous) = &wired.anonymous_identity {
         validate_8021x_value(section, "anonymous_identity", anonymous)?;
@@ -261,12 +324,14 @@ pub(super) fn validate_8021x(section: &str, wired: &Wired8021x) -> Result<()> {
         validate_8021x_value(section, "private_key_password", password)?;
     }
     for (field, value) in [
-        ("ca_cert", &wired.ca_cert),
-        ("client_cert", &wired.client_cert),
-        ("private_key", &wired.private_key),
+        ("ca_cert", &mut wired.ca_cert),
+        ("client_cert", &mut wired.client_cert),
+        ("private_key", &mut wired.private_key),
     ] {
-        if let Some(value) = value {
-            validate_8021x_file(section, field, value)?;
+        if let Some(value) = value
+            && let Some(real) = validate_8021x_file(section, field, value, cert_roots)?
+        {
+            *value = real;
         }
     }
     if let Some(domain) = &wired.domain_suffix_match {
@@ -281,6 +346,15 @@ pub(super) fn validate_8021x(section: &str, wired: &Wired8021x) -> Result<()> {
     ensure!(
         tunneled || (wired.phase2.is_none() && wired.anonymous_identity.is_none()),
         "{section}.phase2 and anonymous_identity are only used with peap and ttls"
+    );
+    // Inside PEAP only EAP methods run; pap, chap and mschap are TTLS's.
+    ensure!(
+        wired.eap != EapMethod::Peap
+            || matches!(
+                wired.phase2,
+                None | Some(Phase2Method::Mschapv2 | Phase2Method::Gtc | Phase2Method::Md5)
+            ),
+        "{section}.phase2 for peap must be mschapv2, gtc or md5"
     );
     if wired.eap == EapMethod::Tls {
         ensure!(
@@ -498,16 +572,30 @@ pub(super) fn render_8021x(out: &mut String, wired: &Wired8021x, redact: bool) -
     }
     if let Some(domain) = &wired.domain_suffix_match {
         writeln!(out, "domain-suffix-match={}", domain.to_ascii_lowercase())?;
+        // Matching a name is only meaningful for a certificate checked
+        // against some CA: without `ca_cert`, the system's.
+        if wired.ca_cert.is_none() {
+            writeln!(out, "system-ca-certs=true")?;
+        }
     }
     if let Some(password) = &wired.private_key_password {
         writeln!(out, "private-key-password={}", secret(password))?;
+    } else if wired.eap == EapMethod::Tls {
+        // An unencrypted key: otherwise NetworkManager asks for its
+        // password and the activation fails (`NM_SETTING_SECRET_FLAG_NOT_REQUIRED`).
+        writeln!(out, "private-key-password-flags=4")?;
     }
     if let Some(password) = &wired.password {
         writeln!(out, "password={}", secret(password))?;
     }
     if matches!(wired.eap, EapMethod::Peap | EapMethod::Ttls) {
         let phase2 = wired.phase2.unwrap_or(Phase2Method::Mschapv2);
-        writeln!(out, "phase2-auth={}", phase2_keyword(phase2))?;
+        // TTLS runs EAP inner methods through `phase2-autheap`.
+        let key = match (wired.eap, phase2) {
+            (EapMethod::Ttls, Phase2Method::Gtc | Phase2Method::Md5) => "phase2-autheap",
+            _ => "phase2-auth",
+        };
+        writeln!(out, "{key}={}", phase2_keyword(phase2))?;
     }
     Ok(())
 }
@@ -590,15 +678,25 @@ mod tests {
         serde_json::from_value(value).unwrap()
     }
 
+    /// Roots no path is under.
+    fn no_roots() -> CertRoots<'static> {
+        CertRoots { pki: Path::new("/nonexistent"), tetra: Path::new("/nonexistent"), profile: "eth0" }
+    }
+
+    /// `store` as the host's certificate store.
+    fn roots(store: &Path) -> CertRoots<'_> {
+        CertRoots { pki: store, ..no_roots() }
+    }
+
     fn rendered(value: Value) -> String {
-        let request = request(value);
-        validate(&request).unwrap();
+        let mut request = request(value);
+        validate(&mut request, &no_roots()).unwrap();
         render(&request, UUID)
     }
 
     fn rejection(value: Value) -> String {
         match serde_json::from_value::<NetworkConfigureRequest>(value) {
-            Ok(request) => validate(&request).unwrap_err().to_string(),
+            Ok(mut request) => validate(&mut request, &no_roots()).unwrap_err().to_string(),
             Err(error) => error.to_string(),
         }
     }
@@ -938,28 +1036,37 @@ mod tests {
 
     // Wired 802.1X.
 
+    /// A certificate store holding `radius-ca.pem`.
+    fn store() -> (tempfile::TempDir, String) {
+        let store = tempfile::tempdir().unwrap();
+        let ca = store.path().join("radius-ca.pem");
+        fs::write(&ca, "-----BEGIN CERTIFICATE-----\n").unwrap();
+        (store, ca.to_string_lossy().into_owned())
+    }
+
     #[test]
     fn wired_8021x_peap_renders_an_8021x_section() {
-        let request = request(json!({
+        let (store, ca) = store();
+        let mut request = request(json!({
             "interface": "eth0",
             "wired_8021x": {
                 "eap": "peap",
                 "identity": "alice@example.com",
                 "anonymous_identity": "anonymous@example.com",
                 "password": " pa\\ss word",
-                "ca_cert": "/etc/pki/tls/certs/radius-ca.pem"
+                "ca_cert": ca,
             }
         }));
-        validate(&request).unwrap();
+        validate(&mut request, &roots(store.path())).unwrap();
         assert!(!format!("{request:?}").contains("pa\\ss"));
         let keyfile = render(&request, UUID);
         assert_eq!(
             keyfile,
             header("eth0")
                 + "[802-1x]\neap=peap;\nidentity=alice@example.com\n\
-                   anonymous-identity=anonymous@example.com\n\
-                   ca-cert=/etc/pki/tls/certs/radius-ca.pem\n\
-                   password=\\spa\\\\ss word\nphase2-auth=mschapv2\n\n\
+                   anonymous-identity=anonymous@example.com\n"
+                + &format!("ca-cert={ca}\n")
+                + "password=\\spa\\\\ss word\nphase2-auth=mschapv2\n\n\
                    [ipv4]\nmethod=auto\n\n[ipv6]\nmethod=auto\n"
         );
         let redacted = render_redacted(&request, UUID);
@@ -969,7 +1076,7 @@ mod tests {
 
     #[test]
     fn wired_8021x_tls_uses_certificates() {
-        let keyfile = rendered(json!({
+        let keyfile = render(&request(json!({
             "interface": "eth0",
             "wired_8021x": {
                 "eap": "tls",
@@ -979,7 +1086,7 @@ mod tests {
                 "private_key": "/etc/pki/8021x/client.key",
                 "private_key_password": "keypass"
             }
-        }));
+        })), UUID);
         assert!(keyfile.contains(
             "[802-1x]\neap=tls;\nidentity=host.example.com\nca-cert=/etc/pki/8021x/ca.pem\n\
              client-cert=/etc/pki/8021x/client.pem\nprivate-key=/etc/pki/8021x/client.key\n\
@@ -995,6 +1102,144 @@ mod tests {
             "wired_8021x": { "eap": "ttls", "identity": "bob", "password": "x", "phase2": "pap" }
         }));
         assert!(keyfile.contains("phase2-auth=pap\n"));
+        // EAP inner methods go in `phase2-autheap`, for TTLS.
+        let keyfile = rendered(json!({
+            "interface": "eth0",
+            "wired_8021x": { "eap": "ttls", "identity": "bob", "password": "x", "phase2": "gtc" }
+        }));
+        assert!(keyfile.contains("phase2-autheap=gtc\n") && !keyfile.contains("phase2-auth="));
+        let keyfile = rendered(json!({
+            "interface": "eth0",
+            "wired_8021x": { "eap": "peap", "identity": "bob", "password": "x", "phase2": "md5" }
+        }));
+        assert!(keyfile.contains("phase2-auth=md5\n"));
+    }
+
+    #[test]
+    fn wired_8021x_tls_key_without_a_password_needs_none() {
+        let keyfile = render(&request(json!({
+            "interface": "eth0",
+            "wired_8021x": {
+                "eap": "tls",
+                "identity": "host.example.com",
+                "client_cert": "/etc/pki/8021x/client.pem",
+                "private_key": "/etc/pki/8021x/client.key"
+            }
+        })), UUID);
+        assert!(keyfile.contains("private-key=/etc/pki/8021x/client.key\nprivate-key-password-flags=4\n"));
+    }
+
+    #[test]
+    fn domain_suffix_match_without_a_ca_uses_the_system_cas() {
+        let keyfile = rendered(json!({
+            "interface": "eth0",
+            "wired_8021x": {
+                "eap": "peap", "identity": "bob", "password": "x",
+                "domain_suffix_match": "radius.example.com"
+            }
+        }));
+        assert!(keyfile.contains("domain-suffix-match=radius.example.com\nsystem-ca-certs=true\n"));
+        // With a CA of its own, that CA is the one the server is checked against.
+        let keyfile = render(&request(json!({
+            "interface": "eth0",
+            "wired_8021x": {
+                "eap": "peap", "identity": "bob", "password": "x",
+                "ca_cert": "/etc/pki/ca.pem", "domain_suffix_match": "radius.example.com"
+            }
+        })), UUID);
+        assert!(!keyfile.contains("system-ca-certs"));
+    }
+
+    #[test]
+    fn certificate_paths_must_be_regular_files_in_a_store() {
+        let (store, ca) = store();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("host.key");
+        fs::write(&secret, "key").unwrap();
+        let escape = store.path().join("escape.pem");
+        std::os::unix::fs::symlink(&secret, &escape).unwrap();
+        let alias = store.path().join("alias.pem");
+        std::os::unix::fs::symlink(&ca, &alias).unwrap();
+        let fifo = store.path().join("fifo.pem");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let check = |path: &Path| {
+            validate(
+                &mut request(json!({
+                    "interface": "eth0",
+                    "wired_8021x": { "eap": "peap", "identity": "bob", "password": "x", "ca_cert": path }
+                })),
+                &roots(store.path()),
+            )
+        };
+
+        check(Path::new(&ca)).unwrap();
+        check(&alias).unwrap();
+        for path in [&secret, &escape, &fifo, &store.path().join("missing.pem"), store.path()] {
+            let error = check(path).unwrap_err().to_string();
+            assert!(error.contains("must be a regular file under"), "{error}");
+        }
+    }
+
+    #[test]
+    fn stored_certificates_only_serve_their_own_profile() {
+        // Tetra's store, inside the host's, with a file for `eth0` and one
+        // for `eth1`, which pruning `eth1`'s directory would delete.
+        let (store, ca) = store();
+        let tetra = store.path().join("tetra");
+        for profile in ["eth0", "eth1"] {
+            fs::create_dir_all(tetra.join(profile)).unwrap();
+            fs::write(tetra.join(profile).join("ca-cert.pem"), "-----BEGIN CERTIFICATE-----\n")
+                .unwrap();
+        }
+        let roots = CertRoots { pki: store.path(), tetra: &tetra, profile: "eth0" };
+        let check = |path: &Path| {
+            validate(
+                &mut request(json!({
+                    "interface": "eth0",
+                    "wired_8021x": { "eap": "peap", "identity": "bob", "password": "x", "ca_cert": path }
+                })),
+                &roots,
+            )
+        };
+
+        check(Path::new(&ca)).unwrap();
+        check(&tetra.join("eth0/ca-cert.pem")).unwrap();
+        let error = check(&tetra.join("eth1/ca-cert.pem")).unwrap_err().to_string();
+        assert!(error.contains("another profile's directory"), "{error}");
+        // Nor through a symlink, or a file directly in Tetra's store.
+        let alias = store.path().join("alias.pem");
+        std::os::unix::fs::symlink(tetra.join("eth1/ca-cert.pem"), &alias).unwrap();
+        check(&alias).unwrap_err();
+        fs::write(tetra.join("loose.pem"), "-----BEGIN CERTIFICATE-----\n").unwrap();
+        check(&tetra.join("loose.pem")).unwrap_err();
+    }
+
+    #[test]
+    fn certificate_paths_are_rendered_as_the_file_checked() {
+        // Pruning keeps only the stored files a keyfile names by their real
+        // path, so `eth0`'s own file reached another way must be rendered
+        // by that path, or pruning would delete it.
+        let (store, _) = store();
+        let tetra = store.path().join("tetra");
+        fs::create_dir_all(tetra.join("eth0")).unwrap();
+        let real = tetra.join("eth0/ca-cert.pem");
+        fs::write(&real, "-----BEGIN CERTIFICATE-----\n").unwrap();
+        let alias = store.path().join("alias.pem");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let roots = CertRoots { pki: store.path(), tetra: &tetra, profile: "eth0" };
+        let real = fs::canonicalize(&real).unwrap().to_string_lossy().into_owned();
+
+        for path in [
+            alias.to_string_lossy().into_owned(),
+            format!("{}//eth0/./ca-cert.pem", tetra.display()),
+        ] {
+            let mut request = request(json!({
+                "interface": "eth0",
+                "wired_8021x": { "eap": "peap", "identity": "bob", "password": "x", "ca_cert": path }
+            }));
+            validate(&mut request, &roots).unwrap();
+            assert!(render(&request, UUID).contains(&format!("\nca-cert={real}\n")), "{path}");
+        }
     }
 
     #[test]
@@ -1007,6 +1252,9 @@ mod tests {
             json!({ "eap": "tls", "identity": "bob", "client_cert": "/c.pem", "private_key": "/k", "password": "x" }),
             // Inner methods only for tunneled EAP.
             json!({ "eap": "md5", "identity": "bob", "password": "x", "phase2": "pap" }),
+            // PEAP runs only EAP methods inside.
+            json!({ "eap": "peap", "identity": "bob", "password": "x", "phase2": "pap" }),
+            json!({ "eap": "peap", "identity": "bob", "password": "x", "phase2": "mschap" }),
             // Certificates only for TLS.
             json!({ "eap": "pwd", "identity": "bob", "password": "x", "client_cert": "/c.pem" }),
             // Keyfile injection.

@@ -5,8 +5,9 @@
 //! - *Live state* (`interfaces`, `status`) is read from `/sys/class/net` sysfs
 //!   and `ip -json addr show`, so callers can see what is currently up.
 //!   `interfaces` reports each interface's [`InterfaceKind`] (`wifi`,
-//!   `ethernet`, or `other`) as `type`. Both report every address with a scope (`global`, `private`, `ula`,
-//!   `link-local`, ...) derived from its prefix; see [`addresses`].
+//!   `ethernet`, or `other`) as `type`. Both report every address with a
+//!   scope (`global`, `private`, `ula`, `link-local`, ...) derived from its
+//!   prefix; see [`addresses`].
 //! - *Persistent configuration* is managed as NetworkManager *keyfiles*:
 //!   INI-style `.nmconnection` profiles under
 //!   `/etc/NetworkManager/system-connections/`.
@@ -39,11 +40,11 @@ use std::{
 
 use crate::prelude::*;
 
-use crate::agent::module_support::{CommandResult, SelinuxOptions};
+use crate::agent::module_support::{CommandResult, SelinuxOptions, restorecon};
 use crate::types::{
     DryRunRequest, NetworkConfigRequest, NetworkConfigureRequest, NetworkConfirmRequest,
     NetworkConnectWifiRequest, NetworkInterfaceRequest, NetworkScanWifiRequest,
-    NetworkWriteConfigRequest, WifiSecurity,
+    NetworkWriteConfigRequest, WifiSecurity, Wired8021x,
 };
 use addresses::{InterfaceAddress, parse_ip_addr_json};
 use apply::{Change, NetworkHost, SafeApply};
@@ -145,10 +146,6 @@ actions!(Action [payload user] => {
         Ok(jsonf! { "networks": scan_wifi(&payload.interface, payload.rescan)? })
     },
     ConnectWifi: NetworkConnectWifiRequest => {
-        if !payload.dry_run {
-            keyfile::validate_interface(&payload.interface)?;
-            ensure_wireless(&payload.interface)?;
-        }
         connect_wifi(
             &payload,
             Path::new(SYSTEM_CONNECTIONS_DIR),
@@ -176,8 +173,9 @@ fn scan_wifi(interface: &str, rescan: Option<bool>) -> Result<Vec<wifi::Network>
 
 /// Validate, render, and (outside dry-run) apply a Wi-Fi profile as
 /// `wifi-<interface>.nmconnection` in `dir`. `scan` lists the networks the
-/// interface can see, to tell WPA3-only and hidden networks apart; it is
-/// not run in dry-run.
+/// (validated) interface can see, to tell WPA3-only and hidden networks
+/// apart, and fails if it is not a Wi-Fi device or cannot scan; it is not
+/// run in dry-run, so key management is only decided when connecting.
 fn connect_wifi(
     payload: &NetworkConnectWifiRequest,
     dir: &Path,
@@ -189,9 +187,7 @@ fn connect_wifi(
     let seen = if payload.dry_run {
         None
     } else {
-        scan(&payload.interface)
-            .ok()
-            .and_then(|networks| networks.into_iter().find(|network| network.ssid == payload.ssid))
+        scan(&payload.interface)?.into_iter().find(|network| network.ssid == payload.ssid)
     };
     let key_management = if seen.as_ref().is_some_and(|network| network.sae_only) {
         wifi::KeyManagement::Sae
@@ -200,43 +196,35 @@ fn connect_wifi(
     };
     // A network the scan did not see is probed for, in case it is hidden.
     let hidden = payload.hidden || (!payload.dry_run && seen.is_none());
-    wifi::validate(payload, key_management)?;
-
+    // Without a scan, a dry run cannot know whether the network takes SAE,
+    // so it only checks the password against SAE's wider rules.
+    let checked_as = if payload.dry_run { wifi::KeyManagement::Sae } else { key_management };
     let name = wifi::connection_name(&payload.interface);
-    let path = keyfile_path_for(dir, &name)?;
-    let uuid = read_keyfile(&path)?
-        .as_deref()
-        .and_then(keyfile::existing_uuid)
-        .unwrap_or_else(keyfile::new_uuid);
-    let certs = certs_dir.join(&name);
     let mut request = payload.clone();
-    let pem_files = match &mut request.security {
-        WifiSecurity::WpaEnterprise(settings) => certs::externalize(settings, &certs),
-        _ => Vec::new(),
-    };
-    let contents = wifi::render(&request, key_management, hidden, &uuid);
-    let shown = wifi::render_redacted(&request, key_management, hidden, &uuid);
+    wifi::validate(&mut request, checked_as, &cert_roots(certs_dir, &name))?;
+
+    let profile = Profile::locate(&name, dir, certs_dir)?;
+    let pem_files = profile.externalize(match &mut request.security {
+        WifiSecurity::WpaEnterprise(settings) => Some(settings),
+        _ => None,
+    });
+    let contents = wifi::render(&request, key_management, hidden, &profile.uuid);
+    let shown = wifi::render_redacted(&request, key_management, hidden, &profile.uuid);
 
     if payload.dry_run {
-        return Ok(jsonf! {
-            "path": path,
-            uuid,
-            "keyfile": shown,
-            "applied": false,
-            payload.dry_run,
-        });
+        let mut response = profile.dry_run(&shown);
+        response["note"] = "nothing was scanned, so key management is decided when connecting: \
+                            a network the scan shows as WPA3-only gets key-mgmt=sae (passwords \
+                            of 1-128 characters) instead of wpa-psk (8-63), and one it does not \
+                            see gets hidden=true"
+            .into();
+        return Ok(response);
     }
 
-    store_certs(&pem_files)?;
-    let mut response = safe_apply
-        .apply_or_revert(&Change {
-            interface: &payload.interface,
-            path: &path,
-            uuid: &uuid,
-            contents: contents.as_bytes(),
-            certs: Some(&certs),
-        })
+    let response = safe_apply
+        .apply_or_revert(&profile.change(&payload.interface, &contents, &pem_files))
         .with_context(|| format!("could not connect to `{}`", payload.ssid))?;
+    let mut response = profile.finish(response, shown);
     response["ssid"] = payload.ssid.clone().into();
     response["security"] = match &payload.security {
         WifiSecurity::Open {} => "open",
@@ -244,9 +232,6 @@ fn connect_wifi(
         WifiSecurity::WpaEnterprise(_) => "wpa-enterprise",
     }
     .into();
-    response["uuid"] = uuid.into();
-    response["keyfile"] = shown.into();
-    response["dry_run"] = false.into();
     Ok(response)
 }
 
@@ -258,59 +243,95 @@ fn configure(
     certs_dir: &Path,
     safe_apply: &SafeApply,
 ) -> Result<Value> {
-    keyfile::validate(payload)?;
     let name = keyfile::connection_name(payload);
-    let path = keyfile_path_for(dir, name)?;
-    // Rewriting a profile keeps its UUID, so NetworkManager treats it as the
-    // same connection rather than a new one.
-    let uuid = read_keyfile(&path)?
-        .as_deref()
-        .and_then(keyfile::existing_uuid)
-        .unwrap_or_else(keyfile::new_uuid);
-    // PEM certificates and keys are stored as files the keyfile points at.
-    let certs = certs_dir.join(name);
     let mut request = payload.clone();
-    let pem_files = request
-        .wired_8021x
-        .as_mut()
-        .map(|settings| certs::externalize(settings, &certs))
-        .unwrap_or_default();
-    let contents = keyfile::render(&request, &uuid);
-    // Responses never carry 802.1X passwords.
-    let shown = keyfile::render_redacted(&request, &uuid);
+    keyfile::validate(&mut request, &cert_roots(certs_dir, name))?;
+    let profile = Profile::locate(name, dir, certs_dir)?;
+    let pem_files = profile.externalize(request.wired_8021x.as_deref_mut());
+    let contents = keyfile::render(&request, &profile.uuid);
+    let shown = keyfile::render_redacted(&request, &profile.uuid);
 
     if payload.dry_run {
-        return Ok(jsonf! {
-            "path": path,
-            uuid,
-            "keyfile": shown,
-            "applied": false,
-            payload.dry_run,
-        });
+        return Ok(profile.dry_run(&shown));
     }
 
     ensure_ethernet(&payload.interface)?;
-    store_certs(&pem_files)?;
-    let mut response = safe_apply.apply(&Change {
-        interface: &payload.interface,
-        path: &path,
-        uuid: &uuid,
-        contents: contents.as_bytes(),
-        certs: Some(&certs),
-    })?;
-    response["uuid"] = uuid.into();
-    response["keyfile"] = shown.into();
-    response["dry_run"] = false.into();
-    Ok(response)
+    let response = safe_apply.apply(&profile.change(&payload.interface, &contents, &pem_files))?;
+    Ok(profile.finish(response, shown))
 }
 
-/// Write PEM certificates and keys and give them their default SELinux
-/// label.
-fn store_certs(files: &[certs::PemFile]) -> Result<()> {
-    for path in certs::write(files)? {
-        restorecon(&path, false)?;
+/// Where `profile`'s 802.1X certificate and key paths may point: the
+/// host's certificate store, except other profiles' directories in
+/// `certs_dir`, the one Tetra keeps PEM contents in (inside it, except in
+/// tests).
+fn cert_roots<'a>(certs_dir: &'a Path, profile: &'a str) -> keyfile::CertRoots<'a> {
+    keyfile::CertRoots { pki: Path::new(keyfile::PKI_DIR), tetra: certs_dir, profile }
+}
+
+/// A connection profile `configure` or `connect_wifi` writes.
+struct Profile {
+    /// Its keyfile.
+    path: PathBuf,
+    /// Its UUID: the existing profile's, or a new one. Rewriting a profile
+    /// keeps its UUID, so NetworkManager treats it as the same connection
+    /// rather than a new one.
+    uuid: String,
+    /// Where its PEM contents are stored ([`certs`]).
+    certs: PathBuf,
+}
+
+impl Profile {
+    /// The profile `name`, with its keyfile in `dir` and its certificates
+    /// in `certs_dir`.
+    fn locate(name: &str, dir: &Path, certs_dir: &Path) -> Result<Self> {
+        let path = keyfile_path_for(dir, name)?;
+        let uuid = read_keyfile(&path)?
+            .as_deref()
+            .and_then(keyfile::existing_uuid)
+            .unwrap_or_else(keyfile::new_uuid);
+        Ok(Self { path, uuid, certs: certs_dir.join(name) })
     }
-    Ok(())
+
+    /// Point `settings`' PEM contents at the files they are stored as,
+    /// returning those files for [`SafeApply`] to write.
+    fn externalize(&self, settings: Option<&mut Wired8021x>) -> Vec<certs::PemFile> {
+        settings
+            .map(|settings| certs::externalize(settings, &self.certs))
+            .unwrap_or_default()
+    }
+
+    /// The change writing `contents` (and `pem_files`) as this profile.
+    fn change<'a>(
+        &'a self,
+        interface: &'a str,
+        contents: &'a str,
+        pem_files: &'a [certs::PemFile],
+    ) -> Change<'a> {
+        Change {
+            interface,
+            path: &self.path,
+            uuid: &self.uuid,
+            contents: contents.as_bytes(),
+            certs: Some(&self.certs),
+            pem_files,
+        }
+    }
+
+    /// A dry run's response: where the profile would go and, with
+    /// passwords redacted, what it would hold. PEM contents would be
+    /// stored as files, which `keyfile` already points at.
+    fn dry_run(self, keyfile: &str) -> Value {
+        jsonf! { "path": self.path, "uuid": self.uuid, keyfile, "applied": false, "dry_run": true }
+    }
+
+    /// Completes [`SafeApply`]'s response with the profile's UUID and
+    /// redacted keyfile.
+    fn finish(self, mut response: Value, keyfile: String) -> Value {
+        response["uuid"] = self.uuid.into();
+        response["keyfile"] = keyfile.into();
+        response["dry_run"] = false.into();
+        response
+    }
 }
 
 fn get_config(payload: &NetworkConfigRequest, dir: &Path) -> Result<Value> {
@@ -340,7 +361,7 @@ fn set_config(payload: &NetworkWriteConfigRequest, dir: &Path) -> Result<Value> 
     if !payload.dry_run {
         write_keyfile(&path, payload.contents.as_bytes())?;
     }
-    let selinux = restorecon(&path, payload.dry_run)?;
+    let selinux = restorecon(&path, &["-v"], payload.dry_run)?;
     Ok(jsonf! {
         "path": path,
         "written": !payload.dry_run,
@@ -349,15 +370,6 @@ fn set_config(payload: &NetworkWriteConfigRequest, dir: &Path) -> Result<Value> 
     })
 }
 
-/// `restorecon` a keyfile so it gets the policy's default label. Skipped on
-/// hosts without SELinux, except in dry-run where it is always previewed.
-fn restorecon(path: &Path, dry_run: bool) -> Result<Vec<Value>> {
-    if !dry_run && !Path::new("/sys/fs/selinux/enforce").exists() {
-        return Ok(Vec::new());
-    }
-    let path = path.to_string_lossy();
-    Ok(vec![crate::cmd!((dry_run) "restorecon" ["-v", &*path] json)?])
-}
 
 /// Where the kernel lists network interfaces.
 const SYSFS_NET: &str = "/sys/class/net";
@@ -370,25 +382,26 @@ enum InterfaceKind {
     /// A wireless (cfg80211) device.
     Wifi,
     /// A physical Ethernet device: link type `ARPHRD_ETHER`, backed by a
-    /// device, and not wireless.
+    /// device, with no `DEVTYPE` (so not wireless, WWAN, a VLAN, ...).
     Ethernet,
-    /// Anything else: loopback, bridges, veth, tun, and other virtual links.
+    /// Anything else: loopback, bridges, bonds, VLANs, veth, tun, WWAN
+    /// modems, and other links.
     Other,
 }
 
 /// Classifies the interface whose sysfs directory is `dir`
 /// (`/sys/class/net/<interface>`). Missing attributes count as absent.
 fn interface_kind(dir: &Path) -> InterfaceKind {
-    let is_wlan = fs::read_to_string(dir.join("uevent"))
-        .unwrap_or_default()
-        .lines()
-        .any(|line| line == "DEVTYPE=wlan");
-    if is_wlan || dir.join("wireless").exists() || dir.join("phy80211").exists() {
+    let uevent = fs::read_to_string(dir.join("uevent")).unwrap_or_default();
+    let devtype = uevent.lines().find_map(|line| line.strip_prefix("DEVTYPE="));
+    if devtype == Some("wlan") || dir.join("wireless").exists() || dir.join("phy80211").exists() {
         return InterfaceKind::Wifi;
     }
     // `type` 1 is ARPHRD_ETHER; only physical devices have a `device` link.
+    // Any `DEVTYPE` (`wwan`, `vlan`, `bridge`, `bond`, ...) means something
+    // other than plain Ethernet, even with a device behind it.
     let link_type = fs::read_to_string(dir.join("type")).unwrap_or_default();
-    if link_type.trim() == "1" && dir.join("device").exists() {
+    if devtype.is_none() && link_type.trim() == "1" && dir.join("device").exists() {
         return InterfaceKind::Ethernet;
     }
     InterfaceKind::Other
@@ -449,7 +462,7 @@ impl NetworkHost for NetworkManagerHost {
     }
 
     fn relabel(&self, path: &Path) -> Result<()> {
-        restorecon(path, false).map(drop)
+        restorecon(path, &["-v"], false).map(drop)
     }
 
     fn load(&self, path: &Path) -> Result<()> {
@@ -517,10 +530,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use apply::fake::FakeHost;
 
     #[test]
     fn dns_read_returns_a_stable_shape() {
-        let response = Dns.handle(None).unwrap();
+        let response = Dns {}.handle(None).unwrap();
         assert!(response.get("resolv_conf").is_some());
     }
 
@@ -678,52 +692,6 @@ mod tests {
         assert!(!response.to_string().contains("hunter2-8021x"));
     }
 
-    /// A NetworkManager stand-in for `connect_wifi`: no addresses, and
-    /// activation fails when `fail` is set.
-    #[derive(Default)]
-    struct WifiHost {
-        calls: std::sync::Mutex<Vec<String>>,
-        fail: bool,
-    }
-
-    impl WifiHost {
-        fn record(&self, call: String) {
-            self.calls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(call);
-        }
-    }
-
-    impl NetworkHost for WifiHost {
-        fn routable_addresses(&self, _interface: &str) -> Result<Vec<IpAddr>> {
-            Ok(Vec::new())
-        }
-        fn active_connection(&self, _interface: &str) -> Option<String> {
-            None
-        }
-        fn relabel(&self, _path: &Path) -> Result<()> {
-            Ok(())
-        }
-        fn load(&self, _path: &Path) -> Result<()> {
-            self.record("load".to_owned());
-            Ok(())
-        }
-        fn activate(&self, uuid: &str) -> Result<()> {
-            self.record(format!("up {uuid}"));
-            ensure!(!self.fail, "Error: Connection activation failed: Secrets were required");
-            Ok(())
-        }
-        fn deactivate(&self, uuid: &str) -> Result<()> {
-            self.record(format!("down {uuid}"));
-            Ok(())
-        }
-        fn delete(&self, uuid: &str) -> Result<()> {
-            self.record(format!("delete {uuid}"));
-            Ok(())
-        }
-    }
-
     fn wifi_request(ssid: &str, password: &str) -> NetworkConnectWifiRequest {
         serde_json::from_value(json!({
             "interface": "wlan0",
@@ -744,7 +712,7 @@ mod tests {
     #[test]
     fn connect_wifi_writes_the_passphrase_only_to_the_keyfile() {
         let dir = tempfile::tempdir().unwrap();
-        let host = Arc::new(WifiHost::default());
+        let host = FakeHost::with(&[], None);
         let apply = SafeApply::new(Arc::clone(&host) as Arc<dyn NetworkHost>);
         let request = wifi_request("Home", "wifi-S3CRET-pass");
 
@@ -760,7 +728,7 @@ mod tests {
         assert_eq!(response["ssid"], "Home");
         assert_eq!(response["security"], "wpa-personal");
         let uuid = response["uuid"].as_str().unwrap();
-        assert_eq!(*host.calls.lock().unwrap(), ["load".to_owned(), format!("up {uuid}")]);
+        assert_eq!(host.calls(), ["load".to_owned(), format!("up {uuid}")]);
 
         // Reconnecting keeps the profile; a network missing from the scan
         // is probed for as hidden, with WPA-PSK.
@@ -775,9 +743,62 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_scan_fails_the_connection_instead_of_guessing() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = FakeHost::with(&[], None);
+        let apply = SafeApply::new(Arc::clone(&host) as Arc<dyn NetworkHost>);
+
+        let error = connect_wifi(
+            &wifi_request("Home", "wifi-S3CRET-pass"),
+            dir.path(),
+            &dir.path().join("certs"),
+            &apply,
+            &|_| bail!("nmcli: Wi-Fi radio is off"),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("radio is off"), "{error:#}");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert!(host.calls().is_empty());
+    }
+
+    #[test]
+    fn connect_wifi_checks_the_interface_name_before_scanning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut request = wifi_request("Home", "wifi-S3CRET-pass");
+        request.interface = "../wlan0".into();
+
+        let error = connect_wifi(&request, dir.path(), &dir.path().join("certs"), &SAFE_APPLY, &|_| {
+            panic!("scanned an invalid interface")
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("not a valid interface name"), "{error}");
+    }
+
+    #[test]
+    fn wifi_profiles_cannot_use_another_profiles_stored_certificates() {
+        let dir = tempfile::tempdir().unwrap();
+        let certs = dir.path().join("certs");
+        let other = certs.join("eth0/ca-cert.pem");
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        fs::write(&other, PEM_CA).unwrap();
+        let mut request = enterprise_request();
+        let WifiSecurity::WpaEnterprise(settings) = &mut request.security else { unreachable!() };
+        settings.ca_cert = Some(other.to_string_lossy().into_owned());
+
+        let error = connect_wifi(&request, dir.path(), &certs, &SAFE_APPLY, &|_| Ok(Vec::new()))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("another profile's directory"), "{error}");
+        assert!(!dir.path().join("wifi-wlan0.nmconnection").exists());
+    }
+
+    #[test]
     fn a_wifi_profile_that_does_not_come_up_is_removed() {
         let dir = tempfile::tempdir().unwrap();
-        let host = Arc::new(WifiHost { fail: true, ..WifiHost::default() });
+        let host = FakeHost::with(&[], None);
+        host.fail_every_activation();
         let apply = SafeApply::new(Arc::clone(&host) as Arc<dyn NetworkHost>);
 
         let error = connect_wifi(
@@ -793,7 +814,7 @@ mod tests {
         assert!(message.contains("could not connect to `Home`"), "{message}");
         assert!(!message.contains("S3CRET"), "{message}");
         assert!(!dir.path().join("wifi-wlan0.nmconnection").exists());
-        assert!(host.calls.lock().unwrap().last().unwrap().starts_with("delete "));
+        assert!(host.calls().last().unwrap().starts_with("delete "));
     }
 
     const PEM_KEY: &str =
@@ -822,7 +843,7 @@ mod tests {
     fn enterprise_wifi_stores_pem_files_and_points_the_keyfile_at_them() {
         let dir = tempfile::tempdir().unwrap();
         let certs = dir.path().join("certs");
-        let host = Arc::new(WifiHost::default());
+        let host = FakeHost::with(&[], None);
         let apply = SafeApply::new(Arc::clone(&host) as Arc<dyn NetworkHost>);
 
         let response =
@@ -860,7 +881,8 @@ mod tests {
     fn certificates_of_a_profile_that_does_not_come_up_are_removed() {
         let dir = tempfile::tempdir().unwrap();
         let certs = dir.path().join("certs");
-        let host = Arc::new(WifiHost { fail: true, ..WifiHost::default() });
+        let host = FakeHost::with(&[], None);
+        host.fail_every_activation();
         let apply = SafeApply::new(Arc::clone(&host) as Arc<dyn NetworkHost>);
 
         let error =
@@ -902,23 +924,27 @@ mod tests {
     #[test]
     fn dry_run_connect_wifi_does_not_scan_or_write() {
         let dir = tempfile::tempdir().unwrap();
-        let request: NetworkConnectWifiRequest = serde_json::from_value(json!({
-            "interface": "wlan0",
-            "ssid": "Home",
-            "security": {"type": "wpa-personal", "password": "wifi-S3CRET-pass"},
-            "dry_run": true,
-        }))
-        .unwrap();
+        // Too short for WPA-PSK, but a WPA3-only network would take it.
+        for password in ["wifi-S3CRET-pass", "S3CRET"] {
+            let request: NetworkConnectWifiRequest = serde_json::from_value(json!({
+                "interface": "wlan0",
+                "ssid": "Home",
+                "security": {"type": "wpa-personal", "password": password},
+                "dry_run": true,
+            }))
+            .unwrap();
 
-        let response = connect_wifi(&request, dir.path(), &dir.path().join("certs"), &SAFE_APPLY, &|_| {
-            panic!("dry run scanned")
-        })
-        .unwrap();
+            let response = connect_wifi(&request, dir.path(), &dir.path().join("certs"), &SAFE_APPLY, &|_| {
+                panic!("dry run scanned")
+            })
+            .unwrap();
 
-        assert_eq!(response["applied"], false);
-        assert!(response["keyfile"].as_str().unwrap().contains("psk=<redacted>"));
-        assert!(!response.to_string().contains("S3CRET"));
-        assert!(!dir.path().join("wifi-wlan0.nmconnection").exists());
+            assert_eq!(response["applied"], false);
+            assert!(response["note"].as_str().unwrap().contains("key-mgmt=sae"));
+            assert!(response["keyfile"].as_str().unwrap().contains("psk=<redacted>"));
+            assert!(!response.to_string().contains("S3CRET"));
+            assert!(!dir.path().join("wifi-wlan0.nmconnection").exists());
+        }
     }
 
     #[test]
@@ -956,7 +982,8 @@ mod tests {
     }
 
     /// Builds a fake sysfs whose `class/net` (the returned path) holds a
-    /// Wi-Fi card, a physical NIC, a veth, a bridge, a tun, and loopback,
+    /// Wi-Fi card, a physical NIC, a USB modem, a veth, a bridge, a tun,
+    /// and loopback,
     /// laid out like the kernel's.
     fn fake_sysfs() -> (tempfile::TempDir, PathBuf) {
         let sysfs = tempfile::tempdir().unwrap();
@@ -980,6 +1007,7 @@ mod tests {
         iface("wlan0", "1", "DEVTYPE=wlan\n", true, &["wireless", "phy80211"]);
         iface("enp1s0", "1", "", true, &[]);
         iface("veth0", "1", "", false, &[]);
+        iface("wwan0", "1", "DEVTYPE=wwan\n", true, &[]);
         iface("br0", "1", "DEVTYPE=bridge\n", false, &["bridge"]);
         iface("tailscale0", "65534", "", false, &[]);
         iface("lo", "772", "", false, &[]);
@@ -993,6 +1021,8 @@ mod tests {
         assert_eq!(kind("wlan0"), InterfaceKind::Wifi);
         assert_eq!(kind("enp1s0"), InterfaceKind::Ethernet);
         assert_eq!(kind("veth0"), InterfaceKind::Other);
+        // A WWAN modem is a device with an Ethernet link type, but no NIC.
+        assert_eq!(kind("wwan0"), InterfaceKind::Other);
         assert_eq!(kind("br0"), InterfaceKind::Other);
         assert_eq!(kind("tailscale0"), InterfaceKind::Other);
         assert_eq!(kind("lo"), InterfaceKind::Other);
@@ -1007,7 +1037,7 @@ mod tests {
         }]));
         let interfaces = read_interfaces(&net, &addresses).unwrap();
         let names: Vec<_> = interfaces.iter().map(|i| i["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["br0", "enp1s0", "lo", "tailscale0", "veth0", "wlan0"]);
+        assert_eq!(names, ["br0", "enp1s0", "lo", "tailscale0", "veth0", "wlan0", "wwan0"]);
         let by_name = |name: &str| interfaces.iter().find(|i| i["name"] == name).unwrap();
         assert_eq!(by_name("lo")["type"], "other");
         assert_eq!(by_name("lo")["operstate"], "up");

@@ -7,7 +7,9 @@
 //! `*.caddyfile` file with a `reverse_proxy` block in
 //! `/etc/caddy/Caddyfile.d`, which terra-caddy's default Caddyfile already
 //! imports (`import Caddyfile.d/*.caddyfile`). Operator files in the same
-//! directory are left alone: Tetra only rewrites files it wrote.
+//! directory are left alone: Tetra only rewrites files it wrote. Sites that
+//! released versions wrote to [`LEGACY_CONFIG_DIR`] are moved here when the
+//! agent starts ([`migrate_legacy_sites`]).
 //!
 //! The same directory holds two sites Tetra writes itself rather than
 //! through module actions: the dashboard's site (`access.set`) and, until
@@ -20,6 +22,7 @@
 use crate::prelude::*;
 
 use crate::agent::module_support::safe_join;
+pub use crate::auth::dns::DnsValue;
 
 /// Agent module that manages Caddy reverse proxy snippets.
 ///
@@ -308,9 +311,7 @@ fn ensure_managed(path: &Path) -> Result<()> {
         ),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to read `{}`", path.display()))
-        }
+        Err(error) => Err(error).with_context(|| format!("failed to read `{}`", path.display())),
     }
 }
 
@@ -358,6 +359,60 @@ fn list_sites(config_dir: &Path) -> Result<Vec<Value>> {
     Ok(sites)
 }
 
+/// Where released versions (up to 0.2.3) kept app sites, as `<name>.caddy`.
+pub const LEGACY_CONFIG_DIR: &str = "/etc/caddy/tetra-sites";
+
+/// Move the app sites `write` left in `legacy_dir` to `config_dir`.
+///
+/// `tetra agent-serve` passes [`LEGACY_CONFIG_DIR`] and
+/// [`DEFAULT_CONFIG_DIR`], the directory `list`, `write`, and `delete` use.
+///
+/// Released versions kept them in [`LEGACY_CONFIG_DIR`] as `<name>.caddy`;
+/// they become `<name>.caddyfile`, which terra-caddy imports. Files Tetra did not write, and ones whose new name
+/// is taken or reserved, stay where they are. Returns the files moved.
+///
+/// # Errors
+/// Fails when a directory cannot be read or created or a file moved; the
+/// files moved before stay moved.
+pub fn migrate_legacy_sites(legacy_dir: &Path, config_dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(legacy_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read `{}`", legacy_dir.display()));
+        }
+    };
+    let mut moved = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(stem) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|_| path.extension().is_some_and(|ext| ext == "caddy"))
+        else {
+            continue;
+        };
+        let filename = format!("{stem}.{SITE_EXTENSION}");
+        let target = config_dir.join(&filename);
+        let managed = entry.file_type()?.is_file()
+            && fs::read_to_string(&path).is_ok_and(|contents| contents.starts_with(MANAGED_HEADER));
+        if !managed
+            || filename == DASHBOARD_SITE_FILE
+            || filename == SETUP_SITE_FILE
+            || fs::symlink_metadata(&target).is_ok()
+        {
+            continue;
+        }
+        fs::create_dir_all(config_dir)
+            .with_context(|| format!("failed to create `{}`", config_dir.display()))?;
+        fs::rename(&path, &target)
+            .with_context(|| format!("failed to move `{}`", path.display()))?;
+        moved.push(target);
+    }
+    Ok(moved)
+}
+
 /// Reload Caddy via systemd so new or removed sites take effect without
 /// restarting (which would drop active connections). Dry runs report the
 /// command that would run without invoking systemctl.
@@ -386,37 +441,42 @@ pub enum DashboardTls {
     Dns {
         /// The module, such as `cloudflare`.
         provider: &'static str,
-        /// `(key, value)` lines of the provider block. Values are runtime
-        /// placeholders (`{env.TETRA_DNS_API_TOKEN}`) for secrets and quoted
-        /// literals for settings; never a credential.
-        fields: Vec<(String, String)>,
+        /// The provider block's settings and secret placeholders; never a
+        /// credential.
+        fields: Vec<(&'static str, DnsValue)>,
     },
 }
 
 /// One `key value` line of a DNS provider block. Keys are lowercase words;
-/// values are a `{env.TETRA_DNS_*}` placeholder or a quoted literal that
-/// cannot close the quote or a block.
-fn render_dns_field(key: &str, value: &str) -> Result<String> {
+/// secrets become a `{env.NAME}` placeholder and settings a quoted literal
+/// that cannot close the quote or a block.
+fn render_dns_field(key: &str, value: &DnsValue) -> Result<String> {
     ensure!(
         !key.is_empty() && key.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
         "invalid DNS provider key `{key}`"
     );
-    let placeholder = value
-        .strip_prefix("{env.TETRA_DNS_")
-        .and_then(|rest| rest.strip_suffix('}'))
-        .is_some_and(|name| {
-            !name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c == '_')
-        });
-    let literal = value
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-        .is_some_and(|inner| {
-            !inner.is_empty()
-                && !inner.chars().any(|c| {
-                    matches!(c, '"' | '\\' | '{' | '}') || c.is_control() || c.is_whitespace()
-                })
-        });
-    ensure!(placeholder || literal, "invalid value for DNS provider key `{key}`");
+    let value = match value {
+        DnsValue::Env(name) => {
+            ensure!(
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                "invalid environment variable for DNS provider key `{key}`"
+            );
+            format!("{{env.{name}}}")
+        }
+        DnsValue::Literal(text) => {
+            ensure!(
+                !text.is_empty()
+                    && !text.chars().any(|c| {
+                        matches!(c, '"' | '\\' | '{' | '}') || c.is_control() || c.is_whitespace()
+                    }),
+                "invalid value for DNS provider key `{key}`"
+            );
+            format!("\"{text}\"")
+        }
+    };
     Ok(format!("\t\t\t{key} {value}\n"))
 }
 
@@ -489,54 +549,46 @@ impl DashboardSite {
     }
 }
 
-/// Write the dashboard site into `config_dir`, replacing any previous one,
-/// and optionally reload Caddy.
+/// Write the dashboard site, as rendered by [`DashboardSite::render`], into
+/// `config_dir`, replacing any previous one. Does not reload Caddy.
 ///
 /// # Errors
-/// Fails when the site is invalid or cannot be written. A failed reload is
-/// reported in the result instead, like the `write` action does.
-pub fn write_dashboard_site(
-    config_dir: &Path,
-    site: &DashboardSite,
-    dry_run: bool,
-    reload: bool,
-) -> Result<Value> {
-    let contents = site.render()?;
+/// Fails when the file cannot be written.
+pub fn write_dashboard_site(config_dir: &Path, contents: &str) -> Result<Value> {
     let path = safe_join(config_dir, DASHBOARD_SITE_FILE)?;
-    if !dry_run {
-        fs::create_dir_all(config_dir)
-            .with_context(|| format!("failed to create `{}`", config_dir.display()))?;
-        fs::write(&path, &contents)
-            .with_context(|| format!("failed to write `{}`", path.display()))?;
-    }
-    let (reload, reload_error) = if reload {
-        match reload_caddy("write", dry_run, None) {
-            Ok(result) => (Some(result), None),
-            Err(error) => (None, Some(error.to_string())),
-        }
-    } else {
-        (None, None)
-    };
-    Ok(jsonf! { path, contents, "written": !dry_run, dry_run, reload, reload_error })
+    let changed = crate::auth::store::replace_if_changed(&path, contents.as_bytes(), SITE_MODE)?;
+    Ok(jsonf! { path, contents, changed })
 }
+
+/// Mode of the sites Tetra writes itself: Caddy runs as `caddy` and only
+/// needs to read them.
+const SITE_MODE: u32 = 0o644;
 
 /// Filename of the OOBE's site, written while setup is incomplete.
 pub const SETUP_SITE_FILE: &str = "00-ultramarine-setup.caddyfile";
 const SETUP_HEADER: &str = "# Managed by Tetra setup: Ultramarine Server setup (OOBE)";
-/// Port browsers use for the OOBE.
-pub const SETUP_PORT: u16 = 6623;
-/// Where the OOBE listens (loopback only).
-pub const SETUP_UPSTREAM: &str = "127.0.0.1:6624";
+pub use crate::auth::access::{SETUP_PORT, SETUP_UPSTREAM_PORT};
 
 /// The OOBE's site: HTTPS on [`SETUP_PORT`] for any address or name the
-/// browser uses, with a certificate from Caddy's internal CA, proxied to
-/// [`SETUP_UPSTREAM`].
+/// browser uses, with a certificate from Caddy's internal CA, proxied to the
+/// OOBE on port [`SETUP_UPSTREAM_PORT`] of `127.0.0.1`.
 ///
 /// The site has no host, so Caddy cannot know names up front: certificates
 /// are issued on demand, which Caddy allows without an `ask` endpoint because
 /// only the internal issuer is used. Caddy listens on the port on every
 /// address, IPv4 and IPv6 (a dual-stack wildcard socket), and still starts
 /// on hosts with IPv6 disabled, so the site does not `bind` explicitly.
+///
+/// Accepted risk: without `ask`, any client that reaches the port can make
+/// Caddy issue (and store under its data directory) an internal certificate
+/// for any SNI name it sends. An `ask` endpoint or a `permission` module can
+/// only be set in the global options of terra-caddy's main Caddyfile, not in
+/// this drop-in, and the server's addresses are not known when this file is
+/// written at boot (DHCP, Wi-Fi joined during setup), so they cannot be
+/// listed instead. The risk is disk and CPU use, not impersonation: the
+/// certificates and their keys never leave Caddy, which serves them only on
+/// this port; only the internal CA signs (no public CA is asked); each
+/// certificate is small; and the site exists only until setup completes.
 #[must_use]
 pub fn render_setup_site() -> String {
     format!(
@@ -545,7 +597,7 @@ pub fn render_setup_site() -> String {
          \ttls internal {{\n\
          \t\ton_demand\n\
          \t}}\n\
-         \treverse_proxy {SETUP_UPSTREAM}\n\
+         \treverse_proxy 127.0.0.1:{SETUP_UPSTREAM_PORT}\n\
          }}\n"
     )
 }
@@ -556,14 +608,7 @@ pub fn render_setup_site() -> String {
 /// Fails when the file cannot be written.
 pub fn write_setup_site(config_dir: &Path) -> Result<bool> {
     let path = safe_join(config_dir, SETUP_SITE_FILE)?;
-    let contents = render_setup_site();
-    if fs::read_to_string(&path).is_ok_and(|existing| existing == contents) {
-        return Ok(false);
-    }
-    fs::create_dir_all(config_dir)
-        .with_context(|| format!("failed to create `{}`", config_dir.display()))?;
-    fs::write(&path, contents).with_context(|| format!("failed to write `{}`", path.display()))?;
-    Ok(true)
+    crate::auth::store::replace_if_changed(&path, render_setup_site().as_bytes(), SITE_MODE)
 }
 
 /// Remove the OOBE's site. Returns whether it existed.
@@ -571,16 +616,13 @@ pub fn write_setup_site(config_dir: &Path) -> Result<bool> {
 /// # Errors
 /// Fails when the file exists but cannot be removed.
 pub fn remove_setup_site(config_dir: &Path) -> Result<bool> {
-    let path = safe_join(config_dir, SETUP_SITE_FILE)?;
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).with_context(|| format!("failed to remove `{}`", path.display())),
-    }
+    crate::auth::store::remove_if_exists(&safe_join(config_dir, SETUP_SITE_FILE)?)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     #[test]
@@ -642,7 +684,9 @@ mod tests {
         };
         assert_eq!(
             domain.render().unwrap(),
-            format!("{DASHBOARD_HEADER}\nserver.example.com {{\n\treverse_proxy 127.0.0.1:3972\n}}\n")
+            format!(
+                "{DASHBOARD_HEADER}\nserver.example.com {{\n\treverse_proxy 127.0.0.1:3972\n}}\n"
+            )
         );
         let ip = DashboardSite {
             address: "https://[2001:db8::1]".into(),
@@ -650,7 +694,11 @@ mod tests {
             upstream: "127.0.0.1:3972".into(),
             public_root: None,
         };
-        assert!(ip.render().unwrap().contains("https://[2001:db8::1] {\n\ttls internal\n"));
+        assert!(
+            ip.render()
+                .unwrap()
+                .contains("https://[2001:db8::1] {\n\ttls internal\n")
+        );
         let injected = DashboardSite {
             address: "evil.example.com {\n".into(),
             ..domain.clone()
@@ -677,8 +725,8 @@ mod tests {
             tls: DashboardTls::Dns {
                 provider: "powerdns",
                 fields: vec![
-                    ("server_url".into(), "\"https://ns.example.com\"".into()),
-                    ("api_token".into(), "{env.TETRA_DNS_API_TOKEN}".into()),
+                    ("server_url", DnsValue::Literal("https://ns.example.com".into())),
+                    ("api_token", DnsValue::Env("TETRA_DNS_API_TOKEN".into())),
                 ],
             },
             upstream: "127.0.0.1:3972".into(),
@@ -694,16 +742,18 @@ mod tests {
             )
         );
         for (key, value) in [
-            ("api_token", "plain-secret"),
-            ("api_token", "{env.HOME}"),
-            ("api_token", "\"a\" }\n"),
-            ("api_token", "\"with space\""),
-            ("Key", "\"x\""),
+            ("api_token", DnsValue::Env("HOME}".into())),
+            ("api_token", DnsValue::Env(String::new())),
+            ("api_token", DnsValue::Literal("a\" }\n".into())),
+            ("api_token", DnsValue::Literal("with space".into())),
+            ("api_token", DnsValue::Literal("{env.HOME}".into())),
+            ("api_token", DnsValue::Literal(String::new())),
+            ("Key", DnsValue::Literal("x".into())),
         ] {
             let site = DashboardSite {
                 tls: DashboardTls::Dns {
                     provider: "cloudflare",
-                    fields: vec![(key.into(), value.into())],
+                    fields: vec![(key, value)],
                 },
                 ..site.clone()
             };
@@ -733,15 +783,58 @@ mod tests {
     #[test]
     fn sites_use_terra_caddys_drop_in_directory() {
         assert_eq!(DEFAULT_CONFIG_DIR, "/etc/caddy/Caddyfile.d");
-        assert_eq!(site_filename("app.example.com").unwrap(), "app_example_com.caddyfile");
+        assert_eq!(
+            site_filename("app.example.com").unwrap(),
+            "app_example_com.caddyfile"
+        );
         let dir = tempfile::tempdir().unwrap();
-        // Files with other extensions are not imported, so not listed.
+        // Files with other extensions (such as the `*.caddy` sites of
+        // released versions, see `migrate_legacy_sites`) are not imported,
+        // so not listed.
         fs::write(
             dir.path().join("old_example_com.caddy"),
             format!("{MANAGED_HEADER}\n# tetra: {{\"domain\":\"old.example.com\",\"upstream\":\"127.0.0.1:1\",\"tls\":true}}\n"),
         )
         .unwrap();
         assert_eq!(list_sites(dir.path()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn sites_of_released_versions_are_moved_to_the_drop_in_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("tetra-sites");
+        let sites = dir.path().join("Caddyfile.d");
+        let site = |domain: &str| {
+            SiteMetadata::new(domain, "127.0.0.1:8080", true).unwrap().render().unwrap()
+        };
+        // Missing: nothing to do.
+        assert_eq!(migrate_legacy_sites(&legacy, &sites).unwrap(), Vec::<PathBuf>::new());
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("app_example_com.caddy"), site("app.example.com")).unwrap();
+        // The operator's own files stay, and so does a site whose new name
+        // is taken.
+        fs::write(legacy.join("mine.caddy"), "mine.example.com {\n}\n").unwrap();
+        fs::write(legacy.join("taken_example_com.caddy"), site("taken.example.com")).unwrap();
+        fs::create_dir_all(&sites).unwrap();
+        fs::write(sites.join("taken_example_com.caddyfile"), "operator's\n").unwrap();
+
+        let moved = migrate_legacy_sites(&legacy, &sites).unwrap();
+        assert_eq!(moved, [sites.join("app_example_com.caddyfile")]);
+        assert!(!legacy.join("app_example_com.caddy").exists());
+        assert!(legacy.join("mine.caddy").exists());
+        assert!(legacy.join("taken_example_com.caddy").exists());
+        assert_eq!(fs::read_to_string(sites.join("taken_example_com.caddyfile")).unwrap(), "operator's\n");
+        // `list` sees them in its directory, which is where `agent-serve`
+        // migrates to: `DEFAULT_CONFIG_DIR` unless a request names another.
+        let listed = ReverseProxyModule
+            .handle("list", serde_json::json!({ "config_dir": sites }), None)
+            .unwrap();
+        assert_eq!(listed["sites"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["sites"][0]["domain"], "app.example.com");
+        let default: List = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(default.config_dir, Path::new(DEFAULT_CONFIG_DIR));
+        // Once moved, there is nothing left to do.
+        assert_eq!(migrate_legacy_sites(&legacy, &sites).unwrap(), Vec::<PathBuf>::new());
     }
 
     #[test]
@@ -753,8 +846,15 @@ mod tests {
             upstream: "127.0.0.1:3972".into(),
             public_root: None,
         };
-        write_dashboard_site(dir.path(), &site, false, false).unwrap();
-        assert!(dir.path().join(DASHBOARD_SITE_FILE).exists());
+        let written = write_dashboard_site(dir.path(), &site.render().unwrap()).unwrap();
+        assert_eq!(written["changed"], true);
+        let path = dir.path().join(DASHBOARD_SITE_FILE);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            SITE_MODE
+        );
+        let again = write_dashboard_site(dir.path(), &site.render().unwrap()).unwrap();
+        assert_eq!(again["changed"], false);
         assert_eq!(list_sites(dir.path()).unwrap().len(), 0);
     }
 

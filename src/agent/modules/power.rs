@@ -91,4 +91,12 @@ mod tests {
             .handle("halt", json!({"dry_run": true}), None)
             .unwrap_err();
     }
+
+    #[test]
+    fn the_payload_may_be_left_out() {
+        // Parsed only: handling it would schedule a real reboot.
+        for verb in ["reboot", "poweroff"] {
+            Action::from_payload(verb, Value::Null).unwrap();
+        }
+    }
 }

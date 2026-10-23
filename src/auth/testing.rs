@@ -8,6 +8,8 @@
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use kameo::actor::Spawn as _;
+
 use crate::prelude::*;
 
 use super::{clock::Clock, seal::Sealer};
@@ -30,11 +32,13 @@ impl Sealer for FakeSealer {
 }
 
 /// [`HostControl`](super::host::HostControl) that records every command
-/// instead of running it. Commands listed with [`Self::fail`] fail.
+/// instead of running it. Commands listed with [`Self::fail`] or
+/// [`Self::fail_with`] fail.
 #[derive(Debug, Default)]
 pub struct RecordingHost {
     calls: std::sync::Mutex<Vec<String>>,
-    failing: std::sync::Mutex<HashSet<String>>,
+    /// Failing command lines and their error messages.
+    failing: std::sync::Mutex<BTreeMap<String, String>>,
 }
 
 impl RecordingHost {
@@ -46,7 +50,20 @@ impl RecordingHost {
 
     /// Make the command line `command` fail from now on.
     pub fn fail(&self, command: &str) {
-        self.failing.lock().unwrap().insert(command.into());
+        self.fail_with(command, &format!("`{command}` failed"));
+    }
+
+    /// Make the command line `command` fail with `message` from now on.
+    pub fn fail_with(&self, command: &str, message: &str) {
+        self.failing
+            .lock()
+            .unwrap()
+            .insert(command.into(), message.into());
+    }
+
+    /// Make the command line `command` succeed again.
+    pub fn succeed(&self, command: &str) {
+        self.failing.lock().unwrap().remove(command);
     }
 
     pub fn clear(&self) {
@@ -60,11 +77,10 @@ impl super::host::HostControl for RecordingHost {
             .chain(args.iter().copied())
             .join(" ");
         self.calls.lock().unwrap().push(command.clone());
-        ensure!(
-            !self.failing.lock().unwrap().contains(&command),
-            "`{command}` failed"
-        );
-        Ok(())
+        match self.failing.lock().unwrap().get(&command) {
+            Some(message) => bail!("{message}"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -265,6 +281,19 @@ impl TestHost {
     /// # Errors
     /// Fails when the scratch directories cannot be created.
     pub fn new(root: &Path) -> Result<Self> {
+        Self::with_dispatcher(root, |dispatcher| dispatcher)
+    }
+
+    /// Like [`Self::new`], with `customize` applied to the dispatcher behind
+    /// `module.dispatch`, for instance to replace a module with a stub.
+    /// [`Self::restart`] uses the default dispatcher.
+    ///
+    /// # Errors
+    /// Fails when the scratch directories cannot be created.
+    pub fn with_dispatcher<F>(root: &Path, customize: F) -> Result<Self>
+    where
+        F: FnOnce(crate::agent::Dispatcher) -> crate::agent::Dispatcher,
+    {
         use std::sync::Arc;
         let config = super::AuthConfig {
             state_dir: root.join("var/lib/tetra"),
@@ -285,7 +314,7 @@ impl TestHost {
         let clock = Arc::new(ManualClock::new(TEST_EPOCH));
         let host = Arc::new(RecordingHost::default());
         let queue = crate::agent::queue::DispatchQueue::spawn(
-            crate::agent::AgentBackend::spawn_default(),
+            crate::agent::AgentBackend::spawn(customize(config.dispatcher())),
             crate::agent::queue::DEFAULT_QUEUE_CAPACITY,
         );
         let service = super::AuthService::new(
@@ -348,7 +377,7 @@ impl TestHost {
                 host: Arc::clone(&self.host) as _,
             },
             crate::agent::queue::DispatchQueue::spawn(
-                crate::agent::AgentBackend::spawn_default(),
+                crate::agent::AgentBackend::spawn(self.config.dispatcher()),
                 crate::agent::queue::DEFAULT_QUEUE_CAPACITY,
             ),
         )
