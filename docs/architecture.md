@@ -56,6 +56,7 @@ tetra/
 │       ├── shell/frames.rs     # Shell stream control frames
 │       ├── shell/pty.rs        # PTY + systemd-run --pty, behind PtySpawner
 │       ├── transport.rs        # Outbound endpoint/TLS configuration (wss:// only)
+│       ├── tree.rs             # File operations from directory fds (openat2), for the apps home
 │       ├── websocket.rs        # Outbound WSS control-plane client
 │       ├── dev_listener.rs     # Dev-only loopback TCP listener
 │       ├── module_support.rs   # Shared module helpers
@@ -292,14 +293,16 @@ depend on one serde schema.
   before it becomes a positional argument (so `podman rm -a` cannot happen).
 - `option_arg` — append `--flag value` when an optional value is set.
 - `safe_join` — join a relative path under a base directory, rejecting absolute paths and `..`.
-- `resolve_under` / `write_under` / `remove_under` — `safe_join` that also
-  refuses symlinks below the base; `write_under` writes atomically with a
-  given mode and creates parent directories.
+- `write_under` — `safe_join`, then an atomic write with a given mode
+  through `tree::Tree` (parent directories created, no symlink below the
+  base followed).
 - `apply_selinux` — run `semanage fcontext` + `restorecon` when a payload includes `selinux` options.
-- `apps_account::{write_owned, create_dir_owned}` — `write_under` and
-  directory creation that hand the result to the `ultramarine-apps` account
-  (`Owner`, `lchown`, refusing symlinks below its home), for apps-scope
-  Quadlets and bundles.
+- `tree::Tree` — every read, write, listing and removal of Quadlets and
+  bundles (`quadlets::scope_tree` picks the tree for a scope): paths are
+  resolved from a directory descriptor with `openat2(RESOLVE_BENEATH |
+  RESOLVE_NO_SYMLINKS)`, and what is written is handed to the
+  `ultramarine-apps` account (`apps_account::Owner`) with `fchown` on its
+  descriptor. See [User apps and the apps account](#user-apps-and-the-apps-account).
 - `restorecon` — reset a path to the policy's default label (skipped without SELinux).
 - `parse_action` — decode `{action: payload}` into an action enum.
 - `Commands` — record a sequence of commands for one action, including failures that are tolerated.
@@ -403,10 +406,8 @@ installs them. `apps` and `quadlets` default to this `apps` scope
 services. There is no per-user scope.
 
 - Files: units in `~/.config/containers/systemd`, bundles in
-  `~/.local/share/tetra/quadlets/<app>`. Tetra writes them as root,
-  atomically, then `lchown`s each file and directory to the account
-  (`apps_account::Owner`), after checking that nothing from the home down is
-  a symlink.
+  `~/.local/share/tetra/quadlets/<app>`, written by Tetra as root and owned
+  by the account. See [Files in the apps home](#files-in-the-apps-home).
 - Host setup (`AppsAccount::provision`, on `apps.create`/`update` with
   `converge`): subordinate UID/GID ranges (`usermod --add-subuids/
   --add-subgids`, since `systemd-sysusers` allocates none), lingering, the
@@ -415,6 +416,78 @@ services. There is no per-user scope.
 - systemd: `systemctl --user -M ultramarine-apps@` (`ServiceScope::Apps`).
 - Reads: `podman` defaults to `run_as: apps`; `agent-serve` warns at startup
   when the account is missing or its IDs are not 242.
+
+### Files in the apps home
+
+The account owns its home, and the root of every rootless container is the
+account on the host, so anything in the home can be swapped for a symlink
+between a check by path and a use by path. Tetra therefore stays root but
+never uses a path below the home (`agent::tree::Tree`, `rustix`); it does not
+switch its filesystem UID (`setfsuid`), which is per thread and so a trap
+on Tokio's blocking pool.
+
+- The home is opened with `O_DIRECTORY | O_NOFOLLOW`. Before a write, it must
+  be a directory owned by the account or by Tetra itself (one Tetra just
+  created as `0700`, or that `systemd-tmpfiles` has not handed over yet);
+  any other owner is refused rather than given away, in case the account
+  database points the home at someone else's directory. It is then given
+  to the account with `fchown`.
+- Each directory below it is opened with `openat2` on its parent's
+  descriptor, with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+  RESOLVE_NO_MAGICLINKS`, so a symlink anywhere, the last component
+  included, fails (`ELOOP`) instead of being followed. Missing directories
+  are made with `mkdirat` (`0755`), and every directory from the home down
+  is handed to the account with `fchown` on its descriptor.
+  `RESOLVE_NO_XDEV` is not used: the account cannot mount anything in the
+  host's mount namespace, so a mount point below the home is the
+  administrator's (a separate disk for app data) and keeps working.
+- Files are written to an `O_TMPFILE` in their directory (an `O_CREAT |
+  O_EXCL | O_NOFOLLOW` file with a random name where the filesystem lacks
+  `O_TMPFILE`), given to the account and their mode (`0600` for units and
+  `app.json`, `0644` for companions) with `fchown`/`fchmod`, synced, linked
+  under a random name with `linkat("/proc/self/fd/N", AT_SYMLINK_FOLLOW)`
+  (`AT_EMPTY_PATH`, which needs `CAP_DAC_READ_SEARCH`, without `/proc`) and
+  `renameat`-ed over the target; the directory is synced last. A symlink at
+  the target is replaced, never followed.
+- Reads (`app.json`, `quadlets.read`, templates) go through `openat2` too,
+  with `O_NOFOLLOW | O_NONBLOCK` (a FIFO cannot hang the agent), and only a
+  regular file with one link is read, so a hard link to a file elsewhere is
+  not (`fs.protected_hardlinks` already stops the account from making one
+  to a file it cannot write).
+- Removals are `unlinkat` on the parent's descriptor; `apps.remove` empties
+  the bundle entry by entry the same way, removing symlinks rather than
+  what they point to. Listings read directory descriptors and skip
+  symlinks.
+- Directories outside the home (system scope, payload `base_dir` overrides,
+  a recipe's output directory) are root's and trusted: the directory itself
+  is the anchor, opened by path, and everything below it goes through the
+  same descriptor-relative code.
+
+All of this is blocking I/O and runs on the blocking pool with the rest of
+the module (see [Threading](#threading-and-concurrency-model)). `openat2`
+needs Linux 5.6.
+
+Ownership is only changed when Tetra runs as root and the action is not a dry
+run (`Owner::for_apps`); without root, files stay the caller's. Tests
+replace `fchown` with a recorder (`Owner::with_chown`) and check that it was
+handed the descriptor of the file that ends up at the path.
+
+SELinux labels are not set by path: a new file gets its label from its
+directory at creation. Two things still run `restorecon` on paths in the
+home, as root: the `selinux` options of `quadlets.write`/`install` and
+`apps.create`/`update` (an administrator's request), and the one-time
+`restorecon -R` of the account's container storage in
+`AppsAccount::provision`. `restorecon` resolves the path's directories with
+`realpath(3)` and walks a tree with `fts` (`FTS_PHYSICAL | FTS_NOCHDIR`),
+relabeling each entry by its full path, so it does not follow a symlink
+it finds, but a directory swapped for a symlink while it runs could have it
+relabel a file elsewhere to the label the policy gives the home's path.
+DAC still applies to that file, so this is a mislabeling (and denial of
+service) risk rather than a way to read or write it. Closing it means
+labeling by descriptor (`fsetfilecon` with the context from
+`selabel_lookup`, which needs libselinux), or running `restorecon` as the
+account inside its user namespace, where the kernel only lets it relabel
+files the account owns.
 
 ### Remote and development transports
 
@@ -465,8 +538,8 @@ content.
   with one task per direction pumping bytes and a supervisor that checks the
   session every 5 seconds.
 - A single queue worker serializes module commands and runs each one on the
-  blocking pool, so long-running module actions never block the async
-  transports.
+  blocking pool, so long-running module actions, and blocking file I/O such
+  as `agent::tree`'s, never block the async transports.
 
 ## Testing
 

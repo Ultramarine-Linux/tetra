@@ -724,13 +724,19 @@ files default to `~ultramarine-apps/.local/share/tetra/quadlets/app` in apps
 scope and `/var/lib/tetra/quadlets/app` in system scope.
 
 In apps scope, every file and directory Tetra writes below the account's home
-is handed to `ultramarine-apps` (`lchown` after the atomic write; modes stay
-`0600` for units and `0644` for companions, directories are `0755` and the
-home `0700`), and the `write` and `install` responses say so with
-`"owner": "ultramarine-apps"` (`"root"` in system scope). The home and every
-directory below it are refused if one is a symlink, since the account (and
-so an app container's root) owns that tree. Without root (tests, development)
-files keep their owner. `quadlets` only writes files: run
+is handed to `ultramarine-apps` (`fchown` on the open file before it gets its
+final name; modes stay `0600` for units and `0644` for companions, directories are
+`0755` and the home `0700`), and the `write` and `install` responses say so
+with `"owner": "ultramarine-apps"` (`"root"` in system scope). Since the
+account (and so an app container's root) owns that tree, no path in it is
+followed through a symlink: a symlink at a directory on the way fails the
+action (`... contains a symlink; refusing to follow it`), one at the file
+being written is replaced, `delete` removes a symlink itself, `read` refuses
+anything but a regular file with a single link, and listings skip symlinks
+(`apps.list` reports a symlinked bundle as invalid).
+A write is refused if the home belongs to anyone but the account or Tetra.
+Without root (tests, development) files keep their owner. See
+[architecture.md](architecture.md#files-in-the-apps-home). `quadlets` only writes files: run
 `services.daemon_reload` with `"scope": "apps"` afterwards, and use
 `apps.create` (which also prepares the account, see [apps](#apps)) to install
 apps.
