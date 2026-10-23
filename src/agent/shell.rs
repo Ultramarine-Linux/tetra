@@ -15,10 +15,18 @@
 //! A shell ends when the shell exits, the dashboard closes the connection,
 //! its session ends (checked every [`ShellLimits::check_interval`]: logout,
 //! revocation, expiry, a locked or renamed account, a removed permission),
-//! nothing was typed for [`ShellLimits::idle_timeout`] (output does not
-//! count), or it has been open for [`ShellLimits::max_lifetime`]. Typing
-//! counts as using the session, so a session stays alive while its shell is
-//! used, up to the session's absolute lifetime.
+//! no input came from the dashboard for [`ShellLimits::idle_timeout`], or it
+//! has been open for [`ShellLimits::max_lifetime`]. Input is any terminal
+//! bytes or valid `resize` from the dashboard: keystrokes, but also what
+//! the browser's terminal sends by itself (mouse and focus reports, answers
+//! to queries) and whatever the dashboard sends. Output does not count.
+//! Input also counts as using the session, so a session stays alive while
+//! its shell is used, up to the session's absolute lifetime.
+//!
+//! Whenever a shell ends, its transient unit is stopped (see [`pty`]), so
+//! what runs in it ends too, unless it left the unit (`systemd-run --user`,
+//! lingering user services). If Tetra itself dies, the next start stops
+//! the units it left ([`ShellServer::stop_leftover_units`]).
 //! Each user may have [`ShellLimits::per_user`] shells, the host
 //! [`ShellLimits::total`]. Opening and closing are recorded in the action
 //! log (module `shell`, actions `open` and `close`).
@@ -85,8 +93,9 @@ pub struct ShellLimits {
     pub per_user: usize,
     /// Shells the host runs at once.
     pub total: usize,
-    /// A shell without input for this long ends. Only input counts: a
-    /// forgotten `tail -f` or `watch` must not keep a shell alive.
+    /// A shell without input (terminal bytes or a resize from the
+    /// dashboard) for this long ends. Output does not count: a forgotten
+    /// `tail -f` or `watch` must not keep a shell alive.
     pub idle_timeout: Duration,
     /// A shell ends after this long however it is used, so no shell outlives
     /// a working day.
@@ -544,7 +553,7 @@ struct Pumps {
     output: JoinHandle<OutputEnd>,
     input_done: bool,
     output_done: bool,
-    /// Set by the input side on every keystroke or resize.
+    /// Set by the input side on every input message or resize.
     typed: Arc<AtomicBool>,
 }
 

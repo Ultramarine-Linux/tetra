@@ -457,15 +457,18 @@ and from then on the connection carries only the shell:
   `status` is the shell's exit status when it exited by itself with one,
   otherwise `null`. `reason` is `exited`, `session_ended` (logout,
   revocation or expiry of the session, or its account may no longer log in
-  or open a shell), `idle_timeout` (nothing typed for 30 minutes; output
-  does not count, so a forgotten `tail -f` or `watch` cannot keep a shell
-  alive), `max_lifetime` (open for 4 hours, however it is used) or
+  or open a shell), `idle_timeout` (no input for 30 minutes: no binary
+  message and no valid `resize` from the dashboard; output does not count,
+  so a forgotten `tail -f` or `watch` cannot keep a shell alive), `max_lifetime` (open for 4 hours, however it is used) or
   `protocol_error`.
 
 Closing the connection ends the shell. So does the end of its session, which
-Tetra checks every 5 seconds while the shell runs. Typing in the shell counts
-as using the session (`last_seen`), so a session does not expire while its
-shell is in use; the 12-hour limit still applies.
+Tetra checks every 5 seconds while the shell runs. Input counts as using the
+session (`last_seen`), so a session does not expire while its shell is in
+use; the 12-hour limit still applies. Input is anything the dashboard sends:
+keystrokes, but also what xterm.js sends by itself (mouse and focus reports,
+answers to terminal queries), so a dashboard that keeps sending keeps the
+shell and its session from going idle; `max_lifetime` still ends it.
 
 How Tetra runs it: Tetra opens a PTY pair itself and runs
 
@@ -487,15 +490,19 @@ expiry) and the session stack, like a console login: the user's SELinux
 context, the audit `loginuid`, limits, and a logind session with
 `XDG_RUNTIME_DIR`, so `systemctl --user` and rootless Podman work. Its auth
 stack is `pam_deny`; systemd never runs it. Resizes reach the shell through
-systemd-run (`SIGWINCH`). When the shell ends for any other reason than
-exiting, Tetra stops the unit (`SIGTERM` and `SIGHUP` to everything in it,
-`SIGKILL` after 10 seconds) and hangs up systemd-run, which hangs up the
-shell's terminal. As with SSH, processes the user deliberately detached from
-the shell elsewhere (`systemd-run --user`, `loginctl enable-linger`) are not
-stopped. Output waits when the dashboard reads
-slower than the shell writes, so neither side buffers without bound. If
-Tetra stops, systemd kills its systemd-run processes, which hangs up every
-shell.
+systemd-run (`SIGWINCH`). Whenever a shell ends, for whatever reason,
+Tetra stops its unit (`SIGTERM` and `SIGHUP` to everything in it, `SIGKILL`
+after 10 seconds) and hangs up systemd-run if it still runs. That includes
+the shell exiting and systemd-run exiting by itself (detached with `^]`
+three times, which leaves the unit running): the connection then ends with
+`exited`. As with SSH, processes the user deliberately moved out of the
+unit (`systemd-run --user`, user services with `loginctl enable-linger`)
+are not stopped. Output waits when the dashboard reads slower than the
+shell writes, so neither side buffers without bound. If Tetra stops,
+systemd kills its systemd-run processes, which hangs up every shell's
+terminal; a shell that ignores `SIGHUP` keeps running in its unit until
+Tetra starts again, which stops every `tetra-shell-*.service` it did not
+start itself.
 
 ### Access and setup completion
 

@@ -82,8 +82,8 @@ impl AuthService {
 
     /// Check that the shell of `grant` may keep running: its session is
     /// live, the account may still log in, and it may still open a shell.
-    /// With `touch`, count it as a use of the session (the user typed in
-    /// the shell), which keeps the session from expiring while idle.
+    /// With `touch`, count it as a use of the session (input reached the
+    /// shell), which keeps the session from expiring while idle.
     ///
     /// # Errors
     /// Like [`Self::redeem_shell_ticket`] once the ticket is accepted.

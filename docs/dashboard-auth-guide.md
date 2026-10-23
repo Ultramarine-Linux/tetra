@@ -307,7 +307,7 @@ browser (xterm.js) ⇄ dashboard WebSocket ⇄ dashboard server ⇄ /run/tetra/t
      unchanged. A **text** message is `{"type": "exit", "status", "reason"}`:
      show "session ended" (`exited`, with `status`), "you were logged out"
      (`session_ended`), "closed after 30 minutes without input"
-     (`idle_timeout`; only typing counts, not output) or "closed after
+     (`idle_timeout`; any input counts, not output) or "closed after
      4 hours" (`max_lifetime`). Tetra closes the connection right after it.
 4. Pipe both ways without buffering more than a few messages: when the
    browser is slow, stop reading from Tetra (back-pressure keeps the shell
@@ -319,8 +319,12 @@ browser (xterm.js) ⇄ dashboard WebSocket ⇄ dashboard server ⇄ /run/tetra/t
 Never reuse a shell connection for requests, and never send `shell.open` on
 the shared request connection (`bad_request`). The `result` of `shell.open`
 has the `uid`, `username` and transient `unit` of the shell, and its
-`idle_timeout` and `max_lifetime` in seconds, for display. Typing in the terminal keeps the
-user's session from expiring for inactivity. Opening and closing shells are
+`idle_timeout` and `max_lifetime` in seconds, for display. Any input
+(binary message or valid `resize`) resets the idle timer and keeps the
+user's session from expiring for inactivity; that includes what xterm.js
+sends by itself, such as mouse and focus reports. Never send input the user
+did not cause (keep-alives), or idle shells never end before
+`max_lifetime`. Opening and closing shells are
 recorded in the action log (module `shell`). Every signed-in user may open a
 shell; the setup session and the OOBE may not.
 

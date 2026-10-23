@@ -119,7 +119,7 @@ On an error Tetra sends a normal error response and closes the connection:
 | --- | --- |
 | `exited` | "session ended" (with `status`) |
 | `session_ended` | "you were logged out" (logout, revocation, expiry, locked account) |
-| `idle_timeout` | "closed after 30 minutes without input" (only typing counts) |
+| `idle_timeout` | "closed after 30 minutes without input" (any input counts, not output) |
 | `max_lifetime` | "closed after 4 hours" |
 | `protocol_error` | "the terminal sent too much at once" |
 
