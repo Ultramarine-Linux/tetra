@@ -15,8 +15,10 @@
 //! A shell ends when the shell exits, the dashboard closes the connection,
 //! its session ends (checked every [`ShellLimits::check_interval`]: logout,
 //! revocation, expiry, a locked or renamed account, a removed permission),
-//! or nothing was typed for [`ShellLimits::idle_timeout`]. Typing counts as
-//! using the session, so a session stays alive while its shell is used.
+//! nothing was typed for [`ShellLimits::idle_timeout`] (output does not
+//! count), or it has been open for [`ShellLimits::max_lifetime`]. Typing
+//! counts as using the session, so a session stays alive while its shell is
+//! used, up to the session's absolute lifetime.
 //! Each user may have [`ShellLimits::per_user`] shells, the host
 //! [`ShellLimits::total`]. Opening and closing are recorded in the action
 //! log (module `shell`, actions `open` and `close`).
@@ -83,8 +85,12 @@ pub struct ShellLimits {
     pub per_user: usize,
     /// Shells the host runs at once.
     pub total: usize,
-    /// A shell without input for this long ends.
+    /// A shell without input for this long ends. Only input counts: a
+    /// forgotten `tail -f` or `watch` must not keep a shell alive.
     pub idle_timeout: Duration,
+    /// A shell ends after this long however it is used, so no shell outlives
+    /// a working day.
+    pub max_lifetime: Duration,
     /// How often a shell's session is checked.
     pub check_interval: Duration,
 }
@@ -95,6 +101,7 @@ impl Default for ShellLimits {
             per_user: 4,
             total: 16,
             idle_timeout: Duration::from_mins(30),
+            max_lifetime: Duration::from_hours(4),
             check_interval: Duration::from_secs(5),
         }
     }
@@ -270,6 +277,7 @@ impl ShellServer {
             "cols": size.cols,
             "rows": size.rows,
             "idle_timeout": self.inner.limits.idle_timeout.as_secs(),
+            "max_lifetime": self.inner.limits.max_lifetime.as_secs(),
         });
         let answered = sink
             .send(text(&ServerFrame::Response(Response::new(
@@ -429,7 +437,8 @@ impl ShellServer {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick is immediate.
         ticker.tick().await;
-        let mut last_input = Instant::now();
+        let started = Instant::now();
+        let mut last_input = started;
         loop {
             tokio::select! {
                 ended = &mut pumps.input, if !pumps.input_done => {
@@ -482,6 +491,9 @@ impl ShellServer {
                     }
                     if last_input.elapsed() >= limits.idle_timeout {
                         return End::because(ExitReason::IdleTimeout);
+                    }
+                    if started.elapsed() >= limits.max_lifetime {
+                        return End::because(ExitReason::MaxLifetime);
                     }
                 }
             }
@@ -917,6 +929,86 @@ mod tests {
                 ..
             }
         ));
+        assert!(shell.is_terminated());
+    }
+
+    #[tokio::test]
+    async fn revoking_the_session_ends_its_shell() {
+        let mut h = harness(fast());
+        h.host.accounts.add("root-admin", 1001, &["wheel"]);
+        h.host.passwords.set("root-admin", "hunter2");
+        let token = login(&h.host, "alice").await;
+        let ticket = ticket(&h.host, &token).await;
+        let mut socket = connect(&h.path).await;
+        assert!(open(&mut socket, &ticket).await.ok);
+        let shell = h.shells.recv().await.unwrap();
+
+        let admin = login(&h.host, "root-admin").await;
+        request(
+            &h.host,
+            Some(&admin),
+            "admin.sessions_revoke",
+            json!({"uid": 1000}),
+        )
+        .await;
+        assert_eq!(
+            exit_frame(&mut socket).await,
+            ServerControl::Exit {
+                status: None,
+                reason: ExitReason::SessionEnded
+            }
+        );
+        assert!(shell.is_terminated());
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_ends_its_shell() {
+        let mut h = harness(fast());
+        let token = login(&h.host, "alice").await;
+        let ticket = ticket(&h.host, &token).await;
+        let mut socket = connect(&h.path).await;
+        assert!(open(&mut socket, &ticket).await.ok);
+        let shell = h.shells.recv().await.unwrap();
+
+        // Past the absolute lifetime: typing cannot keep it alive.
+        let policy = crate::auth::sessions::SessionPolicy::default();
+        h.host.clock.advance(policy.lifetime.saturating_add(1));
+        assert_eq!(
+            exit_frame(&mut socket).await,
+            ServerControl::Exit {
+                status: None,
+                reason: ExitReason::SessionEnded
+            }
+        );
+        assert!(shell.is_terminated());
+    }
+
+    #[tokio::test]
+    async fn shells_end_at_their_maximum_lifetime_even_when_used() {
+        let mut h = harness(ShellLimits {
+            max_lifetime: Duration::from_millis(150),
+            ..fast()
+        });
+        let token = login(&h.host, "alice").await;
+        let ticket = ticket(&h.host, &token).await;
+        let mut socket = connect(&h.path).await;
+        assert!(open(&mut socket, &ticket).await.ok);
+        let shell = h.shells.recv().await.unwrap();
+        // Keep typing; the lifetime still ends it.
+        for _ in 0..20 {
+            let sent = socket.send(Message::Binary(b"x".to_vec().into())).await;
+            if sent.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            exit_frame(&mut socket).await,
+            ServerControl::Exit {
+                status: None,
+                reason: ExitReason::MaxLifetime
+            }
+        );
         assert!(shell.is_terminated());
     }
 

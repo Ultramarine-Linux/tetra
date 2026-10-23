@@ -435,7 +435,8 @@ On success Tetra answers
 { "type": "response", "id": "sh-1", "ok": true,
   "result": { "uid": 1000, "username": "alice",
               "unit": "tetra-shell-1000-1a2b3c4d5e6f.service",
-              "cols": 120, "rows": 40, "idle_timeout": 1800 } }
+              "cols": 120, "rows": 40, "idle_timeout": 1800,
+              "max_lifetime": 14400 } }
 ```
 
 and from then on the connection carries only the shell:
@@ -451,7 +452,9 @@ and from then on the connection carries only the shell:
   `status` is the shell's exit status when it exited by itself with one,
   otherwise `null`. `reason` is `exited`, `session_ended` (logout,
   revocation or expiry of the session, or its account may no longer log in
-  or open a shell), `idle_timeout` (nothing typed for 30 minutes) or
+  or open a shell), `idle_timeout` (nothing typed for 30 minutes; output
+  does not count, so a forgotten `tail -f` or `watch` cannot keep a shell
+  alive), `max_lifetime` (open for 4 hours, however it is used) or
   `protocol_error`.
 
 Closing the connection ends the shell. So does the end of its session, which

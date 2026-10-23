@@ -91,6 +91,8 @@ pub enum ExitReason {
     SessionEnded,
     /// No input for the idle timeout.
     IdleTimeout,
+    /// Open for the maximum lifetime, whatever its use.
+    MaxLifetime,
     /// The dashboard closed the connection (never sent: it is gone).
     ClientClosed,
     /// The dashboard broke the protocol (an oversized input message).
