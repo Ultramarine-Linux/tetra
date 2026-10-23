@@ -7,9 +7,13 @@
 //! a check by path and a use by path, so Tetra, which works there as root,
 //! never uses a path below the home:
 //!
-//! - the home is opened once per operation (`O_DIRECTORY | O_NOFOLLOW`);
-//!   for a write, it must belong to the account or to Tetra itself (a home
-//!   Tetra just created), and is then handed to the account;
+//! - the home must be a plausible one (absolute, not `/` or a system
+//!   directory, see [`check_home`]). It is opened once per operation
+//!   (`O_DIRECTORY | O_NOFOLLOW`) from its parent's descriptor. For a write,
+//!   the parent must be Tetra's (root's) and writable by no one else, and
+//!   the home must belong to the account, or be one Tetra made in this very
+//!   operation (`mkdirat` on the parent), and is then handed to the account.
+//!   An existing directory of anyone else, root included, is refused;
 //! - every directory below it is opened with `openat2` relative to its
 //!   parent's descriptor, with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
 //!   RESOLVE_NO_MAGICLINKS`, so a symlink anywhere on the way (the last
@@ -53,7 +57,7 @@ use std::{
     io::{Read as _, Write as _},
     os::{
         fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd},
-        unix::{ffi::OsStringExt as _, fs::DirBuilderExt as _},
+        unix::ffi::OsStringExt as _,
     },
     path::Component,
 };
@@ -64,7 +68,7 @@ use rustix::{
     io::Errno,
 };
 
-use crate::agent::apps_account::Owner;
+use crate::agent::apps_account::{APPS_USER, Owner, check_home};
 use crate::prelude::*;
 
 /// How every path below an anchor is resolved.
@@ -356,69 +360,103 @@ impl Tree {
     /// not set. With `create`, a missing anchor is made, and the anchor is
     /// handed to the owner.
     fn open_anchor(&self, create: bool) -> Result<Option<OwnedFd>> {
+        if self.home {
+            return self.open_home(create);
+        }
         let anchor = &self.anchor;
-        // The home's own entry is in a directory root owns, so the account
-        // cannot swap it; `O_NOFOLLOW` refuses a symlink there anyway.
-        let flags = if self.home {
-            DIRECTORY.union(OFlags::NOFOLLOW)
-        } else {
-            DIRECTORY
+        let open = || rfs::open(anchor, DIRECTORY, Mode::empty());
+        let context = || format!("failed to open `{}`", anchor.display());
+        match open() {
+            Ok(fd) => Ok(Some(fd)),
+            Err(Errno::NOENT) if !create => Ok(None),
+            Err(Errno::NOENT) => {
+                fs::create_dir_all(anchor)
+                    .with_context(|| format!("failed to create `{}`", anchor.display()))?;
+                open()
+                    .map(Some)
+                    .map_err(io::Error::from)
+                    .with_context(context)
+            }
+            Err(errno) => Err(io::Error::from(errno)).with_context(context),
+        }
+    }
+
+    /// [`open_anchor`](Self::open_anchor) for the apps account's home,
+    /// opened (and made, `0700`) from its parent's descriptor. With `create`
+    /// and an owner, the parent must be Tetra's and writable by no one else,
+    /// so the home's entry cannot be swapped, and the home must be the
+    /// account's or one this call just made (see [`Owner::may_own_home`]).
+    fn open_home(&self, create: bool) -> Result<Option<OwnedFd>> {
+        let home = &self.anchor;
+        check_home(home)?;
+        let (Some(parent_path), Some(name)) = (home.parent(), home.file_name()) else {
+            bail!("`{}` has no parent directory", home.display());
         };
-        let open = || rfs::open(anchor, flags, Mode::empty());
+        let parent = match rfs::open(parent_path, DIRECTORY, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) if !create => return Ok(None),
+            Err(errno) => {
+                return Err(io::Error::from(errno))
+                    .with_context(|| format!("failed to open `{}`", parent_path.display()));
+            }
+        };
+        let owner = self.owner.as_ref().filter(|_| create);
+        if owner.is_some() {
+            let stat = rfs::fstat(&parent)?;
+            let me = nix::unistd::geteuid().as_raw();
+            ensure!(
+                (stat.st_uid == 0 || stat.st_uid == me) && stat.st_mode & 0o022 == 0,
+                "`{}`, the parent of `{}`, belongs to UID {} or is writable by others; \
+                 refusing to hand the home to `{APPS_USER}`",
+                parent_path.display(),
+                home.display(),
+                stat.st_uid
+            );
+        }
+        // `O_DIRECTORY | O_NOFOLLOW` refuses a symlink (as `ENOTDIR`).
+        let flags = DIRECTORY.union(OFlags::NOFOLLOW);
+        let open = || rfs::openat(&parent, name, flags, Mode::empty());
+        let refused = |errno: Errno| match errno {
+            Errno::LOOP | Errno::NOTDIR => anyhow!(
+                "`{}` is a symlink or not a directory; refusing to follow it",
+                home.display()
+            ),
+            errno => anyhow::Error::from(io::Error::from(errno))
+                .context(format!("failed to open `{}`", home.display())),
+        };
         let mut created = false;
         let fd = match open() {
             Ok(fd) => fd,
             Err(Errno::NOENT) if !create => return Ok(None),
             Err(Errno::NOENT) => {
-                created = self.create_anchor()?;
-                open().with_context(|| format!("failed to open `{}`", anchor.display()))?
+                match rfs::mkdirat(&parent, name, Mode::from_raw_mode(HOME_MODE)) {
+                    Ok(()) => created = true,
+                    Err(Errno::EXIST) => {}
+                    Err(errno) => {
+                        return Err(io::Error::from(errno))
+                            .with_context(|| format!("failed to create `{}`", home.display()));
+                    }
+                }
+                open().map_err(refused)?
             }
-            // `O_DIRECTORY | O_NOFOLLOW` on a symlink is `ENOTDIR`.
-            Err(Errno::LOOP | Errno::NOTDIR) if self.home => {
-                bail!(
-                    "`{}` is a symlink or not a directory; refusing to follow it",
-                    anchor.display()
-                )
-            }
-            Err(errno) => {
-                return Err(io::Error::from(errno))
-                    .with_context(|| format!("failed to open `{}`", anchor.display()));
-            }
+            Err(errno) => return Err(refused(errno)),
         };
         if created {
             // The umask may have narrowed the mode.
             rfs::fchmod(&fd, Mode::from_raw_mode(HOME_MODE))?;
         }
-        if create && let Some(owner) = &self.owner {
-            if self.home {
-                let uid = rfs::fstat(&fd)?.st_uid;
-                ensure!(
-                    owner.may_own_home(uid),
-                    "`{}` belongs to UID {uid}, not to `{}`; refusing to write to it",
-                    anchor.display(),
-                    crate::agent::apps_account::APPS_USER
-                );
-            }
-            owner.claim(fd.as_fd(), anchor)?;
+        if let Some(owner) = owner {
+            let uid = rfs::fstat(&fd)?.st_uid;
+            ensure!(
+                owner.may_own_home(uid, created),
+                "`{}` belongs to UID {uid}, not to `{APPS_USER}`, and Tetra did not just \
+                 create it; refusing to write to it (give it to `{APPS_USER}`, or remove it \
+                 to have Tetra create it)",
+                home.display()
+            );
+            owner.claim(fd.as_fd(), home)?;
         }
         Ok(Some(fd))
-    }
-
-    /// Make the missing anchor: the home (`0700`, in a directory root owns),
-    /// or a trusted directory and its parents. Returns whether this made the
-    /// home.
-    fn create_anchor(&self) -> Result<bool> {
-        let anchor = &self.anchor;
-        let context = || format!("failed to create `{}`", anchor.display());
-        if !self.home {
-            fs::create_dir_all(anchor).with_context(context)?;
-            return Ok(false);
-        }
-        match fs::DirBuilder::new().mode(HOME_MODE).create(anchor) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-            Err(error) => Err(error).with_context(context),
-        }
     }
 
     /// Open the directory `relative` below the anchor, or `None` when it
@@ -696,7 +734,9 @@ mod tests {
                 .unwrap()
                 .push((relative.to_string_lossy().into_owned(), inode));
             Ok(())
-        });
+        })
+        // The fake chown leaves the home the test's.
+        .adopting_existing_homes();
         (Tree::new(dir, Some(home), Some(owner)), chowned)
     }
 
@@ -943,17 +983,48 @@ mod tests {
     }
 
     #[test]
-    fn a_home_owned_by_someone_else_is_refused() {
+    fn only_a_home_tetra_just_made_is_taken_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
         let account = AppsAccount {
             uid: u32::MAX - 1,
             gid: u32::MAX - 1,
-            home: PathBuf::from("/nonexistent"),
+            home: home.clone(),
         };
+        // Production's policy, with a chown that changes nothing: the home
+        // stays Tetra's (root's) after the first write.
         let owner = Owner::with_chown(&account, |_, _, _, _| Ok(()));
-        assert!(owner.may_own_home(u32::MAX - 1));
-        assert!(owner.may_own_home(nix::unistd::geteuid().as_raw()));
-        let stranger = nix::unistd::geteuid().as_raw().wrapping_add(1);
-        assert!(!owner.may_own_home(stranger) || stranger == u32::MAX - 1);
+        let tree = Tree::new(&home, Some(&home), Some(owner.clone()));
+        tree.write(&home.join("a"), b"x", 0o600).unwrap();
+        assert_eq!(fs::read(home.join("a")).unwrap(), b"x");
+        // Now it is an existing home of Tetra's own, which is refused.
+        let error = tree.write(&home.join("b"), b"x", 0o600).unwrap_err();
+        assert!(
+            error.to_string().contains("did not just create"),
+            "{error:#}"
+        );
+        assert!(!home.join("b").exists());
+        // Reads do not hand anything over, so they still work.
+        assert_eq!(tree.read(&home.join("a")).unwrap(), b"x");
+
+        // A home whose parent others may write to is refused.
+        let open = dir.path().join("open");
+        fs::create_dir_all(&open).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
+        let home = open.join("home");
+        let tree = Tree::new(&home, Some(&home), Some(owner.adopting_existing_homes()));
+        let error = tree.create_dir(&home).unwrap_err();
+        assert!(
+            error.to_string().contains("writable by others"),
+            "{error:#}"
+        );
+        assert!(!home.exists());
+
+        // So is a system directory, for reads too.
+        for home in ["/", "/var/lib", "/etc"] {
+            let tree = Tree::new(Path::new("/etc/x"), Some(Path::new(home)), None);
+            tree.read(Path::new("/etc/x")).unwrap_err();
+        }
     }
 
     #[test]

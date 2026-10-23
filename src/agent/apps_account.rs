@@ -21,7 +21,7 @@
 //! converged, enables lingering, and gives the account's container storage
 //! the labels of `/var/lib/containers/storage`.
 
-use std::{os::fd::BorrowedFd, sync::Arc};
+use std::{os::fd::BorrowedFd, path::Component, sync::Arc};
 
 use nix::unistd::User;
 
@@ -45,6 +45,53 @@ const DATA_DIR: &str = ".local/share/tetra/quadlets";
 const STORAGE_DIR: &str = ".local/share/containers/storage";
 /// Rootful storage, whose labels the account's storage gets.
 const SYSTEM_STORAGE: &str = "/var/lib/containers/storage";
+
+/// Directories that are never the account's home: handing one to the
+/// account would give it the system.
+const SYSTEM_DIRS: &[&str] = &[
+    "/",
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/home",
+    "/lib",
+    "/lib64",
+    "/media",
+    "/mnt",
+    "/opt",
+    "/proc",
+    "/root",
+    "/run",
+    "/sbin",
+    "/srv",
+    "/sys",
+    "/tmp",
+    "/usr",
+    "/var",
+    "/var/cache",
+    "/var/home",
+    "/var/lib",
+    "/var/lib/containers",
+    "/var/lib/systemd",
+    "/var/log",
+    "/var/mnt",
+    "/var/opt",
+    "/var/roothome",
+    "/var/spool",
+    "/var/srv",
+    "/var/tmp",
+];
+/// Trees no home is below.
+const SYSTEM_TREES: &[&str] = &[
+    "/boot",
+    "/dev",
+    "/etc",
+    "/proc",
+    "/sys",
+    "/usr",
+    "/var/lib/tetra",
+];
 
 /// Fedora's `SUB_UID_MIN`/`SUB_GID_MIN` (`/etc/login.defs`).
 const SUBID_MIN: u64 = 524_288;
@@ -214,6 +261,35 @@ impl AppsAccount {
     }
 }
 
+/// Refuse a home that cannot be the account's.
+///
+/// That is one that is not an absolute plain path, or is (or is below) a
+/// system directory, such as `/` from a broken account database: Tetra
+/// hands the home to the account.
+///
+/// # Errors
+/// Fails when `home` is refused.
+pub fn check_home(home: &Path) -> Result<()> {
+    let refuse = |why: &str| {
+        anyhow::anyhow!(
+            "refusing `{}` as the home of `{APPS_USER}`: {why}",
+            home.display()
+        )
+    };
+    let mut components = home.components();
+    if components.next() != Some(Component::RootDir)
+        || !components.all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(refuse("it is not an absolute path without `.` or `..`"));
+    }
+    if SYSTEM_DIRS.iter().any(|dir| home == Path::new(dir))
+        || SYSTEM_TREES.iter().any(|tree| home.starts_with(tree))
+    {
+        return Err(refuse("it is a system directory"));
+    }
+    Ok(())
+}
+
 /// `/run/user/<uid>`, a user manager's `XDG_RUNTIME_DIR`.
 #[must_use]
 pub fn runtime_dir(uid: u32) -> PathBuf {
@@ -325,6 +401,9 @@ pub struct Owner {
     uid: u32,
     gid: u32,
     chown: Arc<ChownFn>,
+    /// Whether a home of Tetra's own that it did not just create may be
+    /// taken over: only for tests, whose fake chown leaves the home theirs.
+    adopt_existing: bool,
 }
 
 impl std::fmt::Debug for Owner {
@@ -360,7 +439,18 @@ impl Owner {
             uid: account.uid,
             gid: account.gid,
             chown: Arc::new(chown),
+            adopt_existing: false,
         }
+    }
+
+    /// Also take over a home of Tetra's own that it did not just create
+    /// (tests: a fake chown never hands the home over, so it stays theirs
+    /// after the first write).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn adopting_existing_homes(mut self) -> Self {
+        self.adopt_existing = true;
+        self
     }
 
     /// The owner of files written for the apps scope: the account, when
@@ -393,13 +483,15 @@ impl Owner {
     }
 
     /// Whether a home owned by `uid` may be written to and handed to the
-    /// account: it must already be the account's, or Tetra's own (one it
-    /// just created, or that `systemd-tmpfiles` has not handed over yet).
-    /// Anyone else's directory is refused rather than given away, in case
-    /// the account database points the home somewhere it should not.
+    /// account: it must already be the account's, or be one Tetra just
+    /// `created` (so its own). Anyone else's directory, root's included, is
+    /// refused rather than given away, in case the account database points
+    /// the home somewhere it should not (`systemd-tmpfiles` creates the home
+    /// as the account's, so a root-owned one is not the expected home).
     #[must_use]
-    pub fn may_own_home(&self, uid: u32) -> bool {
-        uid == self.uid || uid == nix::unistd::geteuid().as_raw()
+    pub fn may_own_home(&self, uid: u32, created: bool) -> bool {
+        uid == self.uid
+            || ((created || self.adopt_existing) && uid == nix::unistd::geteuid().as_raw())
     }
 }
 
@@ -428,7 +520,8 @@ pub(crate) mod tests {
                 .unwrap()
                 .push(relative.to_string_lossy().into_owned());
             Ok(())
-        });
+        })
+        .adopting_existing_homes();
         (owner, chowned)
     }
 
@@ -570,5 +663,51 @@ pub(crate) mod tests {
                 "systemctl start user@242.service",
             ]
         );
+    }
+
+    #[test]
+    fn refuses_system_directories_as_the_home() {
+        for home in [
+            "/",
+            "/var",
+            "/var/lib",
+            "/var/lib/",
+            "/usr",
+            "/usr/local/apps",
+            "/etc/apps",
+            "/root",
+            "/var/lib/tetra",
+            "/var/lib/tetra/apps",
+            "var/lib/ultramarine-apps",
+            "/var/lib/../lib",
+            "/var/lib/./apps/..",
+        ] {
+            check_home(Path::new(home)).unwrap_err();
+        }
+        for home in [APPS_HOME, "/var/lib/apps", "/srv/apps", "/home/apps"] {
+            check_home(Path::new(home)).unwrap();
+        }
+    }
+
+    #[test]
+    fn only_a_home_tetra_just_created_may_be_its_own() {
+        let account = AppsAccount {
+            uid: u32::MAX - 1,
+            gid: u32::MAX - 1,
+            home: PathBuf::from("/nonexistent"),
+        };
+        let owner = Owner::with_chown(&account, |_, _, _, _| Ok(()));
+        let me = nix::unistd::geteuid().as_raw();
+        assert!(owner.may_own_home(u32::MAX - 1, false));
+        assert!(owner.may_own_home(me, true));
+        assert!(
+            !owner.may_own_home(me, false),
+            "an existing home of Tetra's own"
+        );
+        let stranger = me.wrapping_add(1);
+        if stranger != u32::MAX - 1 {
+            assert!(!owner.may_own_home(stranger, true));
+            assert!(!owner.may_own_home(stranger, false));
+        }
     }
 }

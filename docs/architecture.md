@@ -426,12 +426,18 @@ never uses a path below the home (`agent::tree::Tree`, `rustix`); it does not
 switch its filesystem UID (`setfsuid`), which is per thread and so a trap
 on Tokio's blocking pool.
 
-- The home is opened with `O_DIRECTORY | O_NOFOLLOW`. Before a write, it must
-  be a directory owned by the account or by Tetra itself (one Tetra just
-  created as `0700`, or that `systemd-tmpfiles` has not handed over yet);
-  any other owner is refused rather than given away, in case the account
-  database points the home at someone else's directory. It is then given
-  to the account with `fchown`.
+- The home must be an absolute path that is not `/`, a system directory
+  (`/usr`, `/etc`, `/var`, `/var/lib`, ...) or below one of `/usr`, `/etc`,
+  `/boot`, `/dev`, `/proc`, `/sys`, `/var/lib/tetra`
+  (`apps_account::check_home`), in case the account database points it
+  somewhere it should not. It is opened with `O_DIRECTORY | O_NOFOLLOW`
+  from its parent's descriptor. Before a write, the parent must be root's
+  and writable by no one else (so the home's entry cannot be swapped), and
+  the home must be a directory owned by the account (`systemd-tmpfiles`
+  creates it so), or one Tetra made with `mkdirat` (`0700`) in that same
+  operation. Any other existing directory, root's included, is refused
+  rather than given away. The home is then given to the account with
+  `fchown`.
 - Each directory below it is opened with `openat2` on its parent's
   descriptor, with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
   RESOLVE_NO_MAGICLINKS`, so a symlink anywhere, the last component
