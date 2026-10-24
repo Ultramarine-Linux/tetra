@@ -220,6 +220,8 @@ export function bundleSha256(recipe: string, templates: Record<string, string>):
   the default for non-admins.
 - **`apps.get`** shows secret parameter values as `"********"`. Send the
   placeholder back unchanged on update and Tetra keeps the stored value.
+  Template bodies under `app.recipe.templates` are `"********"` as well
+  (names kept); don't display them as content.
 - **Services in apps scope:** `services.list`/`status` with
   `"scope": "apps"` now default to `run_as: apps` (the account's user
   manager); no need to send it.

@@ -1096,7 +1096,10 @@ Returns the manifest plus the unit listing (each unit with its absolute path
 and an `exists` flag), the companion files and the derived services. `get` is
 open to users granted `apps: view`, so the values of the recipe's `secret`
 parameters are replaced by `"********"` (every value is, if the stored recipe
-cannot be read).
+cannot be read). Template bodies in `recipe.templates` are `"********"` too,
+since they are the app's units and files (`quadlets.read` is admin-only); the
+template names are kept. `update` renders from the stored templates, so
+nothing needs to be sent back.
 
 `update` payload:
 

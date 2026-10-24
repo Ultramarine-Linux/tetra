@@ -681,7 +681,7 @@ action that passes authorization is recorded in the action log.
 | `launcher` (default) | `launcher.list/get` | — | `launcher.set/remove/public_get/public_set` |
 | — (any signed-in user) | `shell.open` (`shell.ticket`): the user's own shell | — | — |
 | `system_services` | `services.list/status/logs` (systemd units and their journal; not a default, grant it explicitly) | — | start, stop, restart, enable, disable, daemon_reload |
-| `apps` | `apps.list/get` (`get` shows secret values as `********`), `quadlets.list/validate/list_files`, `recipes.context_inline` | — | apps create/update/remove, quadlets read (unit files hold app secrets)/write/delete/install, `recipes.render/context` (read paths as root), `recipes.render_inline` (templates can loop for a very long time) |
+| `apps` | `apps.list/get` (`get` shows secret values and template bodies as `********`), `quadlets.list/validate/list_files`, `recipes.context_inline` | — | apps create/update/remove, quadlets read (unit files hold app secrets)/write/delete/install, `recipes.render/context` (read paths as root), `recipes.render_inline` (templates can loop for a very long time) |
 | `containers` | `podman.containers/inspect/images/volumes/networks/logs` (as `ultramarine-apps` by default; `inspect` hides environment values) | — | podman start/stop/restart/remove, `inspect` with `show_env` |
 | `storage` | `storage.list/status/zfs` | — | `storage.mount/unmount/configure` |
 | `sharing` | `samba.list_shares/get_config`, `nfs.list_exports/get_config` (default config path only) | `samba/nfs.reload` | samba/nfs `set_config` (the files can run commands as root), enable, disable |
