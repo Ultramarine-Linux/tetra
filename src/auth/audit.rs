@@ -1,6 +1,5 @@
-//! Action log of every module action Tetra dispatched.
-//!
-//! One JSON line per action, tagged with where it came from (`local` dashboard user, `setup` session, or `remote`
+//! Action log: one JSON line per module action Tetra dispatched, tagged with
+//! where it came from (`local` dashboard user, `setup` session, or `remote`
 //! controller), so the dashboard can show a remote action log.
 //!
 //! Written to `/var/lib/tetra/audit/actions.jsonl` (root-only). When the file
@@ -8,7 +7,6 @@
 //! generation. Payloads are never logged; they may contain secrets.
 
 use std::{
-    collections::VecDeque,
     fs::OpenOptions,
     io::{BufRead, BufReader, Write},
     os::unix::fs::OpenOptionsExt,
@@ -55,10 +53,6 @@ pub struct Entry {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// What else is worth knowing, built by Tetra (never from client text):
-    /// for a web shell, its unit and how it ended.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
 }
 
 /// Append-only action log. Cheap to clone.
@@ -112,36 +106,24 @@ impl AuditLog {
     /// # Errors
     /// Fails when a log file exists but cannot be read.
     pub fn recent(&self, limit: usize, origin: Option<Origin>) -> Result<Vec<Entry>> {
-        // Keep only the newest `limit` while streaming, instead of parsing
-        // both files (up to 8 MiB) into memory first.
-        let mut entries = VecDeque::with_capacity(limit.min(1024));
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
+        let mut entries = Vec::new();
         for name in [ROTATED, FILE] {
-            let path = self.dir.join(name);
-            let file = match fs::File::open(&path) {
+            let file = match fs::File::open(self.dir.join(name)) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
             };
-            // Split on bytes: a torn (non-UTF-8) line after a crash is
-            // skipped like any other unparsable line, not a hard error.
-            for line in BufReader::new(file).split(b'\n') {
-                let line = line.with_context(|| format!("failed to read `{}`", path.display()))?;
-                let Ok(entry) = serde_json::from_slice::<Entry>(&line) else {
-                    continue;
-                };
-                if origin.is_some_and(|origin| entry.origin != origin) {
-                    continue;
+            for line in BufReader::new(file).lines() {
+                if let Ok(entry) = serde_json::from_str::<Entry>(&line?)
+                    && origin.is_none_or(|origin| entry.origin == origin)
+                {
+                    entries.push(entry);
                 }
-                if entries.len() == limit {
-                    entries.pop_front();
-                }
-                entries.push_back(entry);
             }
         }
-        Ok(entries.into_iter().rev().collect())
+        entries.reverse();
+        entries.truncate(limit);
+        Ok(entries)
     }
 }
 
@@ -162,7 +144,6 @@ mod tests {
             action: action.into(),
             ok: true,
             error: None,
-            detail: None,
         }
     }
 

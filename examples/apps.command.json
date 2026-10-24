@@ -7,7 +7,7 @@
     "dry_run": true,
     "recipe": "recipe_id: nginx-site\nname: Nginx static site\nversion: 0.1.0\nparameters:\n  - key: app_id\n    label: App ID\n    type: string\n    default: demo-web\nresources:\n  - type: container\n    filename: \"{{ app_id }}.container\"\n    template: containers/nginx.container.tera\n  - type: file\n    filename: site/index.html\n    template: files/index.html.tera\n",
     "templates": {
-      "containers/nginx.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=docker.io/library/nginx:alpine@sha256:a3554c0d0b48177b1413c26e01f695334428020d9df01243fbae3e11cfd17417\n",
+      "containers/nginx.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=docker.io/library/nginx:alpine\n",
       "files/index.html.tera": "<h1>Hello from {{ app_id }}</h1>\n"
     },
     "values": {

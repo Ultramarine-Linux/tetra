@@ -66,8 +66,12 @@ impl SecretStore {
     /// Fails when the file cannot be read or unsealed.
     pub fn get(&self, sealer: &dyn Sealer, name: &str) -> Result<Option<Vec<u8>>> {
         let path = self.path(name)?;
-        let Some(blob) = store::read_optional(&path)? else {
-            return Ok(None);
+        let blob = match fs::read(&path) {
+            Ok(blob) => blob,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read `{}`", path.display()));
+            }
         };
         sealer
             .unseal(name, &blob)

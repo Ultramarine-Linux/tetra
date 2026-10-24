@@ -59,10 +59,7 @@ browser only gets an opaque cookie.
   admin status on every request anyway.
 - On `unauthenticated`, clear the cookie and send the user to the login page.
   This happens on expiry (1 hour idle, 12 hours total), logout, revocation,
-  a second-factor reset from the console, when the account is locked, when
-  an administrator sets its password or deletes it (`users.set_password`,
-  `users.delete`), or when the user's 33rd session pushes out the least
-  recently used one (32 sessions per user).
+  a second-factor reset from the console, or when the account is locked.
 - On logout, call `session.logout` before clearing the cookie.
 
 ## 4. Password login
@@ -148,10 +145,6 @@ password form.
 
 **Registration** (logged-in user, for example under account settings)
 
-Adding or removing a passkey, and starting TOTP enrollment, needs a login
-from the last 10 minutes. On `reauth_required`, send the user through the
-login form again (same username), then retry the step with the new token.
-
 1. `account.passkey_register_begin {name}` → `{ceremony, options}`. The
    options ask for a discoverable credential (`residentKey: "preferred"`);
    pass them through unchanged.
@@ -203,9 +196,7 @@ The grant editor (administrators only):
 
 Other administrator tools: `session.list {uid}`,
 `admin.sessions_revoke {uid}` (log a user out everywhere) and
-`admin.actions {origin: "remote"}` (remote action log). The action log also
-records grant changes, session revocations, `access.set`, `setup.complete`
-and launcher changes, next to module actions.
+`admin.actions {origin: "remote"}` (remote action log).
 
 ## 8. The Services page (launcher)
 
@@ -246,89 +237,19 @@ Send `module.dispatch {module, action, payload}` with the user's token. Keep
 the existing `dry_run` preview flow from [agent-protocol.md](agent-protocol.md).
 The result is the action's payload. A failed action returns `action_failed`
 with the module's error text, and a full queue returns `queue_full` (retry
-with backoff). Module actions run one at a time, so a slow one (an image pull
-in `systemctl start`, say) delays the others; host commands are killed after
-15 minutes.
+with backoff).
 
-Some payload fields are administrator-only (`base_dir`, `files_base_dir`,
-`config_dir`, `users.home`, and a non-default `path` on `samba`/`nfs`); a user
-who sends one gets `forbidden`, so leave them out of forms for everyone else.
-`apps.get` shows secret parameter values as `"********"`; sending that value
-back in `apps.update` keeps the stored secret.
+The old flow is gone:
 
-The Unix socket and the loopback-only development TCP listener use the same
-Tetra-issued session tokens and per-request authorization. Privileged actions
-are authorized from the user's admin status and grants. `sudo` in the web
-shell (section 10) still asks for the system password separately.
+- Ed25519 controller keys and signed commands on the local socket,
+- `elevation_request` and the 30-minute password elevation,
+- the `user` field in `authenticate`.
 
-## 10. Web shell
+Privileged actions are now authorized per request from the user's admin
+status and grants. Web shell `sudo` still asks for the system password
+separately.
 
-The terminal page gives a signed-in user a shell on the host, as
-themselves. The dashboard does not start it and must not try to: it runs in
-a container without access to host processes. Tetra opens the PTY and runs
-the user's login shell; the dashboard pipes bytes between the browser's
-WebSocket and a second connection to Tetra's socket. Nothing else listens.
-
-```text
-browser (xterm.js) ⇄ dashboard WebSocket ⇄ dashboard server ⇄ /run/tetra/tetra.sock ⇄ Tetra ⇄ PTY ⇄ shell
-```
-
-1. When the user opens the terminal page, call `shell.ticket` with their
-   token on your normal connection → `{ticket, expires_at}`. The ticket is
-   for that user only, works once, and expires after 30 seconds, so ask for
-   it right before step 2 and never send it to the browser.
-2. Open a **new** WebSocket to the same socket
-   (`ws+unix:///run/tetra/tetra.sock`), one per terminal, wait for `hello`,
-   and send `shell.open` as its first request:
-
-   ```ts
-   const shell = new WebSocket("ws+unix:///run/tetra/tetra.sock");
-   shell.binaryType = "nodebuffer";
-   shell.once("message", () => { // hello
-     shell.send(JSON.stringify({
-       type: "request", id: crypto.randomUUID(), op: "shell.open",
-       params: { ticket, cols: term.cols, rows: term.rows },
-     }));
-   });
-   ```
-
-3. The next message is the `response`. If `ok` is `false`, Tetra closes the
-   connection: on `invalid_credentials` (the ticket expired or was used) get
-   a new ticket and try once more; on `unauthenticated` send the user to the
-   login page; on `limit_reached` say they have too many terminals open (4
-   per user, 16 on the server); otherwise show the message. If `ok` is
-   `true`, the connection is now the terminal:
-   - Browser → dashboard → Tetra: send what xterm.js gives you (`onData`,
-     encoded as UTF-8; `onBinary` as is) as **binary** messages, at most
-     1 MiB each (split larger pastes). Send
-     `{"type": "resize", "cols": …, "rows": …}` as a **text** message when the
-     terminal's size changes (xterm.js `onResize`).
-   - Tetra → dashboard → browser: write **binary** messages to the terminal
-     unchanged. A **text** message is `{"type": "exit", "status", "reason"}`:
-     show "session ended" (`exited`, with `status`), "you were logged out"
-     (`session_ended`), "closed after 30 minutes without input"
-     (`idle_timeout`; any input counts, not output) or "closed after
-     4 hours" (`max_lifetime`). Tetra closes the connection right after it.
-4. Pipe both ways without buffering more than a few messages: when the
-   browser is slow, stop reading from Tetra (back-pressure keeps the shell
-   waiting instead of filling memory). When the browser's WebSocket closes,
-   close the Tetra connection: that ends the shell. Close it, too, when the
-   user's dashboard session ends; Tetra also ends the shell by itself within
-   5 seconds of a logout, revocation or expiry.
-
-Never reuse a shell connection for requests, and never send `shell.open` on
-the shared request connection (`bad_request`). The `result` of `shell.open`
-has the `uid`, `username` and transient `unit` of the shell, and its
-`idle_timeout` and `max_lifetime` in seconds, for display. Any input
-(binary message or valid `resize`) resets the idle timer and keeps the
-user's session from expiring for inactivity; that includes what xterm.js
-sends by itself, such as mouse and focus reports. Never send input the user
-did not cause (keep-alives), or idle shells never end before
-`max_lifetime`. Opening and closing shells are
-recorded in the action log (module `shell`). Every signed-in user may open a
-shell; the setup session and the OOBE may not.
-
-## 11. OOBE flow
+## 10. OOBE flow
 
 The OOBE runs unprivileged as `ultramarine-oobe` on `127.0.0.1:6624`. Tetra
 puts it behind Caddy on port 6623 of every address (IPv4 and IPv6) with a
@@ -365,13 +286,8 @@ with the setup session.
      client_cert?, private_key?, private_key_password?, domain_suffix_match?,
      phase2?}`, certificates and keys as PEM contents or paths; Wi-Fi
      Enterprise takes the same fields) and
-     `network.confirm` once the new settings work. A change often drops the
-     OOBE's connection; after reconnecting, `network.pending` returns the
-     change still awaiting confirmation (with its `confirmation_token`), if
-     any, also after a Tetra restart. An unconfirmed change is rolled back
-     after 60 seconds by NetworkManager itself (a checkpoint), so the old
-     network comes back even if Tetra restarted meanwhile. The `keyfile` in
-     the response has 802.1X passwords redacted;
+     `network.confirm` once the new settings work. The `keyfile` in the
+     response has 802.1X passwords redacted;
    - updates: `updates.set_policy {policy: "automatic" | "notify"}`. Tetra
      knows whether the host is bootc or package-based and picks the timer;
    - remote access, if wanted: `remote_access.tailscale_up {auth_key, serve,

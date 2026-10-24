@@ -178,14 +178,7 @@ mod tests {
         let addresses = parse_ip_addr_json(&data);
         let summary: Vec<_> = addresses
             .iter()
-            .map(|a| {
-                (
-                    a.interface.as_str(),
-                    a.family,
-                    a.address.to_string(),
-                    a.scope,
-                )
-            })
+            .map(|a| (a.interface.as_str(), a.family, a.address.to_string(), a.scope))
             .collect();
         assert_eq!(
             summary,
@@ -196,9 +189,6 @@ mod tests {
                 ("lo", "ipv6", "::1".into(), AddressScope::Loopback),
             ]
         );
-        assert_eq!(
-            serde_json::to_value(&addresses[2]).unwrap()["scope"],
-            "link-local"
-        );
+        assert_eq!(serde_json::to_value(&addresses[2]).unwrap()["scope"], "link-local");
     }
 }

@@ -6,11 +6,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment="RUST_LOG=info"
+Environment="TETRA_IDENTITY_DIR=/var/lib/tetra/identity"
 ExecStart=/usr/bin/tetra agent-serve --identity-dir /var/lib/tetra/identity
 ExecReload=/bin/kill -HUP $MAINPID
-# Web shells are transient units of their own; a shell that ignores SIGHUP
-# must not outlive Tetra. (The next start also sweeps leftovers.)
-ExecStopPost=-/usr/bin/systemctl stop --no-block --no-ask-password tetra-shell-*.service
 Restart=on-failure
 RestartSec=5
 # Credentials, grants, sessions, the setup marker and the dashboard's

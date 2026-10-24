@@ -6,15 +6,13 @@
 //! is ignored (and replaced on the next write), so a new account never
 //! inherits someone else's second factor or passkeys.
 
-use std::ffi::OsStr;
-
 use webauthn_rs::prelude::{Passkey, Uuid};
 
 use crate::prelude::*;
 
 use super::{
     seal::Sealed,
-    store::{self, Cached, Extra, Header, Record, StoreLock},
+    store::{self, Extra, Header, Record, StoreLock},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,18 +124,12 @@ pub struct PasskeyRecord {
 #[derive(Debug, Clone)]
 pub struct UserStore {
     dir: PathBuf,
-    /// Records last read, by UID: every request of a user session checks
-    /// its record's `session_epoch`.
-    cache: Cached<Option<UserRecord>, u32>,
 }
 
 impl UserStore {
     #[must_use]
-    pub fn new(dir: PathBuf) -> Self {
-        Self {
-            dir,
-            cache: Cached::new(),
-        }
+    pub const fn new(dir: PathBuf) -> Self {
+        Self { dir }
     }
 
     fn path(&self, uid: u32) -> PathBuf {
@@ -147,32 +139,10 @@ impl UserStore {
     /// The record for `uid`, if one exists and was created for `username`.
     ///
     /// # Errors
-    /// Fails when the record exists but cannot be read, or belongs to another
-    /// name and holds a TOTP secret: that is a renamed account (`usermod -l`)
-    /// as often as a reused UID, and ignoring its second factor would fail
-    /// open. `tetra auth reset-2fa` clears it.
+    /// Fails when the record exists but cannot be read.
     pub fn get(&self, uid: u32, username: &str) -> Result<Option<UserRecord>> {
-        let cached = self
-            .cache
-            .get(uid, &self.path(uid), || self.read_uid(uid))?;
-        let Some(record) = cached.as_ref() else {
-            return Ok(None);
-        };
-        if record.username == username {
-            return Ok(Some(record.clone()));
-        }
-        ensure!(
-            record.totp.is_none(),
-            "the second factor for UID {uid} belongs to `{}`, not `{username}`; \
-             run `tetra auth reset-2fa {username}`",
-            record.username
-        );
-        Ok(None)
-    }
-
-    /// The stored record for `uid`, whoever it was created for.
-    fn read_uid(&self, uid: u32) -> Result<Option<UserRecord>> {
-        Ok(store::read::<UserRecord>(&self.path(uid))?.filter(|record| record.uid == uid))
+        Ok(store::read::<UserRecord>(&self.path(uid))?
+            .filter(|record| record.uid == uid && record.username == username))
     }
 
     /// Read-modify-write the record for `uid` under the store lock, starting
@@ -186,16 +156,11 @@ impl UserStore {
         F: FnOnce(&mut UserRecord) -> Result<R>,
     {
         let _lock = StoreLock::acquire(&self.dir)?;
-        // A previous owner's record is discarded here (not refused as in
-        // `get`), so `reset-2fa` can recover a renamed account.
         let mut record = self
-            .read_uid(uid)?
-            .filter(|record| record.username == username)
+            .get(uid, username)?
             .unwrap_or_else(|| UserRecord::new(uid, username));
         let result = change(&mut record)?;
-        let written = store::write(&self.path(uid), &mut record);
-        self.cache.invalidate(&uid);
-        written?;
+        store::write(&self.path(uid), &mut record)?;
         Ok(result)
     }
 
@@ -252,28 +217,6 @@ mod tests {
             .unwrap();
         assert_eq!(epoch, 0);
         assert!(users.get(1000, "alice").unwrap().is_none());
-    }
-
-    #[test]
-    fn a_renamed_account_does_not_lose_its_totp() {
-        let dir = tempfile::tempdir().unwrap();
-        let users = UserStore::new(dir.path().join("users"));
-        users
-            .update(1000, "alice", |record| {
-                record.totp = Some(TotpRecord {
-                    secret: Sealed::default(),
-                    enrolled_at: 0,
-                    last_step: None,
-                    extra: Extra::new(),
-                });
-                Ok(())
-            })
-            .unwrap();
-        // `usermod -l alice alice2`: refuse rather than skip the second factor.
-        users.get(1000, "alice2").unwrap_err();
-        // Resetting (an update under the new name) starts a fresh record.
-        users.update(1000, "alice2", |_| Ok(())).unwrap();
-        assert!(users.get(1000, "alice2").unwrap().unwrap().totp.is_none());
     }
 
     #[test]

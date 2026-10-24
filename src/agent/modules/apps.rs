@@ -10,21 +10,13 @@
 //! An installed app is two trees plus a manifest:
 //!
 //! - **Quadlet unit files** go to the directory Podman scans
-//!   (`~ultramarine-apps/.config/containers/systemd` in apps scope, the
-//!   default; `/etc/containers/systemd` in system scope), so a
-//!   `daemon-reload` turns them into generated services.
+//!   (`/etc/containers/systemd` system-wide, `~/.config/containers/systemd`
+//!   per-user), so a `daemon-reload` turns them into generated services.
 //! - **Companion files** (reverse-proxy snippets, app config, content) go to
 //!   a per-app bundle directory under the mutable data root:
-//!   `~ultramarine-apps/.local/share/tetra/quadlets/<name>/` in apps scope,
-//!   `/var/lib/tetra/quadlets/<name>/` in system scope. Keeping them out of
+//!   `/var/lib/tetra/quadlets/<name>/` system-wide or
+//!   `$XDG_DATA_HOME/tetra/quadlets/<name>/` per-user. Keeping them out of
 //!   the image-managed scan dir is what makes the layout bootc-friendly.
-//!
-//! Apps scope runs every user app rootless under the one `ultramarine-apps`
-//! account (see [`crate::agent::apps_account`]): Tetra writes the files as
-//! root and hands them to the account, prepares the account (subordinate
-//! IDs, lingering, storage labels) when it converges, and talks to the
-//! account's user manager. System scope is rootful, for real system
-//! services; apps installed there by earlier releases keep working in it.
 //! - **`<bundle>/app.json`** is the [`AppManifest`]: the recipe source and
 //!   merged values the app was cooked from, plus the list of installed units
 //!   and companions. It is what lets `update` re-render and `remove` tear
@@ -39,20 +31,17 @@
 //!    new render no longer produces).
 //! 3. Write `<bundle>/app.json`.
 //! 4. Optionally apply the shared `selinux` payload to the bundle directory.
-//! 5. Unless `converge: false`, prepare the apps account (apps scope) and
-//!    converge systemd: `daemon-reload`, then
-//!    `start` (create) or `restart` (update) each service derived from the
-//!    app's `.container`/`.kube`/`.pod` units. Quadlet services are
-//!    generated, so `systemctl enable` refuses them; their `[Install]`
-//!    section enables them at boot instead. `.network`/`.volume`
+//! 5. Unless `converge: false`, converge systemd: `daemon-reload`, then
+//!    `enable` + `start` (create) or `restart` (update) each service derived
+//!    from the app's `.container`/`.kube`/`.pod` units. `.network`/`.volume`
 //!    units are not managed directly — Podman pulls them in as dependencies
 //!    of the containers.
 //!
 //! All systemd interaction is delegated to the `services` module and all path
 //! handling reuses the `quadlets` module's scope/traversal-safe helpers, so
-//! every step stays representable as plain module actions. `remove` stops
-//! the app's services, deletes its units, reloads systemd, and
-//! removes the bundle directory; stop failures are tolerated (and
+//! every step stays representable as plain module actions. `remove` stops and
+//! disables the app's services, deletes its units, reloads systemd, and
+//! removes the bundle directory; stop/disable failures are tolerated (and
 //! reported) so removal still cleans up after partial drift. Note that
 //! Podman volumes created by `.volume` units are *not* deleted — app data
 //! survives removal by design.
@@ -62,26 +51,17 @@
 //! rendered resources, target paths, and `systemctl` commands — before
 //! committing.
 
-use std::collections::{BTreeMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use serde_yaml::Value as YamlValue;
 
-use serde_json::json;
-use serde_norway::Value as YamlValue;
-
-use crate::actions;
-use crate::agent::apps_account::{AppsAccount, HostPaths, Owner};
-use crate::agent::module_support::{Commands, ModuleInfo, ModuleStatus, apply_selinux, safe_join};
-use crate::agent::modules::Mod;
+use crate::agent::module_support::{apply_selinux, safe_join};
 use crate::agent::modules::quadlets::{
-    list_companion_files, owner_name, quadlet_base_dir, quadlet_files_base_dir, scope_owner,
-    scope_tree, validate_quadlet,
+    QuadletScope, list_companion_files, quadlet_base_dir, quadlet_files_base_dir, validate_quadlet,
 };
-use crate::agent::tree::{Kind, Tree};
 use crate::catalog::{RenderedResource, ResourceKind, load_values};
 use crate::prelude::*;
 use crate::types::{
-    AppCreateRequest, AppGetRequest, AppListRequest, AppManifest, AppRequest, AppScope,
-    AppUpdateRequest, ServiceScope,
+    AppCreateRequest, AppGetRequest, AppListRequest, AppManifest, AppRequest, AppUpdateRequest,
+    ServiceScope,
 };
 
 use super::ServicesModule;
@@ -124,32 +104,52 @@ impl Mod for AppsModule {
     }
 
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
+        // Delegate `capabilities`/`plan` to the module descriptor first.
+        if let Some(response) = INFO.metadata_response(action, &payload) {
+            return Ok(response);
+        }
         Action::from_payload(action, payload)?.handle(user)
     }
 }
 
 actions!(Action [payload user] => {
     List: AppListRequest => {
+        let dirs = AppDirs::resolve(payload.base_dir, payload.files_base_dir, payload.scope)?;
         let mut apps = Vec::new();
         // Directories under the data root whose `app.json` cannot be read are
         // reported by name rather than failing the whole listing — they are
         // either corrupted bundles or stray unmanaged directories, both of
         // which the dashboard should surface.
         let mut invalid = Vec::new();
-        let mut roots = Vec::new();
-        for &scope in payload.scope.scopes() {
-            let dirs = AppDirs::resolve(payload.base_dir.clone(), payload.files_base_dir.clone(), scope)?;
-            list_scope(&dirs, scope, &mut apps, &mut invalid)?;
-            roots.push(json!({ "scope": scope, "files_base_dir": dirs.files_root }));
+        if dirs.files_root.exists() {
+            for entry in fs::read_dir(&dirs.files_root)
+                .with_context(|| format!("failed to read `{}`", dirs.files_root.display()))?
+            {
+                let entry = entry?;
+                let entry_type = entry.file_type()?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if entry_type.is_symlink() {
+                    invalid.push(name);
+                    continue;
+                }
+                if !entry_type.is_dir() {
+                    continue;
+                }
+                let Ok(bundle) = dirs.bundle(&name) else {
+                    invalid.push(name);
+                    continue;
+                };
+                match bundle.manifest() {
+                    Ok(manifest) if manifest.name == name && manifest.scope == payload.scope => {
+                        apps.push(bundle.summary(&manifest));
+                    }
+                    Ok(_) | Err(_) => invalid.push(name),
+                }
+            }
         }
         apps.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
         invalid.sort();
-        let mut response = json!({ "apps": apps, "invalid": invalid, "roots": roots });
-        // One scope: keep the single root at the top level, as before.
-        if let [root] = roots.as_slice() {
-            response["files_base_dir"] = root["files_base_dir"].clone();
-        }
-        Ok(response)
+        Ok(jsonf! { "files_base_dir": dirs.files_root, apps, invalid })
     },
     Get: AppGetRequest => {
         validate_app_name(&payload.name)?;
@@ -168,53 +168,42 @@ actions!(Action [payload user] => {
             .iter()
             .map(|filename| {
                 let path = dirs.base_dir.join(filename);
-                let exists = dirs.units.exists(&path)?;
-                Ok(json!({ "filename": filename, "path": path, "exists": exists }))
+                jsonf! { filename, path, "exists": path.exists() }
             })
-            .collect::<Result<Vec<_>>>()?;
-        let files = list_companion_files(&dirs.files, &bundle.dir)?
+            .collect::<Vec<_>>();
+        let files = list_companion_files(&bundle.dir)?
             .into_iter()
             .filter(|file| file.filename() != APP_MANIFEST)
             .collect::<Vec<_>>();
         let services = manifest.services();
-        // `get` is open to the Apps page; secrets stay with administrators.
-        let mut manifest = manifest;
-        redact_secrets(&mut manifest);
-        Ok(json!({
+        Ok(jsonf! {
             "app": manifest,
             "base_dir": dirs.base_dir,
             "bundle_dir": bundle.dir,
-            "units": units, "files": files, "services": services,
-        }))
+            units, files, services,
+        })
     },
     Create: AppCreateRequest => {
         validate_app_name(&payload.name)?;
-        let dirs = AppDirs::resolve(payload.base_dir.clone(), payload.files_base_dir.clone(), payload.scope)?
-            .owned(payload.scope, payload.dry_run)?;
+        let dirs = AppDirs::resolve(payload.base_dir.clone(), payload.files_base_dir.clone(), payload.scope)?;
         let bundle = dirs.bundle(&payload.name)?;
         ensure!(
-            !bundle.exists()?,
+            !bundle.exists(),
             "app `{}` already exists; use `update` to modify it",
             payload.name
         );
 
-        let source = payload.recipe_source()?.snapshot()?;
-        let provenance = source.verify(payload.source.as_ref(), payload.allow_unpinned_images)?;
+        let source = payload.recipe_source()?;
         // Inline values win over the optional values file, so a dashboard can
         // ship recipe defaults plus per-instance overrides in one call.
         let mut values = load_values(payload.values_path.as_ref())?;
         values.extend(payload.values);
         bundle.inject_dir(&mut values);
-        let (recipe, resources) = source.render(&mut values)?;
-        crate::catalog::verification::verify_images(&resources, payload.allow_unpinned_images, Some(&bundle.dir))?;
-        check_published_ports(&resources, payload.scope)?;
+        let (recipe, resources) = source.render(&values)?;
 
         let outcome = bundle.install(&resources, None, payload.dry_run)?;
         let now = epoch_secs();
-        let secret_keys = recipe.secret_keys().map(str::to_owned).collect();
         let manifest = AppManifest {
-            source: Some(provenance),
-            allow_unpinned_images: payload.allow_unpinned_images,
             version: MANIFEST_VERSION,
             name: payload.name,
             scope: payload.scope,
@@ -222,7 +211,6 @@ actions!(Action [payload user] => {
             recipe_version: recipe.version,
             recipe: source,
             values,
-            secret_keys,
             units: outcome.units.clone(),
             files: outcome.files.clone(),
             created_at: now,
@@ -231,29 +219,25 @@ actions!(Action [payload user] => {
         let manifest_path = bundle.write_manifest(&manifest, payload.dry_run)?;
         let selinux = apply_selinux(payload.selinux.as_ref(), Some(&bundle.dir), payload.dry_run)?;
         let services = manifest.services();
-        let (account, systemd) = if payload.converge {
-            let account = prepare_account(payload.scope, payload.dry_run)?;
-            let systemd = Systemd::new(payload.scope, payload.dry_run, user).converge(&services, "start")?;
-            (account, systemd)
+        let systemd = if payload.converge {
+            Systemd::new(payload.scope, payload.dry_run, user).converge(&services, "start")?
         } else {
-            (Vec::new(), Vec::new())
+            Vec::new()
         };
-        Ok(json!({
+        Ok(jsonf! {
             "app": manifest,
             "base_dir": dirs.base_dir,
             "bundle_dir": bundle.dir,
-            "owner": owner_name(payload.scope),
-            "manifest_path": manifest_path,
-            "units": outcome.units, "files": outcome.files,
-            "services": services, "account": account, "systemd": systemd, "selinux": selinux,
+            manifest_path,
+            outcome.units, outcome.files,
+            services, systemd, selinux,
             "written": !payload.dry_run,
-            "dry_run": payload.dry_run,
-        }))
+            payload.dry_run,
+        })
     },
     Update: AppUpdateRequest => {
         validate_app_name(&payload.name)?;
-        let dirs = AppDirs::resolve(payload.base_dir.clone(), payload.files_base_dir.clone(), payload.scope)?
-            .owned(payload.scope, payload.dry_run)?;
+        let dirs = AppDirs::resolve(payload.base_dir.clone(), payload.files_base_dir.clone(), payload.scope)?;
         let bundle = dirs.bundle(&payload.name)?;
         let mut manifest = bundle.manifest()?;
         ensure!(
@@ -266,34 +250,10 @@ actions!(Action [payload user] => {
         // values merge per-key so secrets collected earlier are not resent.
         if let Some(source) = payload.recipe_source()? {
             manifest.recipe = source;
-            // A replacement bundle without provenance is custom; never carry
-            // an old official/community claim onto new bytes.
-            manifest.source.clone_from(&payload.source);
-            manifest.allow_unpinned_images = payload.allow_unpinned_images.unwrap_or(false);
-        } else {
-            if let Some(source) = &payload.source {
-                manifest.source = Some(source.clone());
-            }
-            if let Some(allow) = payload.allow_unpinned_images {
-                manifest.allow_unpinned_images = allow;
-            }
         }
-        manifest.recipe = manifest.recipe.snapshot()?;
-        manifest.source = Some(manifest.recipe.verify(manifest.source.as_ref(), manifest.allow_unpinned_images)?);
-        // `get` shows secrets as `REDACTED`; sent back unchanged, they keep
-        // the stored value instead of replacing it.
-        let is_secret = secrets(&manifest);
-        let incoming: Vec<_> = payload
-            .values
-            .into_iter()
-            .filter(|(key, value)| !(value.as_str() == Some(REDACTED) && is_secret(key)))
-            .collect();
-        manifest.values.extend(incoming);
+        manifest.values.extend(payload.values);
         bundle.inject_dir(&mut manifest.values);
-        let (recipe, resources) = manifest.recipe.render(&mut manifest.values)?;
-        crate::catalog::verification::verify_images(&resources, manifest.allow_unpinned_images, Some(&bundle.dir))?;
-        check_published_ports(&resources, payload.scope)?;
-        manifest.secret_keys.extend(recipe.secret_keys().map(str::to_owned));
+        let (recipe, resources) = manifest.recipe.render(&manifest.values)?;
         manifest.recipe_id = recipe.recipe_id;
         manifest.recipe_version = recipe.version;
 
@@ -304,25 +264,22 @@ actions!(Action [payload user] => {
         let manifest_path = bundle.write_manifest(&manifest, payload.dry_run)?;
         let selinux = apply_selinux(payload.selinux.as_ref(), Some(&bundle.dir), payload.dry_run)?;
         let services = manifest.services();
-        let (account, systemd) = if payload.converge {
-            let account = prepare_account(payload.scope, payload.dry_run)?;
-            let systemd = Systemd::new(payload.scope, payload.dry_run, user).converge(&services, "restart")?;
-            (account, systemd)
+        let systemd = if payload.converge {
+            Systemd::new(payload.scope, payload.dry_run, user).converge(&services, "restart")?
         } else {
-            (Vec::new(), Vec::new())
+            Vec::new()
         };
-        Ok(json!({
+        Ok(jsonf! {
             "app": manifest,
             "base_dir": dirs.base_dir,
             "bundle_dir": bundle.dir,
-            "owner": owner_name(payload.scope),
-            "manifest_path": manifest_path,
-            "units": outcome.units, "files": outcome.files,
-            "removed_units": outcome.removed_units, "removed_files": outcome.removed_files,
-            "services": services, "account": account, "systemd": systemd, "selinux": selinux,
+            manifest_path,
+            outcome.units, outcome.files,
+            outcome.removed_units, outcome.removed_files,
+            services, systemd, selinux,
             "written": !payload.dry_run,
-            "dry_run": payload.dry_run,
-        }))
+            payload.dry_run,
+        })
     },
     Remove: AppRequest => {
         validate_app_name(&payload.name)?;
@@ -336,7 +293,7 @@ actions!(Action [payload user] => {
         );
         let services = manifest.services();
 
-        // Stop before deleting anything so systemd can still resolve
+        // Stop/disable before deleting anything so systemd can still resolve
         // the units.
         let phase = Systemd::new(payload.scope, payload.dry_run, user);
         let mut systemd = if payload.converge {
@@ -348,14 +305,14 @@ actions!(Action [payload user] => {
         if payload.converge {
             systemd.push(phase.daemon_reload()?);
         }
-        bundle.remove_bundle(payload.dry_run)?;
-        Ok(json!({
-            "name": payload.name,
+        bundle.remove(payload.dry_run)?;
+        Ok(jsonf! {
+            payload.name,
             "bundle_dir": bundle.dir,
-            "deleted_units": deleted_units, "services": services, "systemd": systemd,
+            deleted_units, services, systemd,
             "bundle_removed": !payload.dry_run,
-            "dry_run": payload.dry_run,
-        }))
+            payload.dry_run,
+        })
     },
 });
 
@@ -375,80 +332,43 @@ struct InstallOutcome {
 }
 
 /// The two directory trees an app spans: the Quadlet scan directory its units
-/// install into, and the companion-file data root its bundle lives under,
-/// each with the [`Tree`] that resolves paths in it (handing what it writes
-/// to the scope's owner). Apps default to apps scope; the request-level
-/// overrides keep the protocol testable without touching real system paths.
+/// install into, and the companion-file data root its bundle lives under.
+/// Apps default to system scope (the agent normally runs as a root system
+/// service); the request-level overrides keep the protocol testable without
+/// touching real system paths.
 #[derive(Debug)]
 struct AppDirs {
-    scope: AppScope,
     base_dir: PathBuf,
     files_root: PathBuf,
-    units: Tree,
-    files: Tree,
 }
 
 impl AppDirs {
-    /// Resolve both roots for a request, honoring its directory overrides,
-    /// for reading.
+    /// Resolve both roots for a request, honoring its directory overrides.
     fn resolve(
         base_dir: Option<PathBuf>,
         files_base_dir: Option<PathBuf>,
-        scope: AppScope,
+        scope: ServiceScope,
     ) -> Result<Self> {
-        let base_dir = quadlet_base_dir(base_dir, scope);
-        let files_root = quadlet_files_base_dir(files_base_dir, scope, None)?;
+        let scope = match scope {
+            ServiceScope::System => QuadletScope::System,
+            ServiceScope::User => QuadletScope::User,
+        };
         Ok(Self {
-            scope,
-            units: scope_tree(&base_dir, scope, None),
-            files: scope_tree(&files_root, scope, None),
-            base_dir,
-            files_root,
-        })
-    }
-
-    /// The same roots, for writes: files go to the scope's owner (see
-    /// [`Owner::for_apps`](crate::agent::apps_account::Owner::for_apps)).
-    fn owned(self, scope: AppScope, dry_run: bool) -> Result<Self> {
-        let owner = scope_owner(scope, dry_run, &[&self.base_dir, &self.files_root])?;
-        Ok(Self {
-            units: scope_tree(&self.base_dir, scope, owner.clone()),
-            files: scope_tree(&self.files_root, scope, owner),
-            ..self
+            base_dir: quadlet_base_dir(base_dir, scope)?,
+            files_root: quadlet_files_base_dir(files_base_dir, scope, None)?,
         })
     }
 
     /// Address an app's bundle directory inside the data root. `safe_join`
     /// keeps names with traversal components from escaping the root.
     fn bundle(&self, name: &str) -> Result<AppBundle> {
+        let dir = safe_join(&self.files_root, name)?;
+        reject_symlink_path(&self.files_root, name)?;
         Ok(AppBundle {
-            scope: self.scope,
             base_dir: self.base_dir.clone(),
-            dir: safe_join(&self.files_root, name)?,
-            units: self.units.clone(),
-            files: self.files.clone(),
+            dir,
         })
     }
-}
-
-/// Prepare the apps account to run apps (apps scope only), returning the
-/// commands run (or planned, on a dry run). See [`AppsAccount::provision`].
-fn prepare_account(scope: AppScope, dry_run: bool) -> Result<Vec<Value>> {
-    if scope != AppScope::Apps {
-        return Ok(Vec::new());
-    }
-    let account = if dry_run {
-        AppsAccount::resolve()
-    } else {
-        AppsAccount::require()?
-    };
-    let mut commands = Commands::new(dry_run);
-    account.provision(
-        &HostPaths::system(),
-        Owner::for_apps(dry_run)?,
-        &mut commands,
-    )?;
-    Ok(commands.done)
 }
 
 /// App names become directory and file names, so keep them to a single safe
@@ -465,11 +385,49 @@ fn validate_app_unit_filename(filename: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_companion_filename(filename: &str) -> Result<()> {
+fn reject_symlink_path(base: &Path, relative: &str) -> Result<()> {
+    let path = Path::new(relative);
     ensure!(
-        !filename.ends_with('/')
+        path.is_relative()
+            && !path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                )
+            }),
+        "managed path `{relative}` must be relative and stay within its base"
+    );
+
+    let mut current = base.to_path_buf();
+    for component in path.components() {
+        if let std::path::Component::Normal(component) = component {
+            current.push(component);
+            if let Ok(metadata) = fs::symlink_metadata(&current) {
+                ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "managed path `{relative}` contains a symlink"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_companion_filename(filename: &str) -> Result<()> {
+    let path = Path::new(filename);
+    ensure!(
+        !filename.is_empty()
+            && filename != "."
+            && !filename.ends_with('/')
             && !filename.ends_with("/.")
-            && safe_join(Path::new(""), filename).is_ok_and(|path| path.file_name().is_some()),
+            && path.is_relative()
+            && path.file_name().is_some()
+            && !path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                )
+            }),
         "companion filename `{filename}` must identify a relative file path"
     );
     Ok(())
@@ -492,6 +450,7 @@ fn validate_manifest_paths(manifest: &AppManifest) -> Result<()> {
             "app manifest cannot own reserved file `{APP_MANIFEST}`"
         );
         validate_companion_filename(file)?;
+        safe_join(Path::new("."), file)?;
         ensure!(
             files.insert(file.as_str()),
             "duplicate file `{file}` in app manifest"
@@ -519,22 +478,15 @@ fn validate_app_name(name: &str) -> Result<()> {
 /// type so the action handlers stay declarative.
 #[derive(Debug)]
 struct AppBundle {
-    /// The scope the bundle was addressed in, which decides how far its
-    /// manifest is trusted (see [`manifest`](Self::manifest)).
-    scope: AppScope,
     /// Scan directory the app's Quadlet units are installed into.
     base_dir: PathBuf,
     /// Per-app bundle directory under the companion-file data root.
     dir: PathBuf,
-    /// Where the units are written.
-    units: Tree,
-    /// Where the bundle is written.
-    files: Tree,
 }
 
 impl AppBundle {
-    fn exists(&self) -> Result<bool> {
-        self.files.exists(&self.dir)
+    fn exists(&self) -> bool {
+        self.dir.exists()
     }
 
     /// Recipes that declare a `bundle_dir` parameter (typically for bind
@@ -548,23 +500,10 @@ impl AppBundle {
     }
 
     /// Read and parse `<dir>/app.json`.
-    ///
-    /// In apps scope the manifest is in the apps account's home, so whoever
-    /// runs as that account (any app's container, on a breakout) can write
-    /// it: every field of it is untrusted. Unit and companion names are kept
-    /// to plain names below their directories, and everything they name is
-    /// reached through the scope's [`Tree`]. An on-disk recipe source is
-    /// refused there outright: its paths would be read as root (a FIFO hangs
-    /// the dispatch worker; `templates_dir: /etc` copies root's files into
-    /// the account's units). No release writes one in apps scope —
-    /// manifests store inline snapshots — so only system scope, whose
-    /// manifests root owns, still accepts the `file` source of older
-    /// releases.
     fn manifest(&self) -> Result<AppManifest> {
+        reject_symlink_path(&self.dir, APP_MANIFEST)?;
         let path = self.dir.join(APP_MANIFEST);
-        let text = self
-            .files
-            .read_to_string(&path)
+        let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read app manifest `{}`", path.display()))?;
         let manifest: AppManifest = serde_json::from_str(&text)
             .with_context(|| format!("failed to parse app manifest `{}`", path.display()))?;
@@ -575,27 +514,19 @@ impl AppBundle {
             MANIFEST_VERSION
         );
         validate_manifest_paths(&manifest)?;
-        ensure!(
-            self.scope == AppScope::System
-                || matches!(
-                    manifest.recipe,
-                    crate::types::AppRecipeSource::Inline { .. }
-                ),
-            "app manifest `{}` names an on-disk recipe, which apps-scope manifests may not",
-            path.display()
-        );
         Ok(manifest)
     }
 
     /// Serialize the manifest into the bundle. Skipped on dry runs; returns
     /// the target path either way so previews show where it would land.
     fn write_manifest(&self, manifest: &AppManifest, dry_run: bool) -> Result<PathBuf> {
+        reject_symlink_path(&self.dir, APP_MANIFEST)?;
         let path = self.dir.join(APP_MANIFEST);
         if !dry_run {
-            let contents =
-                serde_json::to_vec_pretty(manifest).context("failed to serialize app manifest")?;
-            // Holds the app's values, secrets included.
-            self.files.write(&path, &contents, PRIVATE_MODE)?;
+            let contents = serde_json::to_string_pretty(manifest)
+                .context("failed to serialize app manifest")?;
+            fs::write(&path, contents)
+                .with_context(|| format!("failed to write `{}`", path.display()))?;
         }
         Ok(path)
     }
@@ -641,14 +572,16 @@ impl AppBundle {
                 "duplicate companion filename `{}` in rendered app",
                 companion.filename
             );
+            safe_join(&self.dir, &companion.filename)?;
         }
 
         let previous_units: HashSet<&str> = previous
             .map(|manifest| manifest.units.iter().map(String::as_str).collect())
             .unwrap_or_default();
         for unit in &units {
+            reject_symlink_path(&self.base_dir, &unit.filename)?;
             let path = safe_join(&self.base_dir, &unit.filename)?;
-            if self.units.exists(&path)? && !previous_units.contains(unit.filename.as_str()) {
+            if path.exists() && !previous_units.contains(unit.filename.as_str()) {
                 bail!(
                     "Quadlet unit `{}` already exists and is not owned by this app",
                     unit.filename
@@ -657,8 +590,10 @@ impl AppBundle {
         }
 
         if !dry_run {
-            self.units.create_dir(&self.base_dir)?;
-            self.files.create_dir(&self.dir)?;
+            fs::create_dir_all(&self.base_dir)
+                .with_context(|| format!("failed to create `{}`", self.base_dir.display()))?;
+            fs::create_dir_all(&self.dir)
+                .with_context(|| format!("failed to create `{}`", self.dir.display()))?;
         }
 
         let mut outcome = InstallOutcome::default();
@@ -669,7 +604,12 @@ impl AppBundle {
                 if desired_units.contains(unit.as_str()) {
                     continue;
                 }
-                remove_under(&self.units, &self.base_dir, unit, dry_run)?;
+                reject_symlink_path(&self.base_dir, unit)?;
+                let path = safe_join(&self.base_dir, unit)?;
+                if !dry_run && path.exists() {
+                    fs::remove_file(&path)
+                        .with_context(|| format!("failed to delete `{}`", path.display()))?;
+                }
                 outcome.removed_units.push(unit.clone());
             }
             let desired_files: HashSet<&str> = companions
@@ -680,27 +620,24 @@ impl AppBundle {
                 if desired_files.contains(file.as_str()) {
                     continue;
                 }
-                remove_under(&self.files, &self.dir, file, dry_run)?;
+                reject_symlink_path(&self.dir, file)?;
+                let path = safe_join(&self.dir, file)?;
+                if !dry_run && path.exists() {
+                    fs::remove_file(&path)
+                        .with_context(|| format!("failed to delete `{}`", path.display()))?;
+                }
                 outcome.removed_files.push(file.clone());
             }
         }
 
         for unit in units {
-            // Units can carry secrets (`Environment=MYSQL_PASSWORD=...`).
-            if !dry_run {
-                let path = safe_join(&self.base_dir, &unit.filename)?;
-                self.units
-                    .write(&path, unit.contents.as_bytes(), unit.kind.mode())?;
-            }
+            reject_symlink_path(&self.base_dir, &unit.filename)?;
+            write_file(&self.base_dir, &unit.filename, &unit.contents, dry_run)?;
             outcome.units.push(unit.filename.clone());
         }
         for companion in companions {
-            // Containers read companions through bind mounts.
-            if !dry_run {
-                let path = safe_join(&self.dir, &companion.filename)?;
-                self.files
-                    .write(&path, companion.contents.as_bytes(), companion.kind.mode())?;
-            }
+            reject_symlink_path(&self.dir, &companion.filename)?;
+            write_file(&self.dir, &companion.filename, &companion.contents, dry_run)?;
             outcome.files.push(companion.filename.clone());
         }
         Ok(outcome)
@@ -709,16 +646,24 @@ impl AppBundle {
     /// Delete the app's Quadlet units from the scan directory, returning the
     /// affected paths (deleted, or that would be on a dry run).
     fn delete_units(&self, units: &[String], dry_run: bool) -> Result<Vec<PathBuf>> {
-        units
-            .iter()
-            .map(|unit| remove_under(&self.units, &self.base_dir, unit, dry_run))
-            .collect()
+        let mut deleted = Vec::new();
+        for unit in units {
+            reject_symlink_path(&self.base_dir, unit)?;
+            let path = safe_join(&self.base_dir, unit)?;
+            if !dry_run && path.exists() {
+                fs::remove_file(&path)
+                    .with_context(|| format!("failed to delete `{}`", path.display()))?;
+            }
+            deleted.push(path);
+        }
+        Ok(deleted)
     }
 
     /// Remove the bundle directory and everything in it.
-    fn remove_bundle(&self, dry_run: bool) -> Result<()> {
+    fn remove(&self, dry_run: bool) -> Result<()> {
         if !dry_run {
-            self.files.remove_dir_all(&self.dir)?;
+            fs::remove_dir_all(&self.dir)
+                .with_context(|| format!("failed to remove `{}`", self.dir.display()))?;
         }
         Ok(())
     }
@@ -737,172 +682,29 @@ impl AppBundle {
             updated_at,
             ..
         } = manifest;
-        json!({
-            "name": name, "recipe_id": recipe_id, "recipe_version": recipe_version, "scope": scope, "units": units,
+        jsonf! {
+            name, recipe_id, recipe_version, scope, units,
             "services": manifest.services(),
-            "created_at": created_at, "updated_at": updated_at,
+            created_at, updated_at,
             "bundle_dir": self.dir,
-        })
+        }
     }
 }
 
-/// Remove `relative` under `base` in `tree` unless `dry_run`; a missing
-/// file is not an error. Returns its path.
-fn remove_under(tree: &Tree, base: &Path, relative: &str, dry_run: bool) -> Result<PathBuf> {
-    let path = safe_join(base, relative)?;
+/// Write one file under `base_dir`, creating parent directories for nested
+/// companion paths. `safe_join` keeps rendered filenames inside the base.
+/// Serves [`AppBundle::install`].
+fn write_file(base_dir: &Path, filename: &str, contents: &str, dry_run: bool) -> Result<PathBuf> {
+    let path = safe_join(base_dir, filename)?;
     if !dry_run {
-        tree.remove_file(&path)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create `{}`", parent.display()))?;
+        }
+        fs::write(&path, contents)
+            .with_context(|| format!("failed to write `{}`", path.display()))?;
     }
     Ok(path)
-}
-
-/// First port the apps account may bind without privileges: the host's
-/// `net.ipv4.ip_unprivileged_port_start` (which covers IPv6 too), 1024 when
-/// it cannot be read. Rootless port forwarders (pasta, rootlessport) bind
-/// in the host's network namespace as the account.
-fn unprivileged_port_start() -> u16 {
-    fs::read_to_string("/proc/sys/net/ipv4/ip_unprivileged_port_start")
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(1024)
-}
-
-/// In apps scope, refuse a rendered `PublishPort=` whose host port the apps
-/// account cannot bind (see [`unprivileged_port_start`]), so the mistake is
-/// an error now rather than a service that fails to start. This checks the
-/// units Tetra installs, whatever recipe parameter (and its `min`) produced
-/// the port; system scope is rootful and binds anything. Best effort: ports
-/// published by kube YAML (`hostPort`) or raw `PodmanArgs` are not parsed.
-fn check_published_ports(resources: &[RenderedResource], scope: AppScope) -> Result<()> {
-    if scope != AppScope::Apps {
-        return Ok(());
-    }
-    let start = unprivileged_port_start();
-    for resource in resources {
-        if !matches!(resource.kind, ResourceKind::Container | ResourceKind::Pod) {
-            continue;
-        }
-        for line in resource.contents.lines() {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            if key.trim() != "PublishPort" {
-                continue;
-            }
-            if let Some(port) = published_host_port(value.trim())
-                && port < start
-            {
-                bail!(
-                    "{}: `PublishPort={}` binds host port {port}, but rootless apps can only \
-                     bind ports from {start} up; pick a higher port or put a reverse proxy in \
-                     front",
-                    resource.filename,
-                    value.trim()
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The (lowest) host port of a `PublishPort=` value, `[[ip:][host]:]container[/proto]`
-/// with an IPv6 `ip` in brackets and ports possibly ranges (`8000-8010`), or
-/// `None` when it leaves the host port to Podman or cannot be parsed.
-fn published_host_port(value: &str) -> Option<u16> {
-    let value = value.split_once('/').map_or(value, |(ports, _)| ports);
-    // Drop a bracketed IPv6 address; what is left is `:host:container`.
-    let value = match value.strip_prefix('[') {
-        Some(rest) => rest.split_once(']')?.1.strip_prefix(':')?,
-        None => value,
-    };
-    let parts: Vec<&str> = value.split(':').collect();
-    let host = match parts.as_slice() {
-        [_container] => return None,
-        [host, _container] => *host,
-        [_ip, host, _container] => *host,
-        // An unbracketed IPv6 address is not valid here; Podman rejects it.
-        _ => return None,
-    };
-    let low = host.split_once('-').map_or(host, |(low, _)| low);
-    low.trim().parse().ok()
-}
-
-/// Mode of `app.json`, which holds the app's values (secrets included).
-const PRIVATE_MODE: u32 = 0o600;
-
-/// What `get` shows in place of a secret.
-const REDACTED: &str = "********";
-
-/// Add the apps in `dirs` (of `scope`) to `apps`, and the names of bundles
-/// that cannot be read to `invalid`.
-fn list_scope(
-    dirs: &AppDirs,
-    scope: AppScope,
-    apps: &mut Vec<Value>,
-    invalid: &mut Vec<String>,
-) -> Result<()> {
-    for (name, kind) in dirs.files.read_dir(&dirs.files_root)?.unwrap_or_default() {
-        let name = name.to_string_lossy().into_owned();
-        if kind == Kind::Symlink {
-            invalid.push(name);
-            continue;
-        }
-        if kind != Kind::Dir {
-            continue;
-        }
-        let Ok(bundle) = dirs.bundle(&name) else {
-            invalid.push(name);
-            continue;
-        };
-        match bundle.manifest() {
-            Ok(manifest) if manifest.name == name && manifest.scope == scope => {
-                apps.push(bundle.summary(&manifest));
-            }
-            Ok(_) | Err(_) => invalid.push(name),
-        }
-    }
-    Ok(())
-}
-
-/// Whether a key holds a secret: it was a `Secret` parameter at some
-/// render, is one in the current recipe, or the recipe is unknown. Never
-/// touches the filesystem: only an inline recipe is parsed, and every key
-/// of an app with an on-disk recipe (a system-scope manifest of an older
-/// release, whose `secret_keys` may well be empty) counts as secret, since
-/// reading the recipe is what `update`'s snapshot is for.
-fn secrets(manifest: &AppManifest) -> impl Fn(&str) -> bool + use<> {
-    let current: Option<std::collections::BTreeSet<String>> = match &manifest.recipe {
-        crate::types::AppRecipeSource::Inline { recipe, .. } => {
-            crate::catalog::AppRecipe::load_str(recipe)
-                .ok()
-                .map(|recipe| recipe.secret_keys().map(str::to_owned).collect())
-        }
-        crate::types::AppRecipeSource::File { .. } => None,
-    };
-    let stored = manifest.secret_keys.clone();
-    move |key| stored.contains(key) || current.as_ref().is_none_or(|current| current.contains(key))
-}
-
-/// Hide secrets in a manifest shown to the Apps page: the values of secret
-/// parameters, and an inline recipe that spells out a secret's default.
-fn redact_secrets(manifest: &mut AppManifest) {
-    let is_secret = secrets(manifest);
-    for (key, value) in &mut manifest.values {
-        if is_secret(key) {
-            *value = YamlValue::String(REDACTED.to_owned());
-        }
-    }
-    if let crate::types::AppRecipeSource::Inline { recipe, .. } = &mut manifest.recipe {
-        let secret_default = crate::catalog::AppRecipe::load_str(recipe).map_or(true, |parsed| {
-            parsed
-                .parameters
-                .iter()
-                .any(|p| p.kind == crate::catalog::ParameterKind::Secret && p.default.is_some())
-        });
-        if secret_default {
-            REDACTED.clone_into(recipe);
-        }
-    }
 }
 
 /// Adapter that drives the systemd phase of the app lifecycle through the
@@ -917,11 +719,9 @@ struct Systemd<'a> {
 }
 
 impl<'a> Systemd<'a> {
-    /// `systemctl` of the scope's manager: the apps account's user manager
-    /// (`--user -M ultramarine-apps@`) or the system manager.
-    fn new(scope: AppScope, dry_run: bool, user: Option<&'a str>) -> Self {
+    const fn new(scope: ServiceScope, dry_run: bool, user: Option<&'a str>) -> Self {
         Self {
-            scope: scope.into(),
+            scope,
             dry_run,
             user,
         }
@@ -931,7 +731,7 @@ impl<'a> Systemd<'a> {
     fn daemon_reload(self) -> Result<Value> {
         ServicesModule.handle(
             "daemon_reload",
-            json!({ "scope": self.scope, "dry_run": self.dry_run }),
+            jsonf! { "scope": self.scope, "dry_run": self.dry_run },
             self.user,
         )
     }
@@ -941,40 +741,42 @@ impl<'a> Systemd<'a> {
     fn service_action(self, action: &str, service: &str) -> Result<Value> {
         ServicesModule.handle(
             action,
-            json!({
+            jsonf! {
                 "service": service,
                 "scope": self.scope,
                 "dry_run": self.dry_run,
-            }),
+            },
             self.user,
         )
     }
 
-    /// The create/update phase: reload, then start (or restart, on update)
-    /// each app service. No `enable`: systemd refuses it for generated
-    /// units ("Unit ... is transient or generated"); the generator applies
-    /// the unit's `[Install]` section on every reload instead.
+    /// The create/update phase: reload, then enable and start (or restart,
+    /// on update) each app service.
     fn converge(self, services: &[String], service_action: &str) -> Result<Vec<Value>> {
         let mut ops = vec![self.daemon_reload()?];
         for service in services {
+            ops.push(self.service_action("enable", service)?);
             ops.push(self.service_action(service_action, service)?);
         }
         Ok(ops)
     }
 
-    /// The remove phase: stop each service before its unit is deleted
-    /// (deleting the unit and reloading drops its `[Install]` links).
-    /// Failures are reported inline but tolerated: the unit may already be
-    /// gone, and removal should still clean up the bundle.
+    /// The remove phase: stop and disable each service before its unit is
+    /// deleted. Failures are reported inline but tolerated: the unit may
+    /// already be gone, and removal should still clean up the bundle.
     fn teardown(self, services: &[String]) -> Vec<Value> {
-        services
-            .iter()
-            .map(|service| {
-                self.service_action("stop", service).unwrap_or_else(|error| {
-                    json!({ "action": "stop", "service": service, "error": error.to_string() })
-                })
-            })
-            .collect()
+        let mut ops = Vec::new();
+        for service in services {
+            for action in ["stop", "disable"] {
+                match self.service_action(action, service) {
+                    Ok(op) => ops.push(op),
+                    Err(error) => ops.push(jsonf! {
+                        action, service, "error": error.to_string(),
+                    }),
+                }
+            }
+        }
+        ops
     }
 }
 
@@ -1011,7 +813,7 @@ resources:
 
     fn demo_templates() -> serde_json::Value {
         json!({
-            "containers/demo.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=example/demo:latest@sha256:1111111111111111111111111111111111111111111111111111111111111111\n",
+            "containers/demo.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=example/demo:latest\n",
             "files/index.html.tera": "<h1>{{ app_id }}</h1>\n",
         })
     }
@@ -1253,149 +1055,18 @@ resources:
             .iter()
             .map(|op| op["command"].as_str().unwrap().to_owned())
             .collect::<Vec<_>>();
-        // Apps scope (the default): the apps account's user manager.
-        assert_eq!(
-            commands,
-            [
-                "systemctl --user -M ultramarine-apps@ daemon-reload",
-                "systemctl --user -M ultramarine-apps@ start demo-web.service",
-            ]
-        );
-        assert_eq!(response["app"]["scope"], "apps");
-        assert_eq!(response["owner"], "ultramarine-apps");
-        // The account is prepared before its manager is used.
-        let account = response["account"].as_array().unwrap();
-        assert!(
-            account.iter().any(|op| op["command"]
-                .as_str()
-                .unwrap()
-                .starts_with("systemctl start user@")),
-            "{account:?}"
-        );
-        assert!(account.iter().all(|op| op["dry_run"] == true));
-        assert_eq!(response["app"]["recipe_id"], "demo-web");
-        // Nothing touched the filesystem.
-        assert!(!base.path().join("demo-web.container").exists());
-        assert!(!files.path().join("demo").exists());
-    }
-
-    #[test]
-    fn system_scope_keeps_rootful_units_and_the_system_manager() {
-        let base = tempfile::tempdir().unwrap();
-        let files = tempfile::tempdir().unwrap();
-        let mut payload = create_payload(base.path(), files.path());
-        payload["scope"] = json!("system");
-        payload["converge"] = json!(true);
-        payload["dry_run"] = json!(true);
-        let response = dispatch("create", payload).unwrap();
-        let commands: Vec<_> = response["systemd"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|op| op["command"].as_str().unwrap().to_owned())
-            .collect();
         assert_eq!(
             commands,
             [
                 "systemctl daemon-reload",
-                "systemctl start demo-web.service"
+                "systemctl enable demo-web.service",
+                "systemctl start demo-web.service",
             ]
         );
-        assert_eq!(response["account"], json!([]));
-        assert_eq!(response["owner"], "root");
-        assert_eq!(response["app"]["scope"], "system");
-
-        // An app installed in system scope is found only there.
-        let mut create = create_payload(base.path(), files.path());
-        create["scope"] = json!("system");
-        dispatch("create", create).unwrap();
-        let listed = |scope: &str| {
-            dispatch(
-                "list",
-                json!({ "scope": scope, "base_dir": base.path(), "files_base_dir": files.path() }),
-            )
-            .unwrap()
-        };
-        assert_eq!(listed("system")["apps"][0]["scope"], "system");
-        assert_eq!(listed("apps")["apps"], json!([]));
-        assert_eq!(listed("apps")["invalid"], json!(["demo"]));
-        let get = |scope: &str| {
-            dispatch(
-                "get",
-                json!({ "name": "demo", "scope": scope, "base_dir": base.path(), "files_base_dir": files.path() }),
-            )
-        };
-        get("system").unwrap();
-        get("apps").unwrap_err();
-        // `user` scope is gone.
-        get("user").unwrap_err();
-    }
-
-    #[test]
-    fn apps_scope_bundles_are_handed_to_the_account() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("apps");
-        let (owner, chowned) = crate::agent::apps_account::tests::recording_owner(&home);
-        let base_dir = home.join(".config/containers/systemd");
-        let files_root = home.join(".local/share/tetra/quadlets");
-        let dirs = AppDirs {
-            scope: AppScope::Apps,
-            units: Tree::new(&base_dir, Some(&home), Some(owner.clone())),
-            files: Tree::new(&files_root, Some(&home), Some(owner)),
-            base_dir,
-            files_root,
-        };
-        let bundle = dirs.bundle("demo").unwrap();
-        let source = crate::types::AppRecipeSource::Inline {
-            recipe: DEMO_RECIPE.to_owned(),
-            templates: serde_json::from_value(demo_templates()).unwrap(),
-        };
-        let mut values = BTreeMap::new();
-        let (_, resources) = source.render(&mut values).unwrap();
-        let outcome = bundle.install(&resources, None, false).unwrap();
-        assert_eq!(outcome.units, ["demo-web.container"]);
-        let manifest = AppManifest {
-            source: None,
-            allow_unpinned_images: false,
-            version: MANIFEST_VERSION,
-            name: "demo".into(),
-            scope: AppScope::Apps,
-            recipe_id: "demo-web".into(),
-            recipe_version: "0.1.0".into(),
-            recipe: source,
-            values,
-            secret_keys: std::collections::BTreeSet::new(),
-            units: outcome.units,
-            files: outcome.files,
-            created_at: 0,
-            updated_at: 0,
-        };
-        bundle.write_manifest(&manifest, false).unwrap();
-
-        let chowned = chowned.lock().unwrap().clone();
-        for path in [
-            "",
-            ".config",
-            ".config/containers/systemd",
-            ".config/containers/systemd/demo-web.container",
-            ".local/share/tetra/quadlets",
-            ".local/share/tetra/quadlets/demo",
-            ".local/share/tetra/quadlets/demo/site",
-            ".local/share/tetra/quadlets/demo/site/index.html",
-            ".local/share/tetra/quadlets/demo/app.json",
-        ] {
-            assert!(
-                chowned.iter().any(|entry| entry == path),
-                "{path}: {chowned:?}"
-            );
-        }
-        let mode = |path: &Path| {
-            use std::os::unix::fs::PermissionsExt;
-            fs::metadata(path).unwrap().permissions().mode() & 0o777
-        };
-        assert_eq!(mode(&dirs.base_dir.join("demo-web.container")), 0o600);
-        assert_eq!(mode(&bundle.dir.join("app.json")), 0o600);
-        assert_eq!(mode(&bundle.dir.join("site/index.html")), 0o644);
+        assert_eq!(response["app"]["recipe_id"], "demo-web");
+        // Nothing touched the filesystem.
+        assert!(!base.path().join("demo-web.container").exists());
+        assert!(!files.path().join("demo").exists());
     }
 
     #[test]
@@ -1408,7 +1079,7 @@ resources:
         assert_eq!(response["systemd"], json!([]));
         assert_eq!(
             fs::read_to_string(base.path().join("demo-web.container")).unwrap(),
-            "[Container]\nContainerName=demo-web\nImage=example/demo:latest@sha256:1111111111111111111111111111111111111111111111111111111111111111\n"
+            "[Container]\nContainerName=demo-web\nImage=example/demo:latest\n"
         );
         let bundle = files.path().join("demo");
         assert_eq!(
@@ -1474,7 +1145,7 @@ resources:
 
     fn site_templates() -> serde_json::Value {
         json!({
-            "site.container.tera": "[Container]\nImage=docker.io/library/nginx:alpine@sha256:a3554c0d0b48177b1413c26e01f695334428020d9df01243fbae3e11cfd17417\nPublishPort={{ http_port }}:80\nVolume={{ bundle_dir }}/html:/usr/share/nginx/html:ro\n",
+            "site.container.tera": "[Container]\nImage=docker.io/library/nginx:stable-alpine\nPublishPort={{ http_port }}:80\nVolume={{ bundle_dir }}/html:/usr/share/nginx/html:ro\n",
         })
     }
 
@@ -1571,295 +1242,6 @@ resources:
         );
     }
 
-    /// Swap the recipe of the stored manifest of `demo` for an on-disk one.
-    fn plant_file_recipe(files: &Path, recipe_path: &Path, templates_dir: &Path) {
-        let manifest_path = files.join("demo").join(APP_MANIFEST);
-        let mut manifest: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
-        manifest["recipe"] = json!({
-            "source": "file",
-            "recipe_path": recipe_path,
-            "templates_dir": templates_dir,
-        });
-        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-    }
-
-    /// Run `f` on another thread, failing the test if it does not return
-    /// within a few seconds (a FIFO would block it forever).
-    fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || tx.send(f()));
-        rx.recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the action blocked")
-    }
-
-    #[test]
-    fn apps_scope_refuses_a_planted_on_disk_recipe() {
-        let base = tempfile::tempdir().unwrap();
-        let files = tempfile::tempdir().unwrap();
-        dispatch("create", create_payload(base.path(), files.path())).unwrap();
-        let unit = base.path().join("demo-web.container");
-        let installed = fs::read_to_string(&unit).unwrap();
-
-        // A recipe whose template is a file root reads and the account must
-        // not: `update` would render it into the account's unit.
-        let planted = tempfile::tempdir().unwrap();
-        let secrets = planted.path().join("secrets");
-        fs::create_dir_all(&secrets).unwrap();
-        fs::write(secrets.join("shadow"), "root:SECRET-HASH:::\n").unwrap();
-        let recipe = planted.path().join("recipe.yaml");
-        fs::write(
-            &recipe,
-            DEMO_RECIPE.replace("containers/demo.container.tera", "shadow"),
-        )
-        .unwrap();
-        plant_file_recipe(files.path(), &recipe, &secrets);
-        let request = json!({
-            "name": "demo",
-            "base_dir": base.path(),
-            "files_base_dir": files.path(),
-            "converge": false,
-        });
-        for action in ["get", "update", "remove"] {
-            let error = dispatch(action, request.clone()).unwrap_err();
-            assert!(
-                error.to_string().contains("on-disk recipe"),
-                "{action}: {error:#}"
-            );
-        }
-        assert_eq!(fs::read_to_string(&unit).unwrap(), installed);
-        assert!(
-            files.path().join("demo/app.json").exists(),
-            "remove went ahead"
-        );
-        let listed = dispatch(
-            "list",
-            json!({ "base_dir": base.path(), "files_base_dir": files.path() }),
-        )
-        .unwrap();
-        assert_eq!(listed["apps"], json!([]));
-        assert_eq!(listed["invalid"], json!(["demo"]));
-
-        // A FIFO as the recipe would block the one dispatch worker.
-        let fifo = planted.path().join("fifo");
-        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
-        plant_file_recipe(files.path(), &fifo, Path::new("/etc"));
-        for action in ["get", "update", "remove"] {
-            let request = request.clone();
-            let error = bounded(move || dispatch(action, request)).unwrap_err();
-            assert!(
-                error.to_string().contains("on-disk recipe"),
-                "{action}: {error:#}"
-            );
-        }
-    }
-
-    #[test]
-    fn system_scope_still_handles_on_disk_recipes_of_older_releases() {
-        let base = tempfile::tempdir().unwrap();
-        let files = tempfile::tempdir().unwrap();
-        let mut create = create_payload(base.path(), files.path());
-        create["scope"] = json!("system");
-        dispatch("create", create).unwrap();
-
-        let recipes = tempfile::tempdir().unwrap();
-        let recipe = recipes.path().join("recipe.yaml");
-        fs::write(&recipe, DEMO_RECIPE).unwrap();
-        for (name, body) in demo_templates().as_object().unwrap() {
-            let path = recipes.path().join(name);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, body.as_str().unwrap()).unwrap();
-        }
-        plant_file_recipe(files.path(), &recipe, recipes.path());
-        let request = json!({
-            "name": "demo",
-            "scope": "system",
-            "base_dir": base.path(),
-            "files_base_dir": files.path(),
-            "converge": false,
-        });
-        let listed = dispatch(
-            "list",
-            json!({ "scope": "system", "base_dir": base.path(), "files_base_dir": files.path() }),
-        )
-        .unwrap();
-        assert_eq!(listed["apps"][0]["name"], "demo");
-
-        // `get` reads no recipe from disk, so every value counts as secret.
-        let got = dispatch("get", request.clone()).unwrap();
-        assert_eq!(got["app"]["recipe"]["source"], "file");
-        assert_eq!(got["app"]["values"]["app_id"], REDACTED);
-
-        // `update` snapshots the recipe (root's, in system scope)...
-        let updated = dispatch("update", request.clone()).unwrap();
-        assert_eq!(updated["app"]["recipe"]["source"], "inline");
-        assert_eq!(updated["app"]["values"]["app_id"], "demo-web");
-        assert!(base.path().join("demo-web.container").exists());
-
-        // ...and `remove` tears one down.
-        plant_file_recipe(files.path(), &recipe, recipes.path());
-        dispatch("remove", request).unwrap();
-        assert!(!files.path().join("demo").exists());
-        assert!(!base.path().join("demo-web.container").exists());
-    }
-
-    #[test]
-    fn reads_the_host_port_of_publish_port_values() {
-        for (value, port) in [
-            ("80", None),
-            ("8080:80", Some(8080)),
-            ("80:80/tcp", Some(80)),
-            ("127.0.0.1:443:443", Some(443)),
-            ("127.0.0.1::80", None),
-            ("[::1]:8443:443", Some(8443)),
-            ("[2001:db8::1]:53:53/udp", Some(53)),
-            ("[::]::80", None),
-            ("8000-8010:80-90", Some(8000)),
-            ("garbage:80", None),
-        ] {
-            assert_eq!(published_host_port(value), port, "{value}");
-        }
-    }
-
-    #[test]
-    fn apps_scope_refuses_privileged_host_ports() {
-        let unit = |port: &str| RenderedResource {
-            kind: ResourceKind::Container,
-            filename: "site.container".into(),
-            contents: format!("[Container]\nImage=x\nPublishPort = {port}\n"),
-        };
-        // Rootful system scope binds anything.
-        check_published_ports(&[unit("80:80")], AppScope::System).unwrap();
-        check_published_ports(&[unit("80")], AppScope::Apps).unwrap();
-        check_published_ports(&[unit("65535:80")], AppScope::Apps).unwrap();
-        let start = unprivileged_port_start();
-        if start > 80 {
-            let error = check_published_ports(&[unit("[::]:80:80")], AppScope::Apps).unwrap_err();
-            assert!(error.to_string().contains("rootless"), "{error}");
-            // `create` checks before writing anything.
-            let base = tempfile::tempdir().unwrap();
-            let files = tempfile::tempdir().unwrap();
-            let error = dispatch(
-                "create",
-                site_payload(base.path(), files.path(), &json!({ "http_port": 80 })),
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains("rootless"), "{error}");
-            assert!(fs::read_dir(files.path()).unwrap().next().is_none());
-            let mut system = site_payload(base.path(), files.path(), &json!({ "http_port": 80 }));
-            system["scope"] = json!("system");
-            dispatch("create", system).unwrap();
-        }
-    }
-
-    const KUBE_RECIPE: &str = "
-recipe_id: kube-demo
-name: Kube demo
-version: 1.0.0
-parameters:
-  - key: bundle_dir
-    label: Bundle directory
-    type: string
-resources:
-  - type: kube
-    filename: demo.kube
-    template: demo.kube.tera
-  - type: file
-    filename: kube/pod.yaml
-    template: pod.yaml.tera
-";
-
-    fn kube_payload(base_dir: &Path, files_base_dir: &Path, yaml: &str) -> Value {
-        json!({
-            "name": "kube",
-            "base_dir": base_dir,
-            "files_base_dir": files_base_dir,
-            "recipe": KUBE_RECIPE,
-            "templates": {
-                "demo.kube.tera": format!("[Kube]\nYaml={yaml}\n"),
-                "pod.yaml.tera": "spec:\n  containers:\n    - Image: docker.io/library/nginx:alpine@sha256:a3554c0d0b48177b1413c26e01f695334428020d9df01243fbae3e11cfd17417\n",
-            },
-            "converge": false,
-        })
-    }
-
-    /// Quadlet resolves a relative `Yaml=` against the scan directory, not
-    /// the bundle: a pinned kube app must point at its bundle by absolute
-    /// path, which `create` checks against the real bundle directory.
-    #[test]
-    fn pinned_kube_apps_name_their_yaml_in_the_bundle() {
-        let base = tempfile::tempdir().unwrap();
-        let files = tempfile::tempdir().unwrap();
-        for yaml in ["kube/pod.yaml", "/srv/elsewhere/kube/pod.yaml"] {
-            let error =
-                dispatch("create", kube_payload(base.path(), files.path(), yaml)).unwrap_err();
-            assert!(error.to_string().contains("Yaml="), "{error}");
-        }
-        // A caller-supplied `bundle_dir` is not where the bundle is.
-        let mut moved = kube_payload(base.path(), files.path(), "{{ bundle_dir }}/kube/pod.yaml");
-        moved["values"] = json!({ "bundle_dir": "/srv/elsewhere" });
-        dispatch("create", moved).unwrap_err();
-        assert!(fs::read_dir(base.path()).unwrap().next().is_none());
-
-        dispatch(
-            "create",
-            kube_payload(base.path(), files.path(), "{{ bundle_dir }}/kube/pod.yaml"),
-        )
-        .unwrap();
-        let unit = fs::read_to_string(base.path().join("demo.kube")).unwrap();
-        let yaml = files.path().join("kube/kube/pod.yaml");
-        assert_eq!(unit, format!("[Kube]\nYaml={}\n", yaml.display()));
-        assert!(yaml.exists());
-        // `update` checks the same way.
-        dispatch(
-            "update",
-            json!({ "name": "kube", "base_dir": base.path(), "files_base_dir": files.path(), "converge": false }),
-        )
-        .unwrap();
-    }
-
-    /// The shipped nginx-site recipe serves only `site/` (not `app.json`)
-    /// and relabels what it mounts.
-    #[test]
-    fn nginx_site_serves_only_its_site_directory() {
-        let base = tempfile::tempdir().unwrap();
-        let files = tempfile::tempdir().unwrap();
-        let templates = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
-        let response = dispatch(
-            "create",
-            json!({
-                "name": "web",
-                "base_dir": base.path(),
-                "files_base_dir": files.path(),
-                "recipe_path": templates.join("recipes/nginx-site.yaml"),
-                "templates_dir": templates,
-                "values": { "app_id": "web" },
-                "converge": false,
-            }),
-        )
-        .unwrap();
-        assert_eq!(
-            response["files"],
-            json!(["site/index.html", "conf/default.conf"])
-        );
-        let bundle = files.path().join("web");
-        let unit = fs::read_to_string(base.path().join("web.container")).unwrap();
-        let volumes: Vec<_> = unit.lines().filter(|l| l.starts_with("Volume=")).collect();
-        assert_eq!(
-            volumes,
-            [
-                format!(
-                    "Volume={}/site:/usr/share/nginx/html:ro,z",
-                    bundle.display()
-                ),
-                format!("Volume={}/conf:/etc/nginx/conf.d:ro,z", bundle.display()),
-            ]
-        );
-        assert!(bundle.join("app.json").exists());
-        assert!(bundle.join("site/index.html").exists());
-        assert!(!bundle.join("site/app.json").exists());
-    }
-
     #[test]
     fn create_refuses_an_existing_bundle() {
         let base = tempfile::tempdir().unwrap();
@@ -1910,149 +1292,6 @@ resources:
             response["app"]["updated_at"].as_u64().unwrap()
                 >= response["app"]["created_at"].as_u64().unwrap()
         );
-    }
-
-    #[test]
-    fn generated_secrets_survive_updates_and_stay_private() {
-        let base = tempfile::tempdir().unwrap();
-        let files = tempfile::tempdir().unwrap();
-        let recipe = DEMO_RECIPE.replace(
-            "resources:",
-            "  - key: db_password\n    label: Database password\n    type: secret\n    generate: random_32\nresources:",
-        );
-        let mut templates = demo_templates();
-        templates["containers/demo.container.tera"] = json!(
-            "[Container]\nImage=example/demo:latest@sha256:1111111111111111111111111111111111111111111111111111111111111111\nEnvironment=PW={{ db_password }}\n"
-        );
-        let mut create = create_payload(base.path(), files.path());
-        create["recipe"] = json!(recipe);
-        create["templates"] = templates;
-        let created = dispatch("create", create).unwrap();
-        let password = created["app"]["values"]["db_password"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert_eq!(password.len(), 32);
-
-        let unit = base.path().join("demo-web.container");
-        let read = || fs::read_to_string(&unit).unwrap();
-        assert!(read().contains(&password));
-        let update = json!({
-            "name": "demo",
-            "base_dir": base.path(),
-            "files_base_dir": files.path(),
-            "converge": false,
-        });
-        dispatch("update", update).unwrap();
-        assert!(read().contains(&password), "the secret was regenerated");
-
-        let mode = |path: &Path| {
-            use std::os::unix::fs::PermissionsExt;
-            fs::metadata(path).unwrap().permissions().mode() & 0o777
-        };
-        assert_eq!(mode(&unit), 0o600);
-        assert_eq!(mode(&files.path().join("demo/app.json")), 0o600);
-        assert_eq!(mode(&files.path().join("demo/site/index.html")), 0o644);
-
-        let got = dispatch(
-            "get",
-            json!({ "name": "demo", "base_dir": base.path(), "files_base_dir": files.path() }),
-        )
-        .unwrap();
-        assert_eq!(got["app"]["values"]["db_password"], "********");
-        assert_eq!(got["app"]["values"]["app_id"], "demo-web");
-
-        // Sending `get`'s values back keeps the secret.
-        let mut update = json!({
-            "name": "demo",
-            "base_dir": base.path(),
-            "files_base_dir": files.path(),
-            "converge": false,
-        });
-        update["values"] = got["app"]["values"].clone();
-        update["values"]["bundle_dir"] = json!(files.path().join("demo"));
-        dispatch("update", update).unwrap();
-        assert!(
-            read().contains(&password),
-            "the secret became the placeholder"
-        );
-    }
-
-    #[test]
-    fn get_keeps_secrets_hidden_even_after_the_recipe_declassifies_them() {
-        let base = tempfile::tempdir().unwrap();
-        let files = tempfile::tempdir().unwrap();
-        let secret = DEMO_RECIPE.replace(
-            "resources:",
-            "  - key: token\n    label: Token\n    type: secret\n    default: hunter3\nresources:",
-        );
-        let mut create = create_payload(base.path(), files.path());
-        create["recipe"] = json!(secret);
-        create["values"]["token"] = json!("hunter2");
-        dispatch("create", create).unwrap();
-        let get = || {
-            dispatch(
-                "get",
-                json!({ "name": "demo", "base_dir": base.path(), "files_base_dir": files.path() }),
-            )
-            .unwrap()
-        };
-        let shown = get();
-        assert_eq!(shown["app"]["values"]["token"], "********");
-        assert!(!shown.to_string().contains("hunter2"));
-        assert!(
-            !shown.to_string().contains("hunter3"),
-            "the recipe's secret default"
-        );
-
-        // A later recipe calls it a plain string; the stored value stays hidden.
-        dispatch(
-            "update",
-            json!({
-                "name": "demo",
-                "base_dir": base.path(),
-                "files_base_dir": files.path(),
-                "recipe": secret.replace("type: secret\n    default: hunter3", "type: string"),
-                "templates": demo_templates(),
-                "converge": false,
-            }),
-        )
-        .unwrap();
-        let shown = get();
-        assert_eq!(shown["app"]["values"]["token"], "********");
-        assert!(!shown.to_string().contains("hunter2"));
-    }
-
-    #[test]
-    fn list_filters_by_scope() {
-        let base = tempfile::tempdir().unwrap();
-        let files = tempfile::tempdir().unwrap();
-        dispatch("create", create_payload(base.path(), files.path())).unwrap();
-        let list = |scope: Option<&str>| {
-            let mut payload = json!({ "base_dir": base.path(), "files_base_dir": files.path() });
-            if let Some(scope) = scope {
-                payload["scope"] = json!(scope);
-            }
-            dispatch("list", payload).unwrap()
-        };
-        let names = |response: &Value| {
-            response["apps"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|app| app["name"].as_str().unwrap().to_owned())
-                .collect::<Vec<_>>()
-        };
-        let default = list(None);
-        assert_eq!(names(&default), ["demo"]);
-        assert_eq!(default["files_base_dir"], json!(files.path()));
-        // The demo app is apps scope; with shared overrides, system scope
-        // sees its manifest and refuses it as another scope's.
-        assert!(names(&list(Some("system"))).is_empty());
-        let all = list(Some("all"));
-        assert_eq!(names(&all), ["demo"]);
-        assert_eq!(all["roots"].as_array().unwrap().len(), 2);
-        assert!(all.get("files_base_dir").is_none());
     }
 
     #[test]
@@ -2116,8 +1355,9 @@ resources:
         assert_eq!(
             commands,
             [
-                "systemctl --user -M ultramarine-apps@ stop demo-web.service",
-                "systemctl --user -M ultramarine-apps@ daemon-reload",
+                "systemctl stop demo-web.service",
+                "systemctl disable demo-web.service",
+                "systemctl daemon-reload",
             ]
         );
         assert_eq!(response["bundle_removed"], false);

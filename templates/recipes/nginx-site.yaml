@@ -40,8 +40,8 @@ resources:
     filename: "{{ app_id }}.container"
     template: containers/nginx-site.container.tera
   - type: file
-    filename: site/index.html
+    filename: index.html
     template: files/nginx-index.html.tera
   - type: file
-    filename: conf/default.conf
+    filename: default.conf
     template: files/nginx-default.conf.tera

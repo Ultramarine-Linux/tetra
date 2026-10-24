@@ -19,13 +19,9 @@
 //! (`write`, `delete`) accept `dry_run` and an optional `reload` flag that
 //! triggers `systemctl reload caddy.service` after the change.
 
-use serde_json::json;
-
-use crate::actions;
-use crate::agent::modules::Mod;
 use crate::prelude::*;
 
-use crate::agent::module_support::{ModuleInfo, ModuleStatus, run_for, safe_join};
+use crate::agent::module_support::safe_join;
 pub use crate::auth::dns::DnsValue;
 
 /// Agent module that manages Caddy reverse proxy snippets.
@@ -123,7 +119,7 @@ actions!(Action [payload user] => {
     List {
         #[serde(default = "default_config_dir")]
         config_dir: PathBuf,
-    } => Ok(json!({ "config_dir": payload.config_dir, "sites": list_sites(&payload.config_dir)? })),
+    } => Ok(jsonf! { payload.config_dir, "sites": list_sites(&payload.config_dir)? }),
     Render {
         #[serde(default = "default_config_dir")]
         config_dir: PathBuf,
@@ -137,14 +133,14 @@ actions!(Action [payload user] => {
         reload: bool,
     } => {
         let site = SiteMetadata::new(&payload.domain, &payload.upstream, payload.tls)?;
-        Ok(json!({
-            "config_dir": payload.config_dir,
+        Ok(jsonf! {
+            payload.config_dir,
             "filename": site_filename(&site.domain)?,
             "contents": site.render()?,
-            "site": site,
-            "dry_run": payload.dry_run,
-            "reload": payload.reload,
-        }))
+            site,
+            payload.dry_run,
+            payload.reload,
+        })
     },
     Write {
         #[serde(default = "default_config_dir")]
@@ -168,15 +164,24 @@ actions!(Action [payload user] => {
         if !payload.dry_run {
             fs::create_dir_all(config_dir)
                 .with_context(|| format!("failed to create `{}`", config_dir.display()))?;
-            crate::auth::store::replace(&path, contents.as_bytes(), SITE_MODE)?;
+            fs::write(&path, &contents)
+                .with_context(|| format!("failed to write `{}`", path.display()))?;
         }
-        let (reload, reload_error) = optional_reload(payload.reload, "write", payload.dry_run, user);
 
-        Ok(json!({
-            "config_dir": config_dir, "filename": filename, "path": path, "contents": contents, "site": site,
+        let (reload, reload_error) = if payload.reload {
+            match reload_caddy("write", payload.dry_run, user) {
+                Ok(result) => (Some(result), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else {
+            (None, None)
+        };
+
+        Ok(jsonf! {
+            config_dir, filename, path, contents, site,
             "written": !payload.dry_run,
-            "dry_run": payload.dry_run, "reload": reload, "reload_error": reload_error,
-        }))
+            payload.dry_run, reload, reload_error,
+        })
     },
     Delete {
         #[serde(default = "default_config_dir")]
@@ -193,39 +198,31 @@ actions!(Action [payload user] => {
         let path = safe_join(config_dir, &filename)?;
         ensure_managed(&path)?;
 
-        if !payload.dry_run {
-            crate::auth::store::remove(&path)?;
+        if !payload.dry_run && path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to delete `{}`", path.display()))?;
         }
-        let (reload, reload_error) = optional_reload(payload.reload, "delete", payload.dry_run, user);
 
-        Ok(json!({
-            "config_dir": config_dir, "filename": filename, "path": path,
+        let (reload, reload_error) = if payload.reload {
+            match reload_caddy("delete", payload.dry_run, user) {
+                Ok(result) => (Some(result), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else {
+            (None, None)
+        };
+
+        Ok(jsonf! {
+            config_dir, filename, path,
             "deleted": !payload.dry_run,
-            "dry_run": payload.dry_run, "reload": reload, "reload_error": reload_error,
-        }))
+            payload.dry_run, reload, reload_error,
+        })
     },
     Reload {
         #[serde(default)]
         dry_run: bool,
     } => reload_caddy("reload", payload.dry_run, user)
 });
-
-/// Reload Caddy when asked. A failed reload is reported next to the change
-/// (which already happened) rather than failing the action.
-fn optional_reload(
-    reload: bool,
-    action: &str,
-    dry_run: bool,
-    user: Option<&str>,
-) -> (Option<Value>, Option<String>) {
-    if !reload {
-        return (None, None);
-    }
-    match reload_caddy(action, dry_run, user) {
-        Ok(result) => (Some(result), None),
-        Err(error) => (None, Some(error.to_string())),
-    }
-}
 
 /// Serde default for `tls`. Caddy auto-provisions HTTPS, so TLS is the
 /// safe default; callers must explicitly opt out.
@@ -244,7 +241,16 @@ fn validate_domain(domain: &str) -> Result<String> {
     if domain.is_empty() {
         bail!("domain is required");
     }
-    if !crate::auth::access::is_dns_name(&domain) {
+    if domain.len() > 253
+        || domain.contains('/')
+        || domain.contains(':')
+        || !domain
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.')
+        || domain.split('.').any(|part| {
+            part.is_empty() || part.starts_with('-') || part.ends_with('-') || part.len() > 63
+        })
+    {
         bail!("invalid domain `{domain}`");
     }
 
@@ -261,34 +267,16 @@ fn validate_upstream(upstream: &str) -> Result<String> {
     if upstream.is_empty() {
         bail!("upstream is required");
     }
-    // One address only: whitespace would add more upstreams to the
-    // `reverse_proxy` directive, and braces or newlines more directives.
-    if !upstream
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']' | '/'))
+    if upstream.contains('\n')
+        || upstream.contains('\r')
+        || upstream.contains('{')
+        || upstream.contains('}')
     {
         bail!("invalid upstream `{upstream}`");
     }
-    // `[scheme://]host:port[/...]`: the port is required, and may not be one
-    // that would expose Caddy's admin API or the OOBE to anyone who can
-    // reach the new site (`reverse_proxy.write` is grantable).
-    let authority = upstream
-        .split_once("://")
-        .map_or(upstream, |(_, rest)| rest);
-    let authority = authority.split('/').next().unwrap_or_default();
-    let port = authority
-        .rsplit_once(':')
-        .and_then(|(host, port)| (!host.is_empty()).then_some(port))
-        .and_then(|port| port.parse::<u16>().ok())
-        .context("upstream must include a host and port, such as 127.0.0.1:8080")?;
-    ensure!(
-        ![
-            crate::auth::access::CADDY_ADMIN_PORT,
-            crate::auth::access::SETUP_UPSTREAM_PORT
-        ]
-        .contains(&port),
-        "upstream port {port} is reserved for Caddy's admin API or the setup"
-    );
+    if !upstream.contains(':') {
+        bail!("upstream must include a host and port, such as 127.0.0.1:8080");
+    }
 
     Ok(upstream.to_owned())
 }
@@ -360,10 +348,10 @@ fn list_sites(config_dir: &Path) -> Result<Vec<Value>> {
             .find_map(|line| line.strip_prefix("# tetra: "))
             .and_then(|raw| serde_json::from_str::<SiteMetadata>(raw).ok());
         if let Some(site) = metadata {
-            sites.push(json!({
+            sites.push(jsonf! {
                 "filename": path.file_name().and_then(|name| name.to_str()).unwrap_or_default(),
-                "path": path, "domain": site.domain, "upstream": site.upstream, "tls": site.tls,
-            }));
+                path, site.domain, site.upstream, site.tls,
+            });
         }
     }
 
@@ -391,8 +379,7 @@ pub fn migrate_legacy_sites(legacy_dir: &Path, config_dir: &Path) -> Result<Vec<
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read `{}`", legacy_dir.display()));
+            return Err(error).with_context(|| format!("failed to read `{}`", legacy_dir.display()));
         }
     };
     let mut moved = Vec::new();
@@ -430,15 +417,7 @@ pub fn migrate_legacy_sites(legacy_dir: &Path, config_dir: &Path) -> Result<Vec<
 /// restarting (which would drop active connections). Dry runs report the
 /// command that would run without invoking systemctl.
 fn reload_caddy(action: &str, dry_run: bool, user: Option<&str>) -> Result<Value> {
-    Ok(run_for(
-        &INFO,
-        action,
-        user,
-        "systemctl",
-        ["reload", "caddy.service"],
-        dry_run,
-    )?
-    .into_json())
+    crate::cmd!((dry_run) { &INFO, action, user } "systemctl" ["reload", "caddy.service"] json)
 }
 
 /// Filename of the dashboard's own site.
@@ -578,7 +557,7 @@ impl DashboardSite {
 pub fn write_dashboard_site(config_dir: &Path, contents: &str) -> Result<Value> {
     let path = safe_join(config_dir, DASHBOARD_SITE_FILE)?;
     let changed = crate::auth::store::replace_if_changed(&path, contents.as_bytes(), SITE_MODE)?;
-    Ok(json!({ "path": path, "contents": contents, "changed": changed }))
+    Ok(jsonf! { path, contents, changed })
 }
 
 /// Mode of the sites Tetra writes itself: Caddy runs as `caddy` and only
@@ -642,35 +621,9 @@ pub fn remove_setup_site(config_dir: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::modules::Act;
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-
-    #[test]
-    fn upstreams_need_one_host_and_an_unreserved_port() {
-        for ok in [
-            "127.0.0.1:8080",
-            "[::1]:8080",
-            "localhost:3000",
-            "http://app.lan:80/",
-        ] {
-            validate_upstream(ok).unwrap();
-        }
-        for bad in [
-            "127.0.0.1:2019",
-            "[::1]:2019",
-            "localhost:2019",
-            "http://127.0.0.1:2019/",
-            "127.0.0.1:6624",
-            "127.0.0.1",
-            ":8080",
-            "127.0.0.1:x",
-            "127.0.0.1:1 unix//run/x.sock",
-        ] {
-            assert!(validate_upstream(bad).is_err(), "{bad}");
-        }
-    }
 
     #[test]
     fn renders_caddy_site() {
@@ -772,10 +725,7 @@ mod tests {
             tls: DashboardTls::Dns {
                 provider: "powerdns",
                 fields: vec![
-                    (
-                        "server_url",
-                        DnsValue::Literal("https://ns.example.com".into()),
-                    ),
+                    ("server_url", DnsValue::Literal("https://ns.example.com".into())),
                     ("api_token", DnsValue::Env("TETRA_DNS_API_TOKEN".into())),
                 ],
             },
@@ -855,30 +805,16 @@ mod tests {
         let legacy = dir.path().join("tetra-sites");
         let sites = dir.path().join("Caddyfile.d");
         let site = |domain: &str| {
-            SiteMetadata::new(domain, "127.0.0.1:8080", true)
-                .unwrap()
-                .render()
-                .unwrap()
+            SiteMetadata::new(domain, "127.0.0.1:8080", true).unwrap().render().unwrap()
         };
         // Missing: nothing to do.
-        assert_eq!(
-            migrate_legacy_sites(&legacy, &sites).unwrap(),
-            Vec::<PathBuf>::new()
-        );
+        assert_eq!(migrate_legacy_sites(&legacy, &sites).unwrap(), Vec::<PathBuf>::new());
         fs::create_dir_all(&legacy).unwrap();
-        fs::write(
-            legacy.join("app_example_com.caddy"),
-            site("app.example.com"),
-        )
-        .unwrap();
+        fs::write(legacy.join("app_example_com.caddy"), site("app.example.com")).unwrap();
         // The operator's own files stay, and so does a site whose new name
         // is taken.
         fs::write(legacy.join("mine.caddy"), "mine.example.com {\n}\n").unwrap();
-        fs::write(
-            legacy.join("taken_example_com.caddy"),
-            site("taken.example.com"),
-        )
-        .unwrap();
+        fs::write(legacy.join("taken_example_com.caddy"), site("taken.example.com")).unwrap();
         fs::create_dir_all(&sites).unwrap();
         fs::write(sites.join("taken_example_com.caddyfile"), "operator's\n").unwrap();
 
@@ -887,10 +823,7 @@ mod tests {
         assert!(!legacy.join("app_example_com.caddy").exists());
         assert!(legacy.join("mine.caddy").exists());
         assert!(legacy.join("taken_example_com.caddy").exists());
-        assert_eq!(
-            fs::read_to_string(sites.join("taken_example_com.caddyfile")).unwrap(),
-            "operator's\n"
-        );
+        assert_eq!(fs::read_to_string(sites.join("taken_example_com.caddyfile")).unwrap(), "operator's\n");
         // `list` sees them in its directory, which is where `agent-serve`
         // migrates to: `DEFAULT_CONFIG_DIR` unless a request names another.
         let listed = ReverseProxyModule
@@ -901,10 +834,7 @@ mod tests {
         let default: List = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(default.config_dir, Path::new(DEFAULT_CONFIG_DIR));
         // Once moved, there is nothing left to do.
-        assert_eq!(
-            migrate_legacy_sites(&legacy, &sites).unwrap(),
-            Vec::<PathBuf>::new()
-        );
+        assert_eq!(migrate_legacy_sites(&legacy, &sites).unwrap(), Vec::<PathBuf>::new());
     }
 
     #[test]

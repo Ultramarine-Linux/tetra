@@ -24,8 +24,6 @@ use super::store::{self, Extra, Header, Record, Tolerant};
 pub const TOKEN_PREFIX: &str = "tts_";
 const TOKEN_BYTES: usize = 32;
 const PUBLIC_ID_CHARS: usize = 16;
-/// Live sessions per account; a new one ends the least recently used.
-pub const MAX_SESSIONS_PER_USER: usize = 32;
 
 /// Which local client a connection (and so a token) belongs to, from the
 /// peer's credentials.
@@ -244,19 +242,6 @@ impl SessionStore {
         };
         let mut state = self.lock();
         self.prune(&mut state, now);
-        if let Some(uid) = session.uid {
-            let mut mine: Vec<_> = state
-                .sessions
-                .iter()
-                .filter(|(_, other)| other.uid == Some(uid))
-                .map(|(hash, other)| (other.last_seen, hash.clone()))
-                .collect();
-            mine.sort_unstable();
-            let excess = mine.len().saturating_sub(MAX_SESSIONS_PER_USER - 1);
-            for (_, hash) in mine.into_iter().take(excess) {
-                state.sessions.remove(&hash);
-            }
-        }
         state.sessions.insert(token_hash, session.clone());
         let persisted = self.persist(&mut state);
         drop(state);
@@ -292,46 +277,6 @@ impl SessionStore {
         session.last_seen = now;
         let session = session.clone();
         state.dirty = true;
-        drop(state);
-        Ok(session)
-    }
-
-    /// Look up the live session with the public `id` for `client`, without a
-    /// token: for work a session started that outlives its request (a web
-    /// shell). With `touch`, record a use, as [`Self::validate`] does.
-    ///
-    /// # Errors
-    /// Returns why the session is not usable.
-    pub fn by_id(
-        &self,
-        id: &str,
-        client: ClientKind,
-        touch: bool,
-        now: i64,
-    ) -> Result<Session, SessionError> {
-        let mut state = self.lock();
-        let (hash, session) = state
-            .sessions
-            .iter()
-            .find(|(_, session)| session.id == id)
-            .ok_or(SessionError::Invalid)?;
-        if session.client != client {
-            return Err(SessionError::WrongClient);
-        }
-        let hash = hash.clone();
-        if !live(&self.policy, session, now) {
-            state.sessions.remove(&hash);
-            state.dirty = true;
-            return Err(SessionError::Expired);
-        }
-        let session = state.sessions.get_mut(&hash).ok_or(SessionError::Invalid)?;
-        if touch {
-            session.last_seen = now;
-        }
-        let session = session.clone();
-        if touch {
-            state.dirty = true;
-        }
         drop(state);
         Ok(session)
     }
@@ -658,59 +603,6 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&future("current", 1000))
-        );
-    }
-
-    #[test]
-    fn each_account_keeps_its_most_recently_used_sessions() {
-        let dir = tempfile::tempdir().unwrap();
-        let sessions = store(dir.path());
-        let (first, _) = sessions.issue(new_user(ClientKind::Dashboard), 0).unwrap();
-        let (second, _) = sessions.issue(new_user(ClientKind::Dashboard), 1).unwrap();
-        sessions.validate(&first, ClientKind::Dashboard, 2).unwrap();
-        for now in 3..i64::try_from(MAX_SESSIONS_PER_USER).unwrap() + 2 {
-            sessions
-                .issue(new_user(ClientKind::Dashboard), now)
-                .unwrap();
-        }
-        assert_eq!(sessions.list(|_| true, 100).len(), MAX_SESSIONS_PER_USER);
-        sessions
-            .validate(&first, ClientKind::Dashboard, 100)
-            .unwrap();
-        assert_eq!(
-            sessions.validate(&second, ClientKind::Dashboard, 100),
-            Err(SessionError::Invalid)
-        );
-    }
-
-    #[test]
-    fn sessions_are_found_by_public_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let sessions = store(dir.path());
-        let idle = SessionPolicy::default().idle;
-        let (_, session) = sessions.issue(new_user(ClientKind::Dashboard), 0).unwrap();
-        assert_eq!(
-            sessions.by_id(&session.id, ClientKind::Oobe, false, 1),
-            Err(SessionError::WrongClient)
-        );
-        // Looking without touching does not keep the session alive.
-        sessions
-            .by_id(&session.id, ClientKind::Dashboard, false, idle - 1)
-            .unwrap();
-        let touched = sessions
-            .by_id(&session.id, ClientKind::Dashboard, true, idle - 1)
-            .unwrap();
-        assert_eq!(touched.last_seen, idle - 1);
-        sessions
-            .by_id(&session.id, ClientKind::Dashboard, false, 2 * idle - 2)
-            .unwrap();
-        assert_eq!(
-            sessions.by_id(&session.id, ClientKind::Dashboard, false, 2 * idle),
-            Err(SessionError::Expired)
-        );
-        assert_eq!(
-            sessions.by_id(&session.id, ClientKind::Dashboard, false, 0),
-            Err(SessionError::Invalid)
         );
     }
 

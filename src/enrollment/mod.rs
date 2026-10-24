@@ -10,7 +10,7 @@
 pub mod renewal;
 pub mod store;
 
-use std::{io::Write, path::PathBuf, process::Command, time::Duration};
+use std::{env, io::Write, path::PathBuf, process::Command, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use rcgen::{
@@ -18,7 +18,7 @@ use rcgen::{
     KeyUsagePurpose, PublicKeyData,
 };
 use reqwest::Client;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject as _};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
@@ -122,8 +122,7 @@ pub async fn run(mut options: Options) -> Result<()> {
     let hostname = options
         .hostname
         .take()
-        .or_else(crate::agent::websocket::hostname)
-        .unwrap_or_else(|| "tetra-host".into());
+        .unwrap_or_else(|| env::var("HOSTNAME").unwrap_or_else(|_| "tetra-host".into()));
     let display_name = options
         .display_name
         .take()
@@ -132,15 +131,8 @@ pub async fn run(mut options: Options) -> Result<()> {
     let key_pair = KeyPair::generate().context("failed to generate client key pair")?;
     let csr = certificate_signing_request(&key_pair, &hostname)?;
 
-    // reqwest uses the process-wide provider; `main` installs it, library
-    // callers may not have.
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .ok();
     let client = Client::builder()
         .danger_accept_invalid_certs(options.insecure)
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
         .build()
         .context("failed to create controller HTTP client")?;
     let response = client
@@ -160,13 +152,14 @@ pub async fn run(mut options: Options) -> Result<()> {
         .await
         .context("invalid enrollment response")?;
     if let Some(path) = &options.approval_file {
-        // Atomic, so whatever watches the file never reads half of it.
-        let approval = serde_json::to_vec_pretty(&serde_json::json!({
-            "verification_uri": format!("{}/tetra/device", verification_url.trim_end_matches('/')),
-            "user_code": device.user_code,
-            "expires_in": device.expires_in
-        }))?;
-        crate::auth::store::replace(path, &approval, 0o644)?;
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "verification_uri": format!("{}/tetra/device", verification_url.trim_end_matches('/')),
+                "user_code": device.user_code,
+                "expires_in": device.expires_in
+            }))?,
+        )?;
     }
 
     println!(
@@ -180,31 +173,20 @@ pub async fn run(mut options: Options) -> Result<()> {
     let deadline = std::time::Instant::now()
         .checked_add(Duration::from_secs(device.expires_in))
         .context("enrollment expiry is outside the supported time range")?;
-    let poll_every = Duration::from_secs(device.interval.clamp(1, 60));
     let approval = loop {
-        // A transient network error must not throw away the generated key
-        // (and with it an approval the admin may be about to give).
-        let response = match client
+        let response = client
             .put(format!("{dashboard_url}/api/tetra/device"))
             .json(&serde_json::json!({ "device_code": device.device_code }))
             .send()
             .await
-        {
-            Ok(response) => response,
-            Err(error) if std::time::Instant::now() < deadline => {
-                eprintln!("failed to poll enrollment, retrying: {error}");
-                sleep(poll_every).await;
-                continue;
-            }
-            Err(error) => return Err(error).context("failed to poll enrollment"),
-        };
+            .context("failed to poll enrollment")?;
         let status: PollResponse = check_response(response).await?.json().await?;
         match status.status.as_str() {
             "authorization_pending" => {
                 if std::time::Instant::now() >= deadline {
                     bail!("enrollment expired");
                 }
-                sleep(poll_every).await;
+                sleep(Duration::from_secs(device.interval.max(1))).await;
             }
             "approved" => {
                 break status
@@ -339,7 +321,7 @@ pub(crate) fn check_client_certificate(pem: &str, key_pair: &KeyPair) -> Result<
 }
 
 fn pem_certificates(pem: &str, what: &str) -> Result<Vec<CertificateDer<'static>>> {
-    CertificateDer::pem_slice_iter(pem.as_bytes())
+    rustls_pemfile::certs(&mut pem.as_bytes())
         .collect::<std::result::Result<_, _>>()
         .with_context(|| format!("failed to parse {what} PEM"))
 }
@@ -410,8 +392,7 @@ mod tests {
     fn csr_requests_client_auth() {
         let key_pair = KeyPair::generate().unwrap();
         let csr = certificate_signing_request(&key_pair, "host.example.test").unwrap();
-        let der = rustls::pki_types::CertificateSigningRequestDer::from_pem_slice(csr.as_bytes())
-            .unwrap();
+        let der = rustls_pemfile::csr(&mut csr.as_bytes()).unwrap().unwrap();
         let (_, request) =
             x509_parser::certification_request::X509CertificationRequest::from_der(der.as_ref())
                 .unwrap();

@@ -4,9 +4,8 @@ use serde_json::Value;
 
 /// A command envelope dispatched to the agent.
 ///
-/// This is the single shape every transport (the local session protocol and
-/// outbound WSS) and the `agent-dispatch` CLI all accept. The
-/// [`Dispatcher`](super::Dispatcher) routes
+/// This is the single shape every transport (vsock, WSS) and the local
+/// `agent-dispatch` CLI all accept. The [`Dispatcher`](super::Dispatcher) routes
 /// on `module` + `action` and hands `payload` to the matching module's
 /// `handle` method.
 ///
@@ -26,7 +25,7 @@ pub struct AgentCommand {
     #[serde(default)]
     pub signature: Option<String>,
     /// The host user to run unprivileged actions as. Set by the transport
-    /// after session authentication; not part of the wire format.
+    /// after session authentication; not part of the signed wire format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 }
@@ -34,8 +33,8 @@ pub struct AgentCommand {
 impl AgentCommand {
     /// Reject malformed signature metadata before routing the command.
     ///
-    /// No transport currently verifies command signatures; Tetra-issued
-    /// session tokens or mTLS authenticate the transports that use them.
+    /// Actual cryptographic verification is performed by authenticated
+    /// transports, which have the session context required to verify it.
     ///
     /// # Errors
     /// Returns an error when a signature field is present but empty.

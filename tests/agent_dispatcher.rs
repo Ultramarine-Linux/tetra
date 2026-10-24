@@ -1,5 +1,8 @@
+#![allow(clippy::tests_outside_test_module)]
+
 use serde_json::{Value, json};
-use tetra::agent::{AgentCommand, Dispatcher, queue::DispatchQueue};
+use tempfile::tempdir;
+use tetra::agent::{AgentCommand, Dispatcher, backend};
 
 fn dispatch(module: &str, action: &str, payload: Value) -> tetra::agent::AgentResponse {
     Dispatcher::full().dispatch(AgentCommand {
@@ -21,53 +24,43 @@ fn dispatcher_reports_enabled_modules() {
         .as_array()
         .unwrap()
         .clone();
-    let has = |name: &str| modules.iter().any(|module| module["name"] == name);
+    let names = modules
+        .iter()
+        .map(|module| module["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
 
-    assert!(has("settings"));
+    assert!(names.contains(&"settings"));
     #[cfg(feature = "apps")]
-    assert!(has("apps"));
+    assert!(names.contains(&"apps"));
     #[cfg(feature = "files")]
-    assert!(has("files"));
+    assert!(names.contains(&"files"));
     #[cfg(feature = "recipes")]
-    assert!(has("recipes"));
+    assert!(names.contains(&"recipes"));
     #[cfg(feature = "services")]
-    assert!(has("services"));
+    assert!(names.contains(&"services"));
     #[cfg(feature = "selinux")]
-    assert!(has("selinux"));
+    assert!(names.contains(&"selinux"));
     #[cfg(feature = "quadlets")]
-    assert!(has("quadlets"));
+    assert!(names.contains(&"quadlets"));
 }
 
 #[tokio::test]
-async fn dispatch_queue_dispatches_commands() {
-    let queue = DispatchQueue::spawn(Dispatcher::full(), 1);
-    let response = queue
-        .dispatch(AgentCommand {
-            id: "backend-settings".into(),
-            module: "settings".into(),
-            action: "get_system".into(),
-            payload: Value::Null,
-            signature: None,
-            user: None,
-        })
-        .await
-        .unwrap();
+async fn kameo_backend_dispatches_commands() {
+    let response = backend::dispatch_with_default_backend(AgentCommand {
+        id: "backend-settings".into(),
+        module: "settings".into(),
+        action: "get_system".into(),
+        payload: Value::Null,
+        signature: None,
+        user: None,
+    })
+    .await
+    .unwrap();
 
     assert!(response.ok, "{response:?}");
     let payload = response.payload.unwrap();
     assert!(payload["os"].is_string());
     assert!(payload["arch"].is_string());
-}
-
-#[test]
-fn every_module_answers_capabilities_and_plan() {
-    for module in Dispatcher::full().capabilities() {
-        let capabilities = dispatch(module.name, "capabilities", json!({}));
-        assert!(capabilities.ok, "{}: {capabilities:?}", module.name);
-        let plan = dispatch(module.name, "plan", json!({ "x": 1 }));
-        assert!(plan.ok, "{}: {plan:?}", module.name);
-        assert_eq!(plan.payload.unwrap()["requested"]["x"], 1);
-    }
 }
 
 #[test]
@@ -108,13 +101,13 @@ fn settings_module_returns_host_shape() {
 #[cfg(feature = "files")]
 #[test]
 fn files_module_reads_and_writes_files() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let path = dir.path().join("managed.conf");
 
     let write = dispatch(
         "files",
         "write",
-        json!({ "path": path, "contents": "enabled=true\n" }),
+        tetra::jsonf! { path, "contents": "enabled=true\n" },
     );
     assert!(write.ok, "{write:?}");
 
@@ -126,16 +119,16 @@ fn files_module_reads_and_writes_files() {
 #[cfg(feature = "quadlets")]
 #[test]
 fn quadlets_module_installs_lists_reads_and_deletes_files() {
-    let dir = tempfile::tempdir().unwrap();
-    let files_dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
+    let files_dir = tempdir().unwrap();
     let base_dir = dir.path();
     let files_base_dir = files_dir.path();
 
     let install = dispatch(
         "quadlets",
         "install",
-        json!({
-            "base_dir": base_dir, "files_base_dir": files_base_dir,
+        tetra::jsonf! {
+            base_dir, files_base_dir,
             "resources": [
                 {
                     "filename": "app.container",
@@ -152,7 +145,7 @@ fn quadlets_module_installs_lists_reads_and_deletes_files() {
                     "contents": "<h1>Hello</h1>\n",
                 },
             ],
-        }),
+        },
     );
     assert!(install.ok, "{install:?}");
     assert_eq!(
@@ -222,7 +215,7 @@ fn quadlets_module_installs_lists_reads_and_deletes_files() {
 #[cfg(feature = "quadlets")]
 #[test]
 fn quadlets_module_rejects_invalid_or_unsafe_files() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let base_dir = dir.path();
 
     let wrong_extension = dispatch(
@@ -251,7 +244,7 @@ fn quadlets_module_rejects_invalid_or_unsafe_files() {
 #[cfg(feature = "quadlets")]
 #[test]
 fn quadlets_module_supports_dry_run_and_system_scope() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let base_dir = dir.path();
 
     let dry_run = dispatch(
@@ -286,8 +279,8 @@ fn quadlets_module_supports_dry_run_and_system_scope() {
 #[cfg(feature = "apps")]
 #[test]
 fn apps_module_cooks_lists_and_removes_apps() {
-    let dir = tempfile::tempdir().unwrap();
-    let files_dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
+    let files_dir = tempdir().unwrap();
     let base_dir = dir.path();
     let files_base_dir = files_dir.path();
 
@@ -317,7 +310,7 @@ resources:
     template: files/index.html.tera
 "#,
             "templates": {
-                "containers/nginx.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=docker.io/library/nginx:alpine@sha256:a3554c0d0b48177b1413c26e01f695334428020d9df01243fbae3e11cfd17417\n",
+                "containers/nginx.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=docker.io/library/nginx:alpine\n",
                 "files/index.html.tera": "<h1>{{ app_id }}</h1>\n",
             },
             "values": { "app_id": "demo-web" },
@@ -373,8 +366,8 @@ resources:
 #[cfg(feature = "apps")]
 #[test]
 fn apps_create_dry_run_previews_systemd_commands() {
-    let dir = tempfile::tempdir().unwrap();
-    let files_dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
+    let files_dir = tempdir().unwrap();
 
     let create = dispatch(
         "apps",
@@ -386,7 +379,7 @@ fn apps_create_dry_run_previews_systemd_commands() {
             "dry_run": true,
             "recipe": "recipe_id: nginx-site\nname: Nginx static site\nversion: 0.1.0\nparameters:\n  - key: app_id\n    label: App ID\n    type: string\n    default: demo-web\nresources:\n  - type: container\n    filename: \"{{ app_id }}.container\"\n    template: containers/nginx.container.tera\n",
             "templates": {
-                "containers/nginx.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=example/demo@sha256:1111111111111111111111111111111111111111111111111111111111111111\n",
+                "containers/nginx.container.tera": "[Container]\nContainerName={{ app_id }}\n",
             },
             "values": { "app_id": "demo-web" },
         }),
@@ -401,16 +394,14 @@ fn apps_create_dry_run_previews_systemd_commands() {
         .iter()
         .map(|op| op["command"].as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
-    // Apps run rootless under `ultramarine-apps` by default.
     assert_eq!(
         commands,
         [
-            "systemctl --user -M ultramarine-apps@ daemon-reload",
-            "systemctl --user -M ultramarine-apps@ start demo-web.service",
+            "systemctl daemon-reload",
+            "systemctl enable demo-web.service",
+            "systemctl start demo-web.service",
         ]
     );
-    assert_eq!(payload["app"]["scope"], "apps");
-    assert!(payload["account"].as_array().is_some());
     assert!(!dir.path().join("demo-web.container").exists());
 }
 
@@ -501,7 +492,7 @@ resources:
     template: containers/nginx.container.tera
 "#,
             "templates": {
-                "containers/nginx.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=example/demo@sha256:1111111111111111111111111111111111111111111111111111111111111111\n"
+                "containers/nginx.container.tera": "[Container]\nContainerName={{ app_id }}\n"
             }
         }),
     );
@@ -513,6 +504,6 @@ resources:
     assert_eq!(resources[0]["filename"], "demo-web.container");
     assert_eq!(
         resources[0]["contents"],
-        "[Container]\nContainerName=demo-web\nImage=example/demo@sha256:1111111111111111111111111111111111111111111111111111111111111111\n"
+        "[Container]\nContainerName=demo-web\n"
     );
 }

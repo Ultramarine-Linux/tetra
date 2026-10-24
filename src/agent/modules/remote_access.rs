@@ -27,16 +27,15 @@
 //! and forget its drop-in (and cloudflared's token), even when the service is
 //! missing.
 
-use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
+use std::{
+    io::Write as _,
+    os::unix::fs::OpenOptionsExt as _,
+};
 
-use serde_json::json;
-
-use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 use crate::agent::module_support::{
-    Commands, ModuleInfo, ModuleStatus, NoPayload, drop_in, install_drop_in, parse_action, run,
-    unit_enabled,
+    Commands, NoPayload, drop_in, install_drop_in, parse_action, unit_enabled,
 };
 use crate::auth::{
     access::{AccessConfig, HTTPS_PORT},
@@ -179,6 +178,9 @@ impl Mod for RemoteAccessWithPaths {
 }
 
 fn handle(paths: &Paths, action: &str, payload: Value) -> Result<Value> {
+    if let Some(response) = INFO.metadata_response(action, &payload) {
+        return Ok(response);
+    }
     let action: Action = parse_action(action, payload)?;
     match action {
         Action::Status(NoPayload {}) => Ok(status()),
@@ -281,44 +283,31 @@ fn tailscale_up(
     let had_drop_in = paths.drop_in(TAILSCALED).exists();
     let new_drop_in = install_drop_in(&paths.drop_in(TAILSCALED), TAILSCALED_DROP_IN, dry_run)?;
     let mut commands = Commands::new(dry_run);
-    let result = bring_up_tailscale(
-        paths,
-        &mut commands,
-        auth_key,
-        new_drop_in,
-        serve,
-        funnel,
-        port,
-    );
+    let result =
+        bring_up_tailscale(paths, &mut commands, auth_key, new_drop_in, serve, funnel, port);
     if let Err(error) = result {
         if dry_run {
             return Err(error);
         }
         let mut undo = Commands::new(false);
-        return Err(
-            match undo_tailscale_up(paths, was_running, had_drop_in, &mut undo) {
-                Ok(()) => error,
-                Err(undo) => {
-                    anyhow::anyhow!("{error:#}; undoing the Tailscale setup also failed: {undo:#}")
-                }
-            },
-        );
+        return Err(match undo_tailscale_up(paths, was_running, had_drop_in, &mut undo) {
+            Ok(()) => error,
+            Err(undo) => anyhow::anyhow!(
+                "{error:#}; undoing the Tailscale setup also failed: {undo:#}"
+            ),
+        });
     }
     // The name the OOBE should give `access.set`.
-    let hostname = if dry_run {
-        None
-    } else {
-        current_tailnet_hostname()
-    };
-    Ok(json!({
+    let hostname = if dry_run { None } else { current_tailnet_hostname() };
+    Ok(jsonf! {
         "enabled": true,
         "serve": serve || funnel,
-        "funnel": funnel,
+        funnel,
         "target": forward_target(port),
-        "hostname": hostname,
-        "dry_run": dry_run,
+        hostname,
+        dry_run,
         "commands": commands.done,
-    }))
+    })
 }
 
 /// Where Tailscale forwards `port`: Caddy on the same port.
@@ -377,14 +366,7 @@ fn bring_up_tailscale(
         let forward = if funnel { "funnel" } else { "serve" };
         commands.run(
             "timeout",
-            &[
-                TAILSCALE_TIMEOUT,
-                "tailscale",
-                forward,
-                "--bg",
-                &tcp,
-                &target,
-            ],
+            &[TAILSCALE_TIMEOUT, "tailscale", forward, "--bg", &tcp, &target],
         )?;
     }
     Ok(())
@@ -435,7 +417,8 @@ fn tailscale_disable(paths: &Paths, dry_run: bool) -> Result<Value> {
     // Fails when tailscaled is not running; nothing to reset then.
     commands.run_ignoring_failure("tailscale", &["serve", "reset"]);
     // Fails when tailscaled is not installed; clean up anyway.
-    let disabled = commands.run_ignoring_failure("systemctl", &["disable", "--now", TAILSCALED]);
+    let disabled =
+        commands.run_ignoring_failure("systemctl", &["disable", "--now", TAILSCALED]);
     let drop_in = paths.drop_in(TAILSCALED);
     let removed = if dry_run {
         drop_in.exists()
@@ -446,7 +429,7 @@ fn tailscale_disable(paths: &Paths, dry_run: bool) -> Result<Value> {
         commands.run("systemctl", &["daemon-reload"])?;
     }
     let enabled = !disabled && unit_enabled(TAILSCALED);
-    Ok(json!({ "enabled": enabled, "dry_run": dry_run, "commands": commands.done }))
+    Ok(jsonf! { enabled, dry_run, "commands": commands.done })
 }
 
 /// The `cloudflared.service` drop-in that hands it the sealed token.
@@ -463,11 +446,7 @@ fn cloudflared_drop_in(credential: &Path) -> String {
 }
 
 /// Seal the token and install the drop-in. Returns the drop-in's path.
-fn install_cloudflared_token(
-    paths: &Paths,
-    sealer: &dyn Sealer,
-    token: &Credential,
-) -> Result<PathBuf> {
+fn install_cloudflared_token(paths: &Paths, sealer: &dyn Sealer, token: &Credential) -> Result<PathBuf> {
     let credential = paths
         .secret_store()
         .put(sealer, CLOUDFLARED_TOKEN, token.0.as_bytes())?;
@@ -493,41 +472,31 @@ fn cloudflared_set_token(
     commands.run("systemctl", &["enable", CLOUDFLARED])?;
     // Restart, so a new token replaces a running tunnel.
     commands.run("systemctl", &["restart", CLOUDFLARED])?;
-    Ok(json!({
-        "enabled": true,
-        "drop_in": drop_in,
-        "dry_run": dry_run,
-        "commands": commands.done,
-    }))
+    Ok(jsonf! { "enabled": true, drop_in, dry_run, "commands": commands.done })
 }
 
 fn cloudflared_disable(paths: &Paths, dry_run: bool) -> Result<Value> {
     let mut commands = Commands::new(dry_run);
     // Fails when cloudflared is not installed; clean up anyway.
-    let disabled = commands.run_ignoring_failure("systemctl", &["disable", "--now", CLOUDFLARED]);
-    let drop_in = paths.drop_in(CLOUDFLARED);
-    let removed = if dry_run {
-        drop_in.exists()
-    } else {
+    let disabled =
+        commands.run_ignoring_failure("systemctl", &["disable", "--now", CLOUDFLARED]);
+    if !dry_run {
+        store::remove(&paths.drop_in(CLOUDFLARED))?;
         paths.secret_store().remove(CLOUDFLARED_TOKEN)?;
-        store::remove_if_exists(&drop_in)?
-    };
-    if removed {
-        commands.run("systemctl", &["daemon-reload"])?;
     }
+    commands.run("systemctl", &["daemon-reload"])?;
     let enabled = !disabled && unit_enabled(CLOUDFLARED);
-    Ok(json!({ "enabled": enabled, "dry_run": dry_run, "commands": commands.done }))
+    Ok(jsonf! { enabled, dry_run, "commands": commands.done })
 }
 
 fn unit_active(unit: &str) -> bool {
-    run("systemctl", ["is-active", "--quiet", unit]).is_ok()
+    crate::cmd!("systemctl" ["is-active", "--quiet", unit]).is_ok()
 }
 
 fn status() -> Value {
-    let mut tailscale =
-        json!({ "enabled": unit_enabled(TAILSCALED), "serve": false, "funnel": false });
+    let mut tailscale = jsonf! { "enabled": unit_enabled(TAILSCALED), "serve": false, "funnel": false };
     if unit_active(TAILSCALED) {
-        if let Some(serve) = run("tailscale", ["serve", "status", "--json"])
+        if let Some(serve) = crate::cmd!("tailscale" ["serve", "status", "--json"])
             .ok()
             .and_then(|result| serde_json::from_str(&result.stdout).ok())
         {
@@ -539,10 +508,10 @@ fn status() -> Value {
             tailscale["hostname"] = hostname.into();
         }
     }
-    json!({
-        "tailscale": tailscale,
+    jsonf! {
+        tailscale,
         "cloudflared": { "enabled": unit_enabled(CLOUDFLARED) },
-    })
+    }
 }
 
 /// Whether `tailscale serve status --json` shows anything served, and
@@ -563,7 +532,7 @@ fn serve_state(status: &Value) -> (bool, bool) {
 
 /// This node's `MagicDNS` name, if tailscaled is up and logged in.
 fn current_tailnet_hostname() -> Option<String> {
-    run("tailscale", ["status", "--json", "--self"])
+    crate::cmd!("tailscale" ["status", "--json", "--self"])
         .ok()
         .and_then(|result| serde_json::from_str(&result.stdout).ok())
         .and_then(|status: Value| tailnet_hostname(&status))
@@ -675,10 +644,7 @@ mod tests {
         let key = Credential(KEY.into());
         for dry_run in [false, true] {
             let error = tailscale_up(&paths, &key, true, false, dry_run).unwrap_err();
-            assert!(
-                format!("{error:#}").contains("dashboard's port"),
-                "{error:#}"
-            );
+            assert!(format!("{error:#}").contains("dashboard's port"), "{error:#}");
         }
     }
 
@@ -714,7 +680,8 @@ mod tests {
 
     #[test]
     fn the_serve_default_and_funnel_are_explicit() {
-        let payload: TailscaleUp = serde_json::from_value(json!({"auth_key": KEY})).unwrap();
+        let payload: TailscaleUp =
+            serde_json::from_value(json!({"auth_key": KEY})).unwrap();
         assert!(payload.serve);
         assert!(!payload.funnel);
         assert!(!format!("{payload:?}").contains(KEY));
@@ -774,8 +741,8 @@ mod tests {
     fn cloudflared_token_is_sealed_and_loaded_as_a_systemd_credential() {
         let dir = tempfile::tempdir().unwrap();
         let paths = paths(dir.path());
-        let drop_in =
-            install_cloudflared_token(&paths, &FakeSealer, &Credential(TOKEN.into())).unwrap();
+        let drop_in = install_cloudflared_token(&paths, &FakeSealer, &Credential(TOKEN.into()))
+            .unwrap();
         assert_eq!(
             drop_in,
             paths
@@ -789,11 +756,7 @@ mod tests {
             credential.display()
         )));
         assert!(unit.contains("Environment=TUNNEL_TOKEN_FILE=%d/tetra-cloudflared-token\n"));
-        assert!(
-            unit.contains(
-                "ExecStart=\nExecStart=/usr/bin/cloudflared --no-autoupdate tunnel run\n"
-            )
-        );
+        assert!(unit.contains("ExecStart=\nExecStart=/usr/bin/cloudflared --no-autoupdate tunnel run\n"));
         assert!(!unit.contains(TOKEN));
         // Sealed under the credential name systemd checks it against.
         assert_eq!(
@@ -899,10 +862,7 @@ mod tests {
         assert!(install_drop_in(&drop_in, TAILSCALED_DROP_IN, false).unwrap());
         assert_eq!(
             undo(false, false),
-            [
-                "systemctl disable --now tailscaled.service",
-                "systemctl daemon-reload"
-            ]
+            ["systemctl disable --now tailscaled.service", "systemctl daemon-reload"]
         );
         assert!(!drop_in.exists());
 

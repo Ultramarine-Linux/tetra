@@ -3,30 +3,24 @@
 Tetra is a modular host agent and recipe renderer for the [Ultramarine Server Dashboard](https://github.com/Ultramarine-Linux/dashboard).
 It is organized around a single dispatcher with independent,
 feature-gated modules for apps, files, recipes, SELinux, services, Quadlets,
-reverse proxy (Caddy), Podman, Samba, NFS, users, storage, network, power,
-updates, remote access (Tailscale, Cloudflare Tunnel), and virtual machines.
-The `settings` module is always compiled so the control plane can discover
-basic host facts.
+reverse-proxy, Podman, Samba, NFS, users, and virtual machines. The `settings`
+module is always compiled so the control plane can discover basic host facts.
 
 Local clients (the dashboard container and the server OOBE) talk to Tetra over
 a Unix socket at `/run/tetra/tetra.sock` (`agent-serve`). This is the only
 listener a production install runs; Tetra does not listen on the network.
 Tetra identifies the client from the socket's peer credentials and is the only
 authority for login and authorization: users log in with a password (PAM) plus
-TOTP, or a passkey, and every request after login carries a Tetra-issued
-session token (login, setup-code redemption, the app access check and
-`shell.open` take none; see the "no token" operations). See
+TOTP, or a passkey, and every request carries a Tetra-issued session token. See
 [docs/auth-protocol.md](docs/auth-protocol.md).
 
-An outbound mTLS WSS connection (`wss://` only) to a remote control plane also
-exists. It is off unless `remote.enabled` is set in `/etc/tetra/tetra.json`.
+An outbound mTLS WSS connection to a remote control plane also exists. It is
+off unless `remote.enabled` is set in `/etc/tetra/tetra.json`. When the agent runs inside a VM, the same JSON frame protocol can
+be carried over a virtio-vsock stream.
 
-For development, `agent-ws-serve` (the `dev-listener` feature) serves the
-same Tetra session protocol as the Unix socket over loopback TCP. TCP has no
-peer credentials, so `--client dashboard|oobe` (default `dashboard`) applies
-to every connection; any local process can claim that client identity, but
-still needs a valid Tetra session. It is dev-only and refuses non-loopback
-binds. See [the session protocol](docs/auth-protocol.md#development-tcp-listener).
+For development, `agent-ws-serve` runs the older controller-key WebSocket
+protocol (Ed25519-signed command frames) on a TCP listener. It is only compiled with the `dev-listener`
+feature, so release builds cannot listen on the network.
 
 The local `agent-dispatch` command accepts the same command envelope shape for
 one-shot debugging. See [docs/agent-protocol.md](docs/agent-protocol.md) for
@@ -44,7 +38,7 @@ to render.
 - [Recipe authoring guide](docs/recipes.md) — How to write recipes, parameters, templates, and resources.
 - [Architecture overview](docs/architecture.md) — Crate layout, dispatcher, queue, transports, and how to add a module.
 - [Remote enrollment](docs/remote-enrollment.md) — The controller side of `tetra enroll` and the outbound mTLS connection.
-- [Troubleshooting](docs/troubleshooting.md) — Common issues with TLS, identity, the development listener, recipe rendering, SELinux, and queue backpressure.
+- [Troubleshooting](docs/troubleshooting.md) — Common issues with TLS, identity, WebSocket auth, recipe rendering, SELinux, and queue backpressure.
 
 ## Feature Flags
 
@@ -63,17 +57,12 @@ Default build features:
 - `users`
 - `storage`
 - `network`
-- `power`
-- `updates`
-- `remote-access`
 
 Additional optional features:
 
 - `virtual-machines`
-- `dev-listener`: the development-only loopback TCP session listener
-  (`agent-ws-serve`). Leave it off in release builds.
-- `testing`: exposes `tetra::auth::testing` (fake PAM, accounts, sealer and
-  host) for integration tests.
+- `dev-listener`: the development TCP listener (`agent-ws-serve`). Leave it
+  off in release builds.
 
 Build with every module:
 
@@ -129,14 +118,11 @@ The one-shot CLI accepts the same JSON command envelope used by transports:
 }
 ```
 
-Run it (without a file it reads the command from stdin):
+Run it:
 
 ```sh
 cargo run -- agent-dispatch examples/settings.command.json
 ```
-
-`agent-dispatch` calls the modules directly, with no login, authorization or
-action log, so use it only for local debugging.
 
 `examples/apps.command.json` shows a dry-run `apps.create` that cooks an
 inline recipe into an installed app bundle.
@@ -160,31 +146,27 @@ cargo run -- agent-serve \
 Clients open a WebSocket over the Unix stream; the HTTP `Host` and path are
 ignored. With Node's `ws`, use `ws+unix:///run/tetra/tetra.sock`.
 
-### Loopback session server (development)
+### Inbound WebSocket server (development)
 
-`agent-ws-serve` runs the host daemon on loopback TCP instead of the Unix
-socket. It is only built with `dev-listener`; it uses the same `AuthService`,
-PAM/TOTP or passkey login, session tokens, grants, and action log as
-`agent-serve`. On a server, this normally means running it as root; the
-example uses scratch state so it does not reuse the host's login database:
+`agent-ws-serve` runs an authenticated WebSocket on TCP. It is only built
+with the `dev-listener` feature (add `--features dev-listener` to the commands
+below). It requires an enrolled controller Ed25519 public key before accepting commands.
+The host identity is automatically generated under `/var/lib/tetra/identity`:
 
 ```sh
-cargo build --features dev-listener
-sudo target/debug/tetra agent-ws-serve \
-  --listen 127.0.0.1:7780 --client dashboard \
-  --identity-dir /tmp/tetra-identity --state-dir /tmp/tetra-state
+cargo run --features dev-listener -- agent-ws-serve \
+  --listen 127.0.0.1:7780 \
+  --controller-public-key "$TETRA_CONTROLLER_PUBLIC_KEY"
 ```
 
-`--client` accepts `dashboard` or `oobe` and defaults to `dashboard`. Since
-TCP has no peer credentials, the selected client is applied to every
-connection; any local process that reaches the port gets that client identity,
-but every operation still needs what it needs on the socket (a valid Tetra
-session, except the "no token" ones such as login). `--listen` rejects
-non-loopback addresses. TLS is omitted because this
-loopback-only development endpoint is not a remote transport and cannot replace
-the process credentials of the Unix socket. Use the Unix socket in production.
-See [docs/auth-protocol.md](docs/auth-protocol.md#development-tcp-listener)
-for connection and frame details.
+For non-loopback addresses, TLS is required:
+
+```sh
+cargo run --features dev-listener -- agent-ws-serve \
+  --listen 0.0.0.0:7780 \
+  --tls-cert /etc/tetra/tetra.crt \
+  --tls-key /etc/tetra/tetra.key
+```
 
 ### Outbound WSS control plane (remote control)
 
@@ -234,6 +216,27 @@ cargo run -- agent-connect --config examples/transport.json --host-id myhost \
   --runtime-config examples/tetra.json
 ```
 
+### Vsock smoke test
+
+For a VM guest with virtio-vsock enabled, run Tetra as a small test listener
+inside the guest:
+
+```sh
+cargo run --all-features -- agent-vsock-serve --port 2048
+```
+
+From the VM host, connect to the guest CID and send one command JSON object.
+For libvirt guests, find the CID with `virsh dumpxml VM_NAME | grep -A4 -i vsock`.
+
+```sh
+printf '%s' '{"id":"cmd-1","module":"settings","action":"get_system","payload":{}}' \
+  | socat - VSOCK-CONNECT:GUEST_CID:2048
+```
+
+The listener reads one command per connection and writes one `AgentResponse`
+JSON object. This is a development smoke test for host-to-guest command
+dispatch over vsock.
+
 ## Systemd
 
 `systemd/tetra.socket` creates `/run/tetra/tetra.sock` as `root:tetra`, mode
@@ -242,8 +245,7 @@ cargo run -- agent-connect --config examples/transport.json --host-id myhost \
 state under `/var/lib/tetra` (root only). The service does not bind a TCP port.
 `systemd/tetra-setup-code.service` shows the first-boot setup code on the
 console until setup completes. `pam/ultramarine-dashboard` is the PAM service
-used for dashboard passwords and `pam/tetra-shell` the one web shells run
-(`agent-serve --shell-pam-service`); both belong in `/etc/pam.d`.
+used for dashboard passwords and belongs in `/etc/pam.d`.
 
 `systemd/tetra.sysusers.conf` creates the `tetra` group with the fixed GID
 **241**, chosen from Fedora's system range (201–999) outside the 0–200 range
@@ -255,50 +257,6 @@ Quadlet, `Volume=/run/tetra/tetra.sock:/run/tetra/tetra.sock` and
 does not change existing groups, and falls back to a dynamic GID if 241 is
 taken); `agent-serve` logs a warning in that case, and the group has to be
 fixed with `groupmod -g 241 tetra`.
-
-### The apps account
-
-User apps run rootless under one system account, `ultramarine-apps`, which
-`systemd/tetra.sysusers.conf` also creates, with the fixed UID and GID
-**242** (same range and reasoning as the `tetra` group) and the home
-`/var/lib/ultramarine-apps`. It cannot log in: no password, `nologin` shell,
-and Tetra refuses it as a dashboard user. Packaging:
-
-- Install `systemd/tetra.sysusers.conf` as
-  `/usr/lib/sysusers.d/tetra.conf` and `systemd/tetra.tmpfiles.conf` as
-  `/usr/lib/tmpfiles.d/tetra.conf` (`%sysusers_create_compat` and
-  `%tmpfiles_create` in the spec; bootc images apply both at boot).
-  `systemd-sysusers` only records the home, so the tmpfiles snippet creates
-  it (`0700`, owned by the account).
-- **Linger.** The tmpfiles snippet also creates
-  `/var/lib/systemd/linger/ultramarine-apps`, which is what
-  `loginctl enable-linger` records: logind starts the account's user manager
-  at boot, so app services run without a login. Tetra runs
-  `loginctl enable-linger` itself if the flag is missing.
-- **Subordinate IDs.** Rootless Podman needs `/etc/subuid` and `/etc/subgid`
-  ranges, which `systemd-sysusers` does not allocate (and `useradd -r` only
-  does with `-F`). Tetra adds them on the first `apps.create`/`update` that
-  converges: the first free 65536 IDs from 524288 (Fedora's
-  `SUB_UID_MIN`/`SUB_UID_COUNT`), with `usermod --add-subuids FIRST-LAST
-  --add-subgids FIRST-LAST ultramarine-apps`, skipped when the account (by
-  name or UID) already has a range. Doing it at runtime rather than in a
-  scriptlet keeps it right on bootc, where `/etc` is per machine and the
-  account only exists after the first boot.
-- **SELinux.** A home under `/var/lib` gets none of the `HOME_DIR` rules that
-  label rootless storage in `/home`, so Tetra adds `semanage fcontext -a -e
-  /var/lib/containers/storage
-  /var/lib/ultramarine-apps/.local/share/containers/storage` unless
-  `file_contexts.subs` already has it, creates the storage and relabels it
-  with `restorecon -R`, once (recorded in
-  `/var/lib/tetra/apps-storage-labels`). Images may apply the same rule at
-  build time instead.
-- `agent-serve` logs a warning when the account is missing or its UID/GID is
-  not 242 (`usermod -u 242 -g 242` fixes it; files in the home must then be
-  re-owned).
-
-Apps installed by earlier releases are system-scope (rootful) and keep
-working with `"scope": "system"`; Tetra does not migrate them. See the
-`apps` section of [docs/agent-protocol.md](docs/agent-protocol.md).
 
 ## Host enrollment
 
@@ -360,14 +318,12 @@ The controller-side API is described in
 ## Authentication and Authorization
 
 Local clients authenticate users through Tetra and send a session token with
-every request after login (the "no token" operations aside); Tetra authorizes each action from the user's admin status
+every request; Tetra authorizes each action from the user's admin status
 (`ultramarine-admin` or `wheel`) and per-page grants. See
 [docs/auth-protocol.md](docs/auth-protocol.md). Outbound WSS uses mTLS for
 transport identity, with the client certificate issued by `tetra enroll`; its
-commands run with full rights, always as root, and are recorded as remote
-actions. Commands are not signed on either production transport. The
-development TCP listener uses the same Tetra-issued session protocol as the
-Unix socket.
+commands run with full rights and are recorded as remote actions. The
+development TCP listener still uses Ed25519 controller-key authentication.
 
 Console recovery: `sudo tetra auth reset-2fa <user>` removes a user's TOTP and
 recovery codes, and `sudo tetra setup code` prints the first-boot setup code. On a host that

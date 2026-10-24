@@ -1,5 +1,6 @@
 //! Passkey registration and login against a software authenticator, and the
 //! access configuration that decides whether passkeys are available.
+#![allow(clippy::tests_outside_test_module)]
 
 mod common;
 
@@ -200,10 +201,7 @@ async fn passkeys_are_unavailable_without_a_domain() {
         ErrorCode::PasskeysUnavailable,
     )
     .await;
-    assert_eq!(
-        host.service.hello().await.unwrap()["passkeys_available"],
-        false
-    );
+    assert_eq!(host.service.hello()["passkeys_available"], false);
 }
 
 #[cfg(feature = "reverse-proxy")]

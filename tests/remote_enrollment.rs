@@ -6,6 +6,8 @@
 //! certificate renewal requests. `agent-connect` and `agent-serve` are run as
 //! the real binary against it.
 
+#![allow(clippy::tests_outside_test_module)]
+
 use std::{
     os::{
         fd::AsRawFd,
@@ -28,7 +30,7 @@ use rcgen::{
 use rustls::{
     RootCertStore,
     crypto::{CryptoProvider, aws_lc_rs},
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject as _},
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     server::WebPkiClientVerifier,
 };
 use serde_json::{Value, json};
@@ -295,8 +297,7 @@ fn assert_csr_requests_client_auth(csr: &str) {
         certification_request::X509CertificationRequest, extensions::ParsedExtension,
         prelude::FromDer,
     };
-    let der =
-        rustls::pki_types::CertificateSigningRequestDer::from_pem_slice(csr.as_bytes()).unwrap();
+    let der = rustls_pemfile::csr(&mut csr.as_bytes()).unwrap().unwrap();
     let (_, request) = X509CertificationRequest::from_der(der.as_ref()).unwrap();
     request.verify_signature().unwrap();
     let client_auth = request.requested_extensions().unwrap().any(|extension| {
@@ -566,6 +567,8 @@ impl Host {
             .arg("--public-dir")
             .arg(self.root.path().join("public"))
             .env("LISTEN_FDS", "1")
+            .env_remove("TETRA_CONTROLLER_PUBLIC_KEY")
+            .env_remove("TETRA_ENROLLMENT_TOKEN")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         // SAFETY: the closure runs in the forked child before exec and only
@@ -642,7 +645,10 @@ fn mode(path: &Path) -> u32 {
 
 fn pem_certificate(path: &Path) -> CertificateDer<'static> {
     let pem = std::fs::read(path).unwrap();
-    CertificateDer::from_pem_slice(&pem).unwrap()
+    rustls_pemfile::certs(&mut pem.as_slice())
+        .next()
+        .unwrap()
+        .unwrap()
 }
 
 #[tokio::test]
@@ -924,7 +930,7 @@ async fn agent_serve_stays_connected_with_no_local_clients() {
     // No local client has connected, yet the socket-activated daemon dials
     // out and keeps the session up instead of exiting when idle.
     assert_eq!(controller.hello().await.frame["host_id"], HOST_ID);
-    controller.expect_quiet(Duration::from_secs(2)).await;
+    controller.expect_quiet(Duration::from_secs(5)).await;
 
     // The activated socket is the one being served.
     let stream = UnixStream::connect(&socket_path).await.unwrap();

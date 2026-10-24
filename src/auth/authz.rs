@@ -13,11 +13,9 @@
 //!   never be granted: managing users, reading or writing files (the files
 //!   module runs as root on any path), changing settings and
 //!   SELinux, mounting or configuring storage, and anything that manages
-//!   rootful systemd units, containers or VMs. App management stays
-//!   admin-only even though apps now run rootless under `ultramarine-apps`:
-//!   its payloads read recipes from host paths and relabel paths as root
-//!   (`selinux`), and every app shares the account, so one app's units could
-//!   read another's secrets.
+//!   rootful systemd units, containers or VMs. Apps are installed as system-scope units today, so app management is
+//!   admin-only too; it becomes grantable once apps run rootless under
+//!   `ultramarine-apps`.
 //! - Actions missing from the table are admin-only, so a new action is never
 //!   accidentally open. A test checks that every action of every compiled
 //!   module is listed.
@@ -26,20 +24,14 @@
 //!   individually; actions in [`SETUP_ONLY_WITHOUT_ADMIN`] only while no
 //!   eligible administrator exists, and actions in
 //!   [`SETUP_OWN_ACCOUNTS_ONLY`] only on accounts the session created.
-//! - Every signed-in user may open their own web shell (`shell.open`, as
-//!   [`Requirement::Authenticated`]); it runs as that user, never as root.
-//!   The setup session may not.
 //! - Remote controllers (the outbound mTLS control plane) may run everything;
 //!   their actions are recorded in the audit log.
 
-use std::{collections::BTreeMap, sync::Arc};
-
-use serde_json::json;
+use std::collections::BTreeMap;
 
 use crate::prelude::*;
-use crate::types::{EXPORTS_PATH, SAMBA_CONFIG_PATH};
 
-use super::store::{self, Cached, Extra, Header, Record, StoreLock, Tolerant};
+use super::store::{self, Extra, Header, Record, StoreLock, Tolerant};
 
 /// A dashboard page that permissions are grouped by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -141,12 +133,6 @@ const TABLE: &[(&str, &str, Requirement)] = &[
     ("launcher", "remove", AdminOnly),
     ("launcher", "public_get", AdminOnly),
     ("launcher", "public_set", AdminOnly),
-    // The web shell (`shell.ticket`, then `shell.open`) is an operation, not
-    // a module. It runs the user's own login shell as that user, never as
-    // root (elevation is `sudo` inside it), so every signed-in user may open
-    // one. Listed so it can become a page grant later; the setup session
-    // never gets one.
-    ("shell", "open", Authenticated),
     // System units and their journal: viewing can be granted, managing them
     // is admin-only.
     ("services", "list", page(SystemServices, View)),
@@ -164,8 +150,7 @@ const TABLE: &[(&str, &str, Requirement)] = &[
     ("apps", "update", AdminOnly),
     ("apps", "remove", AdminOnly),
     ("quadlets", "list", page(Apps, View)),
-    // Unit files hold app secrets (`Environment=MYSQL_PASSWORD=...`).
-    ("quadlets", "read", AdminOnly),
+    ("quadlets", "read", page(Apps, View)),
     ("quadlets", "validate", page(Apps, View)),
     ("quadlets", "list_files", page(Apps, View)),
     ("quadlets", "write", AdminOnly),
@@ -175,9 +160,7 @@ const TABLE: &[(&str, &str, Requirement)] = &[
     // root (and `render` can write rendered files anywhere); the inline forms
     // take their input in the payload.
     ("recipes", "render", AdminOnly),
-    // Tera loops nest, so an inline template can pin the serial dispatch
-    // queue (or exhaust memory) for everyone.
-    ("recipes", "render_inline", AdminOnly),
+    ("recipes", "render_inline", page(Apps, View)),
     ("recipes", "context", AdminOnly),
     ("recipes", "context_inline", page(Apps, View)),
     ("podman", "containers", page(Containers, View)),
@@ -199,15 +182,13 @@ const TABLE: &[(&str, &str, Requirement)] = &[
     ("storage", "configure", AdminOnly),
     ("samba", "list_shares", page(Sharing, View)),
     ("samba", "get_config", page(Sharing, View)),
-    // The whole smb.conf/exports file is root-equivalent (`root preexec`,
-    // `no_root_squash`), and so is its nested `selinux` relabel.
-    ("samba", "set_config", AdminOnly),
+    ("samba", "set_config", page(Sharing, Manage)),
     ("samba", "reload", page(Sharing, Manage)),
     ("samba", "enable", AdminOnly),
     ("samba", "disable", AdminOnly),
     ("nfs", "list_exports", page(Sharing, View)),
     ("nfs", "get_config", page(Sharing, View)),
-    ("nfs", "set_config", AdminOnly),
+    ("nfs", "set_config", page(Sharing, Manage)),
     ("nfs", "reload", page(Sharing, Manage)),
     ("nfs", "enable", AdminOnly),
     ("nfs", "disable", AdminOnly),
@@ -223,7 +204,6 @@ const TABLE: &[(&str, &str, Requirement)] = &[
     ("network", "reload", AdminOnly),
     ("network", "configure", AdminOnly),
     ("network", "confirm", AdminOnly),
-    ("network", "pending", AdminOnly),
     ("network", "scan_wifi", AdminOnly),
     ("network", "connect_wifi", AdminOnly),
     ("reverse_proxy", "list", page(Network, View)),
@@ -293,7 +273,6 @@ pub const SETUP_ALLOWED: &[(&str, &str)] = &[
     ("network", "connect_wifi"),
     ("network", "configure"),
     ("network", "confirm"),
-    ("network", "pending"),
     ("updates", "set_policy"),
     ("remote_access", "status"),
     ("remote_access", "tailscale_up"),
@@ -335,77 +314,27 @@ pub const SETUP_OPERATIONS: &[&str] = &[
     "module.dispatch",
 ];
 
-/// Payload fields that need more than the action itself: each entry is the
-/// module (`*` for any), the field, the values that need nothing extra, and
-/// what any other value needs. Most are administrator-only (and remote
-/// controllers') because they point an action at arbitrary host paths; the
-/// setup session and granted users always get the defaults. A field may
-/// still be sent with an allowed value, since documented payloads do.
-const RESTRICTED_FIELDS: &[(&str, &str, &[&str], Requirement)] = &[
-    ("reverse_proxy", "config_dir", &[], AdminOnly),
-    ("quadlets", "base_dir", &[], AdminOnly),
-    ("quadlets", "files_base_dir", &[], AdminOnly),
-    ("apps", "base_dir", &[], AdminOnly),
-    ("apps", "files_base_dir", &[], AdminOnly),
+/// Payload fields that only administrators (and remote controllers) may set,
+/// because they point an action at arbitrary host paths. The setup session
+/// and granted users always get the defaults.
+const ADMIN_ONLY_FIELDS: &[(&str, &str)] = &[
+    ("reverse_proxy", "config_dir"),
+    ("quadlets", "base_dir"),
+    ("quadlets", "files_base_dir"),
+    ("apps", "base_dir"),
+    ("apps", "files_base_dir"),
     // A new account sharing another's home could replace that account's SSH
     // keys with `set_authorized_keys`.
-    ("users", "home", &[], AdminOnly),
-    // The sharing modules read and replace `path` as root; any other path
-    // would turn the Sharing page into `files.read`/`files.write`.
-    ("samba", "path", &[SAMBA_CONFIG_PATH], AdminOnly),
-    ("nfs", "path", &[EXPORTS_PATH], AdminOnly),
-    // Running a read as root (or as both) shows the host's view: rootful
-    // containers with their environment, every VM. The signed-in user's own
-    // view and the apps account's (where user apps run) are fine.
-    ("*", "run_as", &["user", "apps"], AdminOnly),
-    // Apps keep secrets in their containers' environment.
-    ("podman", "show_env", &["false"], AdminOnly),
-    // System scope holds the rootful system services, which belong to the
-    // system services page, not the apps page.
-    ("apps", "scope", &["apps"], page(SystemServices, View)),
-    ("quadlets", "scope", &["apps"], page(SystemServices, View)),
+    ("users", "home"),
 ];
 
-/// The restricted fields set in a `module` payload, with what each needs.
-fn restricted_fields<'a>(
-    module: &'a str,
-    payload: &'a Value,
-) -> impl Iterator<Item = (&'static str, Requirement)> + 'a {
-    // A string, or another JSON value written out (`false`).
-    let allowed = |value: &Value, allowed: &[&str]| {
-        allowed.iter().any(|allowed| {
-            value.as_str() == Some(*allowed)
-                || serde_json::from_str::<Value>(allowed).is_ok_and(|allowed| allowed == *value)
-        })
-    };
-    RESTRICTED_FIELDS
-        .iter()
-        .filter(move |(m, field, values, _)| {
-            (*m == module || *m == "*")
-                && payload
-                    .get(field)
-                    .is_some_and(|value| !allowed(value, values))
-        })
-        .map(|(_, field, _, requirement)| (*field, *requirement))
-}
-
-/// The first restricted field in a `module` payload that `principal` may not
-/// set, with what it needs.
-#[must_use]
-pub fn unmet_field(
-    principal: &Principal,
-    module: &str,
-    payload: &Value,
-) -> Option<(&'static str, Requirement)> {
-    restricted_fields(module, payload).find(|(_, requirement)| !principal.meets(*requirement))
-}
-
-/// The first administrator-only field set in a `module` payload, if any.
+/// The first admin-only field set in a `module` payload, if any.
 #[must_use]
 pub fn admin_only_field(module: &str, payload: &Value) -> Option<&'static str> {
-    restricted_fields(module, payload)
-        .find(|(_, requirement)| *requirement == AdminOnly)
-        .map(|(field, _)| field)
+    ADMIN_ONLY_FIELDS
+        .iter()
+        .find(|(m, field)| *m == module && payload.get(field).is_some())
+        .map(|(_, field)| *field)
 }
 
 /// The requirement for `module.action`.
@@ -461,29 +390,21 @@ impl Principal {
     #[must_use]
     pub fn allows(&self, module: &str, action: &str) -> bool {
         match self {
-            Self::Setup => SETUP_ALLOWED.contains(&(module, action)),
-            _ => self.meets(requirement(module, action)),
-        }
-    }
-
-    /// Whether this principal meets `requirement`. The setup session meets
-    /// only [`Authenticated`]; its actions come from [`SETUP_ALLOWED`].
-    #[must_use]
-    pub fn meets(&self, requirement: Requirement) -> bool {
-        match self {
             Self::RemoteController => true,
-            Self::Setup => requirement == Authenticated,
+            Self::Setup => SETUP_ALLOWED.contains(&(module, action)),
             Self::User {
                 admin, permissions, ..
             } => {
-                *admin
-                    || match requirement {
-                        Authenticated => true,
-                        AdminOnly => false,
-                        Requirement::Page(page, level) => {
-                            permissions.get(&page).is_some_and(|held| *held >= level)
-                        }
+                if *admin {
+                    return true;
+                }
+                match requirement(module, action) {
+                    Authenticated => true,
+                    AdminOnly => false,
+                    Requirement::Page(page, level) => {
+                        permissions.get(&page).is_some_and(|held| *held >= level)
                     }
+                }
             }
         }
     }
@@ -538,18 +459,12 @@ impl Record for GrantsFile {
 #[derive(Debug, Clone)]
 pub struct GrantStore {
     path: PathBuf,
-    /// The grants last read: they are checked on every request of a user
-    /// who is not an administrator.
-    cache: Cached<BTreeMap<u32, Permissions>>,
 }
 
 impl GrantStore {
     #[must_use]
-    pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            cache: Cached::new(),
-        }
+    pub const fn new(path: PathBuf) -> Self {
+        Self { path }
     }
 
     /// Grants for `uid` (without the defaults).
@@ -557,7 +472,7 @@ impl GrantStore {
     /// # Errors
     /// Fails when the file exists but cannot be read.
     pub fn get(&self, uid: u32) -> Result<Permissions> {
-        Ok(self.grants()?.get(&uid).cloned().unwrap_or_default())
+        Ok(self.all()?.remove(&uid).unwrap_or_default())
     }
 
     /// Every stored grant.
@@ -565,20 +480,13 @@ impl GrantStore {
     /// # Errors
     /// Fails when the file exists but cannot be read.
     pub fn all(&self) -> Result<BTreeMap<u32, Permissions>> {
-        Ok(self.grants()?.as_ref().clone())
-    }
-
-    /// Every stored grant, from the cache while the file is unchanged.
-    fn grants(&self) -> Result<Arc<BTreeMap<u32, Permissions>>> {
-        self.cache.get((), &self.path, || {
-            Ok(store::read::<GrantsFile>(&self.path)?
-                .unwrap_or_default()
-                .grants
-                .iter()
-                .map(|(uid, stored)| (*uid, known_permissions(stored)))
-                .filter(|(_, permissions)| !permissions.is_empty())
-                .collect::<BTreeMap<_, _>>())
-        })
+        Ok(store::read::<GrantsFile>(&self.path)?
+            .unwrap_or_default()
+            .grants
+            .iter()
+            .map(|(uid, stored)| (*uid, known_permissions(stored)))
+            .filter(|(_, permissions)| !permissions.is_empty())
+            .collect())
     }
 
     /// Default permissions merged with `uid`'s grants.
@@ -634,9 +542,7 @@ impl GrantStore {
         if grants.is_empty() {
             file.grants.remove(&uid);
         }
-        let written = store::write(&self.path, &mut file);
-        self.cache.invalidate(&());
-        written?;
+        store::write(&self.path, &mut file)?;
         Ok(result)
     }
 }
@@ -647,19 +553,15 @@ pub fn catalog() -> Value {
     let pages: Vec<Value> = Page::ALL
         .iter()
         .map(|page| {
-            let levels: Vec<_> = [View, Manage]
-                .into_iter()
-                .filter(|level| grantable(*page, *level))
-                .collect();
-            json!({
+            jsonf! {
                 "page": page,
                 "label": page.label(),
-                "grantable": levels,
+                "grantable": [View, Manage].into_iter().filter(|level| grantable(*page, *level)).collect::<Vec<_>>(),
                 "default": default_permissions().get(page),
-            })
+            }
         })
         .collect();
-    json!({ "pages": pages })
+    jsonf! { pages }
 }
 
 #[cfg(test)]
@@ -910,16 +812,6 @@ mod tests {
     }
 
     #[test]
-    fn every_user_may_open_their_own_shell_but_setup_may_not() {
-        assert_eq!(requirement("shell", "open"), Authenticated);
-        assert!(user(false, default_permissions()).allows("shell", "open"));
-        assert!(user(false, Permissions::new()).allows("shell", "open"));
-        assert!(!Principal::Setup.allows("shell", "open"));
-        assert!(!setup_allows_operation("shell.ticket"));
-        assert!(!setup_allows_operation("shell.open"));
-    }
-
-    #[test]
     fn remote_controllers_may_do_anything() {
         assert!(Principal::RemoteController.allows("files", "write"));
     }
@@ -1042,77 +934,5 @@ mod tests {
             None
         );
         assert_eq!(requirement("recipes", "render"), AdminOnly);
-    }
-
-    #[test]
-    fn system_scope_needs_the_system_services_grant() {
-        let apps_only = user(false, BTreeMap::from([(Apps, View)]));
-        let system = user(
-            false,
-            BTreeMap::from([(Apps, View), (SystemServices, View)]),
-        );
-        for module in ["apps", "quadlets"] {
-            let default = serde_json::json!({});
-            let apps = serde_json::json!({ "scope": "apps" });
-            assert_eq!(unmet_field(&apps_only, module, &default), None);
-            assert_eq!(unmet_field(&apps_only, module, &apps), None);
-            for scope in ["system", "all"] {
-                let payload = serde_json::json!({ "scope": scope });
-                assert_eq!(
-                    unmet_field(&apps_only, module, &payload),
-                    Some(("scope", page(SystemServices, View))),
-                    "{module} {scope}"
-                );
-                assert_eq!(unmet_field(&system, module, &payload), None);
-                assert_eq!(
-                    unmet_field(&Principal::Setup, module, &payload).map(|f| f.0),
-                    Some("scope")
-                );
-            }
-            // A grant does not lift the administrator-only fields.
-            let path = serde_json::json!({ "base_dir": "/etc" });
-            assert_eq!(
-                unmet_field(&system, module, &path).map(|f| f.0),
-                Some("base_dir")
-            );
-        }
-    }
-
-    #[test]
-    fn running_as_root_is_admin_only_in_every_module() {
-        for module in ["podman", "virtual_machines", "selinux"] {
-            for run_as in ["root", "both"] {
-                let payload = serde_json::json!({ "run_as": run_as });
-                assert_eq!(admin_only_field(module, &payload), Some("run_as"));
-            }
-            for run_as in ["user", "apps"] {
-                let payload = serde_json::json!({ "run_as": run_as });
-                assert_eq!(admin_only_field(module, &payload), None);
-            }
-        }
-    }
-
-    #[test]
-    fn container_environments_are_admin_only() {
-        let show = serde_json::json!({ "name": "db", "show_env": true });
-        assert_eq!(admin_only_field("podman", &show), Some("show_env"));
-        let hide = serde_json::json!({ "name": "db", "show_env": false });
-        assert_eq!(admin_only_field("podman", &hide), None);
-        assert_eq!(
-            admin_only_field("podman", &serde_json::json!({ "name": "db" })),
-            None
-        );
-    }
-
-    #[test]
-    fn sharing_config_paths_are_pinned_for_non_admins() {
-        let shadow = serde_json::json!({"path": "/etc/shadow"});
-        assert_eq!(admin_only_field("samba", &shadow), Some("path"));
-        assert_eq!(admin_only_field("nfs", &shadow), Some("path"));
-        let samba = serde_json::json!({"path": "/etc/samba/smb.conf"});
-        assert_eq!(admin_only_field("samba", &samba), None);
-        let exports = serde_json::json!({"path": "/etc/exports", "contents": ""});
-        assert_eq!(admin_only_field("nfs", &exports), None);
-        assert_eq!(admin_only_field("nfs", &samba), Some("path"));
     }
 }

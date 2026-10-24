@@ -5,26 +5,15 @@
 //! `daemon_reload`) honor the shared `dry_run` flag so a controller can preview
 //! the exact `systemctl` invocation before applying it.
 //!
-//! A `scope` field on the payload selects the manager: `system` (the
-//! default), `user` (`--user`, the manager of whoever the command runs as) or
-//! `apps`, the user manager of the `ultramarine-apps` account that user apps
-//! run under (`--user -M ultramarine-apps@` as root, plain `--user` when the
-//! command runs as that account). `list` additionally parses the raw
-//! `list-units` table into a stable `services` array.
+//! Both system and per-user systemd scopes are supported: a `scope` field on
+//! the payload selects which, and is translated into the `--user` flag (or its
+//! absence) on every `systemctl`/`journalctl` invocation. `list` additionally
+//! parses the raw `list-units` table into a stable `services` array.
 
-use serde_json::json;
-
-use crate::actions;
-use crate::agent::apps_account::{APPS_USER, AppsAccount};
-use crate::agent::dispatcher::RunAs;
-use crate::agent::module_support::{ModuleInfo, ModuleStatus, positional, run_for};
-use crate::agent::modules::Mod;
+use crate::agent::module_support::parse_payload;
 use crate::prelude::*;
 
-use crate::types::{
-    DaemonReloadRequest, ServiceListRequest, ServiceLogsRequest, ServiceRequest, ServiceScope,
-    ServiceStatus,
-};
+use crate::types::{DaemonReloadRequest, ServiceListRequest, ServiceLogsRequest, ServiceRequest};
 
 /// Marker type for the services module. Stateless; all behavior lives in the
 /// [`Mod`] impl and the static [`INFO`] descriptor.
@@ -64,26 +53,23 @@ impl Mod for ServicesModule {
         INFO
     }
 
-    /// `list` and `status` in apps scope run as the apps account: a
-    /// signed-in user's own `runuser` cannot reach the account's manager
-    /// (`-M ultramarine-apps@` needs root), the account reaches it with
-    /// plain `--user`. `logs` keeps the default: the account's entries are
-    /// in the system journal (journald keeps no per-user journal for system
-    /// UIDs), which the account cannot read and root (or an administrator,
-    /// through the journal's ACLs) reads by `_UID`.
-    fn default_run_as(&self, action: &str, payload: &Value) -> RunAs {
-        let apps_scope = payload
-            .get("scope")
-            .and_then(|scope| ServiceScope::deserialize(scope).ok())
-            == Some(ServiceScope::Apps);
-        if apps_scope && matches!(action, "list" | "status") {
-            RunAs::Apps
-        } else {
-            RunAs::User
-        }
-    }
-
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
+        // Delegate `capabilities`/`plan` to the module descriptor first.
+        if let Some(response) = INFO.metadata_response(action, &payload) {
+            return Ok(response);
+        }
+
+        // The five single-service mutations share one arm because their
+        // `systemctl` invocation has identical shape: `systemctl <action>
+        // <service>`. The `action` string is already a valid systemctl
+        // subcommand, which is why it can be forwarded directly.
+
+        if ["start", "stop", "restart", "enable", "disable"].contains(&action) {
+            let payload: ServiceRequest = parse_payload(payload)?;
+            let args = payload.scope.command_args([action, &payload.service]);
+            return crate::cmd!((payload.dry_run) { &INFO, action, user } "systemctl" => &args ; json);
+        }
+
         Action::from_payload(action, payload)?.handle(user)
     }
 }
@@ -96,87 +82,82 @@ actions!(Action [payload user] => {
         // footer, and `--no-pager` avoids interactive pagers. We still
         // return the raw stdout alongside the parsed `services` array so a
         // controller can fall back to the verbatim table if needed.
-        let args = payload.scope.command_args_as([
+        let args = payload.scope.command_args([
             "--no-pager",
             "--plain",
             "--legend=false",
             "list-units",
             "--type=service",
             "--all",
-        ], as_apps("list", user));
-        let result = run_for(&INFO, "list", user, "systemctl", &args, false)?;
-        Ok(json!({
+        ]);
+        let result = crate::cmd!({ &INFO, "list", user } "systemctl" => &args)?;
+        Ok(jsonf! {
             "command": result.command,
             "status": result.status,
             "stdout": result.stdout,
             "stderr": result.stderr,
             "dry_run": result.dry_run,
-            "services": ServiceStatus::parse_all(&result.stdout),
-        }))
+            "services": parse_systemctl_services(&result.stdout),
+        })
     },
     Status: ServiceRequest => {
-        let args = payload.scope.command_args_as([
+        let args = payload.scope.command_args([
             "--no-pager",
             "--plain",
             "status",
-            positional("service", &payload.service)?,
-        ], as_apps("status", user));
-        Ok(run_for(&INFO, "status", user, "systemctl", &args, false)?.into_json())
+            &payload.service,
+        ]);
+        crate::cmd!({ &INFO, "status", user } "systemctl" => &args ; json)
     },
     Logs: ServiceLogsRequest => {
         // `journalctl -u <unit>` follows the unit's journal across
         // whatever files it spans; `-n` caps the tail to keep payloads
         // bounded. `logs` is a read and therefore never dry-run.
         let lines = payload.lines.to_string();
-        // Not `positional`: `-u` takes the next argument as its value, and
-        // `-.mount` is a real unit.
-        let service = payload.service.as_str();
-        // `journalctl --user` reads the journal of whoever runs it, so root
-        // matches the apps account's entries by UID instead.
-        let (uid, unit);
-        let args = if payload.scope == ServiceScope::Apps && !as_apps("logs", user) {
-            uid = format!("_UID={}", AppsAccount::resolve().uid);
-            unit = format!("_SYSTEMD_USER_UNIT={service}");
-            vec!["--no-pager", &uid, &unit, "-n", &lines]
-        } else {
-            payload.scope.command_args_as(
-                ["--no-pager", "-u", service, "-n", &lines],
-                as_apps("logs", user),
-            )
-        };
-        Ok(run_for(&INFO, "logs", user, "journalctl", &args, false)?.into_json())
+        let args = payload.scope.command_args([
+            "--no-pager",
+            "-u",
+            &payload.service,
+            "-n",
+            &lines,
+        ]);
+        crate::cmd!({ &INFO, "logs", user } "journalctl" => &args ; json)
     },
-    // `systemctl <verb> <service>` for the single-service mutations.
-    Start: ServiceRequest => unit_verb("start", &payload, user),
-    Stop: ServiceRequest => unit_verb("stop", &payload, user),
-    Restart: ServiceRequest => unit_verb("restart", &payload, user),
-    Enable: ServiceRequest => unit_verb("enable", &payload, user),
-    Disable: ServiceRequest => unit_verb("disable", &payload, user),
     DaemonReload: DaemonReloadRequest => {
         let args = payload.scope.command_args(["daemon-reload"]);
-        Ok(run_for(&INFO, "daemon_reload", user, "systemctl", &args, payload.dry_run)?.into_json())
+        crate::cmd!((payload.dry_run) { &INFO, "daemon_reload", user } "systemctl" => &args ; json)
     },
 });
 
-/// Whether `action` runs as the apps account (`run_as: apps`), which
-/// reaches its own manager without `-M`.
-fn as_apps(action: &str, user: Option<&str>) -> bool {
-    INFO.effective_user(action, user) == Some(APPS_USER)
-}
-
-fn unit_verb(verb: &str, payload: &ServiceRequest, user: Option<&str>) -> Result<Value> {
-    let args = payload
-        .scope
-        .command_args([verb, positional("service", &payload.service)?]);
-    Ok(run_for(&INFO, verb, user, "systemctl", &args, payload.dry_run)?.into_json())
+/// Parses the whitespace-separated rows emitted by `systemctl list-units`.
+///
+/// Each row has the fixed prefix `UNIT LOAD ACTIVE SUB` followed by a
+/// free-form `DESCRIPTION` that may contain spaces. We split on runs of
+/// whitespace and treat the first four fields as the fixed columns, rejoining
+/// everything from index 4 onward as the description. Rows with fewer than
+/// four fields (e.g. stray blank lines or the suppressed legend) are dropped
+/// via the `>= 4` guard.
+fn parse_systemctl_services(stdout: &str) -> Vec<Value> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut it = line.split_whitespace();
+            let (unit, load, active, sub) = it.next_tuple()?;
+            Some(jsonf! {
+                unit,
+                load,
+                active,
+                sub,
+                "description": it.join(" "),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::modules::Act;
-    use serde_json::json;
-
     use super::*;
+    use crate::types::{ServiceScope, ServiceStatus};
 
     #[test]
     fn parses_systemctl_service_rows() {
@@ -192,11 +173,11 @@ mod tests {
         let response = ServicesModule
             .handle(
                 "start",
-                json!({
+                jsonf! {
                     "service": "sshd.service",
                     "scope": ServiceScope::System,
                     "dry_run": true,
-                }),
+                },
                 None,
             )
             .unwrap();
@@ -225,11 +206,11 @@ mod tests {
         let response = ServicesModule
             .handle(
                 "start",
-                json!({
+                jsonf! {
                     "service": "tetra-demo.service",
                     "scope": ServiceScope::User,
                     "dry_run": true,
-                }),
+                },
                 None,
             )
             .unwrap();
@@ -238,54 +219,6 @@ mod tests {
             response["command"],
             "systemctl --user start tetra-demo.service"
         );
-    }
-
-    #[test]
-    fn apps_scope_reaches_the_apps_accounts_manager() {
-        let start = ServicesModule
-            .handle(
-                "start",
-                json!({ "service": "site.service", "scope": "apps", "dry_run": true }),
-                // Privileged: root, whoever asked.
-                Some(APPS_USER),
-            )
-            .unwrap();
-        assert_eq!(
-            start["command"],
-            "systemctl --user -M ultramarine-apps@ start site.service"
-        );
-        let reload = DaemonReload(DaemonReloadRequest {
-            scope: ServiceScope::Apps,
-            dry_run: true,
-        })
-        .handle(None)
-        .unwrap();
-        assert_eq!(
-            reload["command"],
-            "systemctl --user -M ultramarine-apps@ daemon-reload"
-        );
-        assert!(as_apps("status", Some(APPS_USER)));
-        assert!(!as_apps("status", Some("alice")));
-        assert!(!as_apps("restart", Some(APPS_USER)));
-    }
-
-    #[test]
-    fn apps_scope_reads_default_to_the_apps_account() {
-        let apps = json!({ "scope": "apps", "service": "site.service" });
-        assert_eq!(ServicesModule.default_run_as("list", &apps), RunAs::Apps);
-        assert_eq!(ServicesModule.default_run_as("status", &apps), RunAs::Apps);
-        // Its journal entries are root's to read, by UID.
-        assert_eq!(ServicesModule.default_run_as("logs", &apps), RunAs::User);
-        for payload in [
-            json!({}),
-            json!({ "scope": "system" }),
-            json!({ "scope": "user" }),
-            json!({ "scope": 7 }),
-        ] {
-            assert_eq!(ServicesModule.default_run_as("list", &payload), RunAs::User);
-        }
-        // Privileged actions run as root whatever the default.
-        assert_eq!(ServicesModule.default_run_as("start", &apps), RunAs::User);
     }
 
     #[test]

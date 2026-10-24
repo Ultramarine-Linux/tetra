@@ -1,4 +1,5 @@
 //! First-boot setup: the setup code, the setup session and completion.
+#![allow(clippy::tests_outside_test_module)]
 
 mod common;
 
@@ -17,20 +18,12 @@ fn published_code(host: &TestHost) -> String {
 async fn the_oobe_redeems_the_published_code_for_a_limited_session() {
     let dir = tempfile::tempdir().unwrap();
     let host = fresh(dir.path());
-    assert_eq!(host.service.hello().await.unwrap()["setup_required"], true);
+    assert_eq!(host.service.hello()["setup_required"], true);
     let code = host.service.publish_setup_code().unwrap().unwrap();
     assert_eq!(published_code(&host), code);
     let banner =
         std::fs::read_to_string(host.config.issue_dir.join("50-tetra-setup.issue")).unwrap();
     assert!(banner.contains(&code));
-    assert!(banner.contains(r"https://\4:6623"));
-    assert!(banner.contains(r"https://[\6]:6623"));
-    let mode = std::os::unix::fs::PermissionsExt::mode(
-        &std::fs::metadata(host.config.issue_dir.join("50-tetra-setup.issue"))
-            .unwrap()
-            .permissions(),
-    );
-    assert_eq!(mode & 0o777, 0o600, "local users must not read the code");
 
     // Only the OOBE may redeem it.
     fails(
@@ -220,7 +213,7 @@ async fn completing_setup_needs_an_admin_and_disables_the_code_for_good() {
     assert!(host.config.state_dir.join("setup-complete").exists());
     assert!(!host.config.run_dir.join("setup-code").exists());
     assert!(!host.config.issue_dir.join("50-tetra-setup.issue").exists());
-    assert_eq!(host.service.hello().await.unwrap()["setup_required"], false);
+    assert_eq!(host.service.hello()["setup_required"], false);
     fails(
         &host.service,
         Oobe,
@@ -257,7 +250,7 @@ async fn completing_setup_needs_an_admin_and_disables_the_code_for_good() {
 async fn setup_mode_applies_even_when_an_admin_already_exists() {
     let dir = tempfile::tempdir().unwrap();
     let host = common::host(dir.path());
-    assert_eq!(host.service.hello().await.unwrap()["setup_required"], true);
+    assert_eq!(host.service.hello()["setup_required"], true);
     let code = host.service.publish_setup_code().unwrap().unwrap();
     let redeemed = ok(
         &host.service,

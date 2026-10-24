@@ -87,11 +87,6 @@ pub enum ErrorCode {
     ActionFailed,
     /// Tetra's command queue is full; retry after backoff.
     QueueFull,
-    /// The operation changes how the user logs in and the session is older
-    /// than the re-authentication window: log in again, then retry.
-    ReauthRequired,
-    /// Too many of something are open (web shells); close one first.
-    LimitReached,
     Internal,
 }
 
@@ -159,8 +154,11 @@ pub type ApiResult = Result<Value, ApiError>;
 /// # Errors
 /// Returns `bad_request` when the parameters do not match `T`.
 pub fn params<T: DeserializeOwned>(params: &Value) -> Result<T, ApiError> {
-    let empty = Value::Object(serde_json::Map::new());
-    let params = if params.is_null() { &empty } else { params };
-    T::deserialize(params)
+    let params = if params.is_null() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        params.clone()
+    };
+    serde_json::from_value(params)
         .map_err(|error| ApiError::bad_request(format!("invalid params: {error}")))
 }

@@ -1,6 +1,5 @@
 use std::{
     fs,
-    future::Future,
     io::{self, Read},
     path::PathBuf,
     sync::Arc,
@@ -9,20 +8,22 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use kameo::actor::Spawn as _;
 use tokio::sync::watch;
 
 use tetra::{
     agent::{
-        AgentCommand, Dispatcher, apps_account,
+        AgentBackend, AgentCommand, backend,
         config::{self, RuntimeConfig},
-        identity::{HostIdentity, public_key_fingerprint},
+        crypto::public_key_fingerprint,
+        identity::HostIdentity,
         local_protocol::LocalServer,
         local_socket,
         peer::{self, PeerPolicy},
         queue::{DEFAULT_QUEUE_CAPACITY, DispatchQueue},
         remote,
-        shell::{self, ShellServer},
         transport::TransportConfig,
+        vsock::VsockAgentConfig,
         websocket::WebSocketAgentConfig,
     },
     auth::{
@@ -46,12 +47,12 @@ use tetra::{
 /// - **Recipe rendering** (`render`) — pure local tooling that turns a YAML
 ///   recipe + Tera templates into container unit and companion files. No agent
 ///   backend, no transport.
-/// - **Agent** (`agent-serve`, `agent-dispatch`, `agent-connect`,
-///   `agent-ws-serve`) — the same dispatcher exposed through different
-///   surfaces: the local Unix socket daemon, a one-shot CLI, an outbound WSS
-///   control-plane connection, and (with the `dev-listener` feature) the
-///   daemon serving its session protocol on loopback TCP instead of the
-///   socket.
+/// - **Agent** (`agent-serve`, `agent-dispatch`, `agent-vsock-serve`,
+///   `agent-connect`, `agent-ws-serve`) — the same Kameo-backed dispatcher
+///   exposed through different surfaces: the local Unix socket daemon, a
+///   one-shot CLI, a vsock smoke-test listener, an outbound WSS control-plane
+///   connection, and (with the `dev-listener` feature) a development TCP
+///   WebSocket listener.
 #[derive(Debug, Parser)]
 #[command(
     author,
@@ -71,14 +72,16 @@ enum Commands {
     /// Run the host agent daemon, serving local clients over a Unix socket.
     AgentServe(AgentServeCli),
 
-    /// Dispatch one agent command envelope from stdin locally, as root and without authorization.
+    /// Dispatch one signed agent command envelope locally.
     AgentDispatch(AgentDispatchCli),
+
+    /// Serve the local agent backend over a Linux virtio-vsock listener.
+    AgentVsockServe(VsockAgentConfig),
 
     /// Connect the local agent backend to an outbound WSS control plane.
     AgentConnect(AgentConnectCli),
 
-    /// Run the host agent daemon, serving the local session protocol on a
-    /// loopback TCP port instead of the Unix socket (development only).
+    /// Serve an authenticated WebSocket over TCP (development only).
     #[cfg(feature = "dev-listener")]
     AgentWsServe(AgentWsServeCli),
 
@@ -195,28 +198,13 @@ struct AgentDispatchCli {
 
 #[derive(Debug, Parser)]
 struct AgentServeCli {
-    #[command(flatten)]
-    daemon: DaemonArgs,
+    /// Runtime config (`remote.enabled`, ...). Re-read on SIGHUP.
+    #[arg(long, env = "TETRA_CONFIG", default_value = config::DEFAULT_CONFIG_PATH)]
+    config: PathBuf,
 
     /// Unix socket to bind when not started by systemd socket activation.
     #[arg(long, env = "TETRA_SOCKET", default_value = local_socket::DEFAULT_SOCKET_PATH)]
     socket: PathBuf,
-
-    /// Account whose UID identifies the dashboard on the local socket.
-    #[arg(long, env = "TETRA_DASHBOARD_USER", default_value = peer::DEFAULT_DASHBOARD_USER)]
-    dashboard_user: String,
-
-    /// Account whose UID identifies the server OOBE on the local socket.
-    #[arg(long, env = "TETRA_OOBE_USER", default_value = peer::DEFAULT_OOBE_USER)]
-    oobe_user: String,
-}
-
-/// Options of the daemon shared by `agent-serve` and `agent-ws-serve`.
-#[derive(Debug, clap::Args)]
-struct DaemonArgs {
-    /// Runtime config (`remote.enabled`, ...). Re-read on SIGHUP.
-    #[arg(long, env = "TETRA_CONFIG", default_value = config::DEFAULT_CONFIG_PATH)]
-    config: PathBuf,
 
     /// Mutable identity directory. Defaults to /var/lib/tetra/identity.
     #[arg(long, default_value = "/var/lib/tetra/identity")]
@@ -226,14 +214,17 @@ struct DaemonArgs {
     #[arg(long, env = "TETRA_STATE_DIR", default_value = auth::service::DEFAULT_STATE_DIR)]
     state_dir: PathBuf,
 
+    /// Account whose UID identifies the dashboard on the local socket.
+    #[arg(long, env = "TETRA_DASHBOARD_USER", default_value = peer::DEFAULT_DASHBOARD_USER)]
+    dashboard_user: String,
+
+    /// Account whose UID identifies the server OOBE on the local socket.
+    #[arg(long, env = "TETRA_OOBE_USER", default_value = peer::DEFAULT_OOBE_USER)]
+    oobe_user: String,
+
     /// PAM service used to verify dashboard passwords.
     #[arg(long, default_value = tetra_pam::DEFAULT_SERVICE)]
     pam_service: String,
-
-    /// PAM service the web shell's sessions run (account and session
-    /// stacks), as the transient unit's `PAMName=`.
-    #[arg(long, env = "TETRA_SHELL_PAM_SERVICE", default_value = shell::pty::DEFAULT_PAM_SERVICE)]
-    shell_pam_service: String,
 
     /// Caddy site directory where `access.set` writes the dashboard site
     /// (terra-caddy's Caddyfile imports `Caddyfile.d/*.caddyfile`).
@@ -256,29 +247,32 @@ struct DaemonArgs {
     enrollment_dir: PathBuf,
 }
 
-/// `agent-ws-serve`: the daemon on loopback TCP. TCP has no peer
-/// credentials, so every connection is taken to be `--client`.
 #[cfg(feature = "dev-listener")]
 #[derive(Debug, Parser)]
 struct AgentWsServeCli {
-    #[command(flatten)]
-    daemon: DaemonArgs,
-
-    /// Loopback address to listen on. Non-loopback addresses are refused.
-    #[arg(long, default_value = tetra::agent::dev_listener::DEFAULT_LISTEN)]
+    /// Loopback address for the WebSocket listener.
+    #[arg(long, default_value = "127.0.0.1:7780")]
     listen: std::net::SocketAddr,
 
-    /// The client every connection is treated as. Development only: any
-    /// local process that can reach the port gets this client's access.
-    #[arg(long, value_enum, default_value_t = DevClient::Dashboard)]
-    client: DevClient,
-}
+    /// URL-safe base64 Ed25519 public key enrolled for the dashboard controller.
+    #[arg(long, env = "TETRA_CONTROLLER_PUBLIC_KEY")]
+    controller_public_key: Option<String>,
 
-#[cfg(feature = "dev-listener")]
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-enum DevClient {
-    Dashboard,
-    Oobe,
+    /// One-time token accepted to enroll a controller while no key is stored.
+    #[arg(long, env = "TETRA_ENROLLMENT_TOKEN")]
+    enrollment_token: Option<String>,
+
+    /// Mutable identity directory. Defaults to /var/lib/tetra/identity.
+    #[arg(long, default_value = "/var/lib/tetra/identity")]
+    identity_dir: PathBuf,
+
+    /// PEM certificate for WSS. Required with --tls-key for non-loopback binds.
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM private key for WSS. Required with --tls-cert for non-loopback binds.
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -357,7 +351,8 @@ struct AgentConnectCli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    // reqwest is built without its own provider and uses this one.
+    // Both rustls providers are compiled in (reqwest pulls in ring), so rustls
+    // cannot pick one itself and would panic on first TLS use.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("a rustls crypto provider was already installed"))?;
@@ -366,9 +361,10 @@ async fn main() -> Result<()> {
         Commands::Render(cli) => render(cli),
         Commands::AgentServe(cli) => Box::pin(agent_serve(cli)).await,
         Commands::AgentDispatch(cli) => agent_dispatch(cli).await,
+        Commands::AgentVsockServe(cli) => cli.serve(),
         Commands::AgentConnect(cli) => agent_connect(cli).await,
         #[cfg(feature = "dev-listener")]
-        Commands::AgentWsServe(cli) => Box::pin(agent_ws_serve(cli)).await,
+        Commands::AgentWsServe(cli) => agent_ws_serve(cli).await,
         Commands::Enroll(cli) => {
             enrollment::run(enrollment::Options {
                 dashboard_url: cli.dashboard_url,
@@ -452,7 +448,7 @@ fn console_auth(paths: ConsolePaths) -> Result<AuthService> {
         caddy_sites_dir: paths.caddy_sites_dir,
         ..AuthConfig::system(paths.state_dir)
     };
-    let queue = DispatchQueue::spawn(config.dispatcher(), 1);
+    let queue = DispatchQueue::spawn(AgentBackend::spawn(config.dispatcher()), 1);
     system_auth(config, tetra_pam::DEFAULT_SERVICE.into(), queue)
 }
 
@@ -544,9 +540,10 @@ async fn agent_dispatch(cli: AgentDispatchCli) -> Result<()> {
 
     let command: AgentCommand =
         serde_json::from_str(&text).context("failed to parse agent command JSON")?;
-    let response = tokio::task::spawn_blocking(move || Dispatcher::full().dispatch(command))
-        .await
-        .context("dispatch failed")?;
+    // Spawn a one-shot backend, dispatch, and print the response. The actor is
+    // dropped when this future completes — no long-lived state survives the
+    // CLI invocation, which is the right behavior for a one-shot dispatch.
+    let response = backend::dispatch_with_default_backend(command).await?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
@@ -586,46 +583,7 @@ fn migrate_legacy_proxy_sites() {
 /// How often in-memory session activity is written to disk.
 const SESSION_FLUSH_INTERVAL: Duration = Duration::from_mins(1);
 
-/// Where the daemon serves local clients.
-enum Listener {
-    /// The Unix socket, identifying clients by their peer credentials.
-    Socket { path: PathBuf, peers: PeerPolicy },
-    /// Loopback TCP, every connection taken to be one client.
-    #[cfg(feature = "dev-listener")]
-    Tcp {
-        listener: tokio::net::TcpListener,
-        client: auth::sessions::ClientKind,
-    },
-}
-
 async fn agent_serve(cli: AgentServeCli) -> Result<()> {
-    let hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        .context("failed to install the SIGHUP handler")?;
-    let listener = Listener::Socket {
-        path: cli.socket,
-        peers: PeerPolicy::from_users(&cli.dashboard_user, &cli.oobe_user),
-    };
-    Box::pin(run_daemon(cli.daemon, listener, hangup)).await
-}
-
-#[cfg(feature = "dev-listener")]
-async fn agent_ws_serve(cli: AgentWsServeCli) -> Result<()> {
-    let hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        .context("failed to install the SIGHUP handler")?;
-    let client = match cli.client {
-        DevClient::Dashboard => auth::sessions::ClientKind::Dashboard,
-        DevClient::Oobe => auth::sessions::ClientKind::Oobe,
-    };
-    let listener = tetra::agent::dev_listener::bind(cli.listen).await?;
-    let listener = Listener::Tcp { listener, client };
-    Box::pin(run_daemon(cli.daemon, listener, hangup)).await
-}
-
-async fn run_daemon(
-    cli: DaemonArgs,
-    listener: Listener,
-    hangup: tokio::signal::unix::Signal,
-) -> Result<()> {
     let identity = HostIdentity::load_or_generate(&cli.identity_dir)?;
     let host_fingerprint = public_key_fingerprint(&identity.verifying_key());
     eprintln!("host identity: {}", identity.path().display());
@@ -639,40 +597,22 @@ async fn run_daemon(
     };
     #[cfg(feature = "reverse-proxy")]
     migrate_legacy_proxy_sites();
-    let queue = DispatchQueue::spawn(config.dispatcher(), DEFAULT_QUEUE_CAPACITY);
+    let queue = DispatchQueue::spawn(
+        AgentBackend::spawn(config.dispatcher()),
+        DEFAULT_QUEUE_CAPACITY,
+    );
     let auth = system_auth(config, cli.pam_service, queue.clone())?;
     // Off the serving path: it waits for systemctl.
     let resume = auth.clone();
     tokio::task::spawn_blocking(move || resume.resume_handoff());
-    // A network change a previous run left awaiting confirmation: re-arm its
-    // rollback (or do it now, if overdue) even if no network action follows.
-    #[cfg(feature = "network")]
-    tokio::task::spawn_blocking(tetra::agent::modules::network::recover_pending);
     let audit = auth.audit();
-    let shells = ShellServer::system(cli.shell_pam_service);
-    // Web shells a previous run left behind (a crash or restart hangs up
-    // their terminals, which a shell may ignore). Asynchronous, and it
-    // leaves alone the shells this run opens meanwhile.
-    let sweep = shells.clone();
-    tokio::spawn(async move { sweep.stop_leftover_units().await });
     let server = LocalServer {
         auth: auth.clone(),
+        peers: PeerPolicy::from_users(&cli.dashboard_user, &cli.oobe_user),
         host_fingerprint,
-        shells,
     };
-    apps_account::check_apps_account();
-    let serve = match listener {
-        Listener::Socket { path, peers } => {
-            let listener = local_socket::listener(&path)?;
-            peer::check_socket_group();
-            Box::pin(local_socket::serve(listener, server, peers))
-                as std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
-        }
-        #[cfg(feature = "dev-listener")]
-        Listener::Tcp { listener, client } => {
-            Box::pin(tetra::agent::dev_listener::serve(listener, server, client))
-        }
-    };
+    let listener = local_socket::listener(&cli.socket)?;
+    peer::check_socket_group();
 
     let enrollment_dir = cli.enrollment_dir;
     let select = move |config: &RuntimeConfig| remote::connection_from(config, &enrollment_dir);
@@ -681,9 +621,9 @@ async fn run_daemon(
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to install the SIGTERM handler")?;
     let result = tokio::select! {
-        result = serve => result,
+        result = local_socket::serve(listener, server) => result,
         () = remote::supervise(settings, queue, audit) => Ok(()),
-        result = remote::reload_on_hangup(hangup, cli.config, sender, select) => result,
+        result = remote::reload_on_hangup(cli.config, sender, select) => result,
         () = auth.flush_sessions_every(SESSION_FLUSH_INTERVAL) => Ok(()),
         result = tokio::signal::ctrl_c() => result.map_err(Into::into),
         _ = terminate.recv() => Ok(()),
@@ -692,9 +632,34 @@ async fn run_daemon(
     result
 }
 
+#[cfg(feature = "dev-listener")]
+async fn agent_ws_serve(
+    AgentWsServeCli {
+        listen,
+        controller_public_key,
+        enrollment_token,
+        identity_dir,
+        tls_cert,
+        tls_key,
+    }: AgentWsServeCli,
+) -> Result<()> {
+    anyhow::ensure!(
+        tls_cert.as_ref().xor(tls_key.as_ref()).is_none(),
+        "--tls-cert and --tls-key must be supplied together"
+    );
+    tetra::agent::dev_listener::WebSocketServerConfig::serve(
+        tetra::agent::dev_listener::WebSocketServerConfig {
+            listen,
+            controller_public_key,
+            enrollment_token,
+            identity_dir,
+            tls_cert_key_path: tls_cert.zip(tls_key),
+        },
+    )
+    .await
+}
+
 async fn agent_connect(cli: AgentConnectCli) -> Result<()> {
-    let hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        .context("failed to install the SIGHUP handler")?;
     anyhow::ensure!(
         RuntimeConfig::load(&cli.runtime_config)?.remote.enabled,
         "remote control is disabled; set remote.enabled to true in `{}`",
@@ -733,7 +698,7 @@ async fn agent_connect(cli: AgentConnectCli) -> Result<()> {
     };
 
     let (sender, settings) = watch::channel(Some(resolve()?));
-    let queue = DispatchQueue::spawn(Dispatcher::full(), DEFAULT_QUEUE_CAPACITY);
+    let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), DEFAULT_QUEUE_CAPACITY);
     let audit = AuditLog::new(action_log::DEFAULT_DIR.into());
     let select = move |config: &RuntimeConfig| {
         config
@@ -747,6 +712,6 @@ async fn agent_connect(cli: AgentConnectCli) -> Result<()> {
     };
     tokio::select! {
         () = remote::supervise(settings, queue, audit) => Ok(()),
-        result = remote::reload_on_hangup(hangup, cli.runtime_config, sender, select) => result,
+        result = remote::reload_on_hangup(cli.runtime_config, sender, select) => result,
     }
 }

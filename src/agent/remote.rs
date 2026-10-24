@@ -11,8 +11,10 @@ use std::{
 };
 
 use anyhow::Result;
-use futures_util::{Stream, StreamExt, pin_mut, stream};
-use tokio::{signal::unix::Signal, sync::watch};
+use tokio::{
+    signal::unix::{SignalKind, signal},
+    sync::watch,
+};
 
 use super::{
     config::RuntimeConfig,
@@ -69,11 +71,7 @@ where
 /// Re-read the runtime config on every `SIGHUP` and publish the connection it
 /// describes. Publishes only when the result differs, so a reload that leaves
 /// the remote settings alone keeps the live session.
-///
-/// The caller must install `hangup` before slow startup work, so an early signal is buffered rather
-/// than terminating the process.
 pub async fn reload_on_hangup<F>(
-    hangup: Signal,
     path: PathBuf,
     sender: watch::Sender<Option<WebSocketAgentConfig>>,
     select: F,
@@ -81,23 +79,8 @@ pub async fn reload_on_hangup<F>(
 where
     F: Fn(&RuntimeConfig) -> Option<WebSocketAgentConfig>,
 {
-    let events = stream::unfold(hangup, |mut hangup| async move {
-        hangup.recv().await.map(|()| ((), hangup))
-    });
-    reload_on_events(path, sender, select, events).await;
-    Ok(())
-}
-
-async fn reload_on_events<F>(
-    path: PathBuf,
-    sender: watch::Sender<Option<WebSocketAgentConfig>>,
-    select: F,
-    events: impl Stream<Item = ()>,
-) where
-    F: Fn(&RuntimeConfig) -> Option<WebSocketAgentConfig>,
-{
-    pin_mut!(events);
-    while events.next().await.is_some() {
+    let mut hangup = signal(SignalKind::hangup())?;
+    while hangup.recv().await.is_some() {
         eprintln!("reloading {}", path.display());
         let next = select(&RuntimeConfig::load_or_disabled(&path));
         sender.send_if_modified(|current| {
@@ -108,13 +91,12 @@ async fn reload_on_events<F>(
             true
         });
     }
+    Ok(())
 }
 
-/// The connection the daemon should run.
-///
-/// Built from `config` and the enrollment in `enrollment_dir`; a remote
-/// section that is enabled but incomplete, or an unreadable enrollment, is
-/// logged and treated as disabled.
+/// The connection the daemon should run for `config` and the enrollment in
+/// `enrollment_dir`, logging (and treating as disabled) a remote section that
+/// is enabled but incomplete or an unreadable enrollment.
 #[must_use]
 pub fn connection_from(
     config: &RuntimeConfig,
@@ -145,47 +127,6 @@ mod tests {
     use tokio::{sync::oneshot, time::timeout};
 
     use super::*;
-
-    #[test]
-    fn corrupt_config_fails_closed_at_connection_selection() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tetra.json");
-        std::fs::write(&path, r#"{"remote":{"enabled":true,"typo":1}}"#).unwrap();
-        RuntimeConfig::load(&path).unwrap_err();
-        assert!(connection_from(&RuntimeConfig::load_or_disabled(&path), dir.path()).is_none());
-    }
-
-    #[tokio::test]
-    async fn reload_events_publish_changes_and_fail_closed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tetra.json");
-        let select = |config: &RuntimeConfig| connection_from(config, dir.path());
-        let (sender, mut settings) = watch::channel(None);
-        let enabled = r#"{"remote":{"enabled":true,"host_id":"host-01","transport":{"control_plane_url":"wss://control.example.test/tetra"}}}"#;
-        std::fs::write(&path, enabled).unwrap();
-        reload_on_events(path.clone(), sender.clone(), select, stream::iter([()])).await;
-        assert!(settings.has_changed().unwrap());
-        assert_eq!(
-            settings.borrow_and_update().as_ref().unwrap().host_id,
-            "host-01"
-        );
-
-        // An unchanged reload does not disrupt the connection.
-        reload_on_events(path.clone(), sender.clone(), select, stream::iter([(), ()])).await;
-        assert!(!settings.has_changed().unwrap());
-
-        std::fs::write(&path, "corrupt").unwrap();
-        reload_on_events(path.clone(), sender.clone(), select, stream::iter([()])).await;
-        assert!(settings.has_changed().unwrap());
-        assert!(settings.borrow_and_update().is_none());
-
-        std::fs::write(&path, enabled).unwrap();
-        reload_on_events(path.clone(), sender.clone(), select, stream::iter([()])).await;
-        assert!(settings.borrow_and_update().is_some());
-        std::fs::write(&path, r#"{"remote":{"enabled":false}}"#).unwrap();
-        reload_on_events(path, sender, select, stream::iter([()])).await;
-        assert!(settings.borrow().is_none());
-    }
 
     /// A fake connection that stays open until dropped, reporting when it is.
     struct Connection {

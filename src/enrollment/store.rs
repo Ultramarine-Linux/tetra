@@ -13,6 +13,8 @@
 //! `controller.json` is written last and removed first, so its presence is
 //! what marks the host as enrolled.
 
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
 use crate::agent::transport::TransportConfig;
 use crate::prelude::*;
 
@@ -36,9 +38,8 @@ const FILES: [&str; 4] = [
 const STAGED_FILES: [&str; 2] = ["client.key.next", "client.crt.next"];
 
 /// The controller this host is enrolled with.
-/// Unknown fields are ignored (not rejected) so a bootc rollback can still
-/// read a record written by a newer release.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControllerRecord {
     /// Host id the controller assigned; sent in the `hello` frame.
     pub host_id: String,
@@ -68,10 +69,15 @@ impl Enrollment {
     /// enrolled.
     pub fn load(directory: &Path) -> Result<Option<Self>> {
         let path = directory.join(RECORD_FILE);
-        let Some(bytes) = crate::auth::store::read_optional(&path)? else {
-            return Ok(None);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read enrollment `{}`", path.display()));
+            }
         };
-        let controller = serde_json::from_slice(&bytes)
+        let controller = serde_json::from_str(&text)
             .with_context(|| format!("failed to parse enrollment `{}`", path.display()))?;
         Ok(Some(Self {
             directory: directory.to_owned(),
@@ -97,7 +103,13 @@ impl Enrollment {
         controller: ControllerRecord,
         credentials: Credentials<'_>,
     ) -> Result<Self> {
-        crate::auth::store::private_dir(directory)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory)
+            .with_context(|| format!("failed to create `{}`", directory.display()))?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to restrict `{}`", directory.display()))?;
 
         write_private(&directory.join(CLIENT_KEY_FILE), credentials.client_key)?;
         write_private(
@@ -120,7 +132,15 @@ impl Enrollment {
     pub fn remove(directory: &Path) -> Result<bool> {
         let mut removed = false;
         for file in FILES.into_iter().chain(STAGED_FILES) {
-            removed |= crate::auth::store::remove_if_exists(&directory.join(file))?;
+            let path = directory.join(file);
+            match fs::remove_file(&path) {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to remove `{}`", path.display()));
+                }
+            }
         }
         Ok(removed)
     }
@@ -152,13 +172,30 @@ impl Enrollment {
 
 /// Atomically write `contents` to `path` with mode `0600`.
 pub(crate) fn write_private(path: &Path, contents: &str) -> Result<()> {
-    crate::auth::store::replace(path, contents.as_bytes(), 0o600)
+    let file_name = path
+        .file_name()
+        .context("enrollment path has no file name")?
+        .to_string_lossy();
+    let temporary = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)
+        .with_context(|| format!("failed to create `{}`", temporary.display()))?;
+    io::Write::write_all(&mut file, contents.as_bytes())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to write `{}`", temporary.display()))?;
+    // `mode` only applies to new files; a leftover temporary keeps its mode.
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to restrict `{}`", temporary.display()))?;
+    fs::rename(&temporary, path).with_context(|| format!("failed to install `{}`", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn record() -> ControllerRecord {
         ControllerRecord {
@@ -196,7 +233,7 @@ mod tests {
             transport.client_key_path.as_deref(),
             Some(directory.join("client.key").to_str().unwrap())
         );
-        transport.wss_url().unwrap();
+        transport.validate(&transport.control_plane_url).unwrap();
     }
 
     #[test]

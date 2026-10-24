@@ -79,12 +79,14 @@ pub struct Registration {
     pub username: String,
     pub name: String,
     pub state: PasskeyRegistration,
+    pub expires_at: i64,
 }
 
 /// A pending login.
 pub struct Authentication {
     pub client: ClientKind,
     pub state: AuthenticationState,
+    pub expires_at: i64,
 }
 
 pub enum AuthenticationState {
@@ -199,12 +201,14 @@ fn next_sequence() -> u64 {
     SEQUENCE.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The browser's IP address from `remote_addr`, without the port.
+/// The owner of a login ceremony (and the setup-code throttle's key): the
+/// browser's IP address, given as `ip`, `[ipv6]`, `ip:port` or `[ipv6]:port`.
 ///
-/// Accepts `ip`, `[ipv6]`, `ip:port` or `[ipv6]:port`; `None` for anything
-/// else, so text a client made up never reaches PAM (`PAM_RHOST`).
+/// IPv6 is grouped by `/64`, what one host typically controls. `None` when
+/// the dashboard sent no address or one that is not an IP address, so a
+/// caller cannot mint owners from arbitrary strings.
 #[must_use]
-pub fn client_ip(remote_addr: Option<&str>) -> Option<IpAddr> {
+pub fn source_owner(remote_addr: Option<&str>) -> Option<String> {
     let remote_addr = remote_addr?.trim();
     let unbracketed = remote_addr
         .strip_prefix('[')
@@ -214,18 +218,7 @@ pub fn client_ip(remote_addr: Option<&str>) -> Option<IpAddr> {
         .parse::<IpAddr>()
         .or_else(|_| remote_addr.parse::<SocketAddr>().map(|addr| addr.ip()))
         .ok()?;
-    Some(ip.to_canonical())
-}
-
-/// The owner of a login ceremony (and the setup-code throttle's key): the
-/// browser's IP address, given as `ip`, `[ipv6]`, `ip:port` or `[ipv6]:port`.
-///
-/// IPv6 is grouped by `/64`, what one host typically controls. `None` when
-/// the dashboard sent no address or one that is not an IP address, so a
-/// caller cannot mint owners from arbitrary strings.
-#[must_use]
-pub fn source_owner(remote_addr: Option<&str>) -> Option<String> {
-    Some(match client_ip(remote_addr)? {
+    Some(match ip.to_canonical() {
         IpAddr::V6(v6) => {
             let [a, b, c, d, ..] = v6.segments();
             format!("{a:x}:{b:x}:{c:x}:{d:x}::/64")

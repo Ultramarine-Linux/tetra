@@ -1,5 +1,6 @@
 //! Password, TOTP, recovery code and session behavior of the auth service,
 //! with PAM, accounts and `systemd-creds` replaced by fakes.
+#![allow(clippy::tests_outside_test_module)]
 
 mod common;
 
@@ -81,42 +82,6 @@ async fn password_login_issues_a_working_session() {
     assert_eq!(info["user"]["admin"], false);
     assert_eq!(info["session"]["method"], "password");
     assert_eq!(info["permissions"], json!({"launcher": "view"}));
-}
-
-#[tokio::test]
-async fn adding_a_second_factor_needs_a_recent_login() {
-    let dir = tempfile::tempdir().unwrap();
-    let host = host(dir.path());
-    let stale = login(&host.service, "alice").await;
-    // Still inside the session's idle timeout, but past the re-auth window.
-    host.clock
-        .advance(tetra::auth::service::REAUTH_WINDOW.saturating_add(1));
-    ok(
-        &host.service,
-        Dashboard,
-        Some(&stale),
-        "session.info",
-        json!({}),
-    )
-    .await;
-    fails(
-        &host.service,
-        Dashboard,
-        Some(&stale),
-        "account.totp_begin",
-        json!({}),
-        ErrorCode::ReauthRequired,
-    )
-    .await;
-    let fresh = login(&host.service, "alice").await;
-    ok(
-        &host.service,
-        Dashboard,
-        Some(&fresh),
-        "account.totp_begin",
-        json!({}),
-    )
-    .await;
 }
 
 #[tokio::test]

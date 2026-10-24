@@ -160,11 +160,7 @@ impl Setup {
     /// Whether setup has completed. Checked on every use, never cached.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        // Fail closed: a marker that cannot be checked must not reopen setup.
-        self.marker_path().try_exists().unwrap_or_else(|error| {
-            eprintln!("cannot check the setup marker, treating setup as complete: {error}");
-            true
-        })
+        self.marker_path().exists()
     }
 
     /// The current code, generating and storing one if needed. `None` once
@@ -185,17 +181,17 @@ impl Setup {
             let code = key.decrypt(CODE_PURPOSE, &file.code)?;
             return Ok((String::from_utf8(code)?, file));
         }
-        self.create(key, now, 0)
+        self.create(key, now)
     }
 
-    fn create(&self, key: &StoreKey, now: i64, retry_at: i64) -> Result<(String, CodeFile)> {
+    fn create(&self, key: &StoreKey, now: i64) -> Result<(String, CodeFile)> {
         let code = generate_code();
         let mut file = CodeFile {
             header: Header::default(),
             code: key.encrypt(CODE_PURPOSE, code.as_bytes())?,
             created_at: now,
             failures: 0,
-            retry_at,
+            retry_at: 0,
             extra: Extra::new(),
         };
         store::write(&self.code_path(), &mut file)?;
@@ -220,15 +216,10 @@ impl Setup {
             .with_context(|| format!("failed to create `{}`", self.paths.issue_dir.display()))?;
         let banner = format!(
             "Ultramarine Server setup code: {code}\n\
-             Open one of these addresses in a web browser to finish setup:\n\
-             IPv4: https://\\4:6623\n\
-             IPv6: https://[\\6]:6623\n\
-             Use the address available on your network and enter the code above.\n\n"
+             Open this server's address (\\4) in a web browser and enter the code to finish setup.\n\n"
         );
         let issue = self.paths.issue_dir.join(ISSUE_FILE);
-        // Root-only like the code file: agetty reads it as root, and any
-        // local user who could read it could redeem the code.
-        store::replace(&issue, banner.as_bytes(), 0o600)
+        fs::write(&issue, banner).with_context(|| format!("failed to write `{}`", issue.display()))
     }
 
     /// Remove the published code.
@@ -272,7 +263,9 @@ impl Setup {
         file.failures = file.failures.saturating_add(1);
         if file.failures >= ROTATE_AFTER {
             eprintln!("setup code: {ROTATE_AFTER} wrong codes, rotating the code");
-            let (code, _) = self.create(key, now, now.saturating_add(MAX_BACKOFF))?;
+            let (code, mut rotated) = self.create(key, now)?;
+            rotated.retry_at = now.saturating_add(MAX_BACKOFF);
+            store::write(&self.code_path(), &mut rotated)?;
             if let Err(error) = self.publish(&code) {
                 eprintln!("failed to publish the rotated setup code: {error:#}");
             }
@@ -289,11 +282,8 @@ impl Setup {
     ///
     /// # Errors
     /// Fails when the marker cannot be written.
-    pub fn complete(&self, completed_by: Option<&str>, now: i64) -> Result<bool> {
+    pub fn complete(&self, completed_by: Option<&str>, now: i64) -> Result<()> {
         let _lock = StoreLock::acquire(&self.paths.auth_dir)?;
-        if self.is_complete() {
-            return Ok(false);
-        }
         store::write(
             &self.marker_path(),
             &mut MarkerFile {
@@ -304,8 +294,7 @@ impl Setup {
             },
         )?;
         store::remove(&self.code_path())?;
-        self.unpublish()?;
-        Ok(true)
+        self.unpublish()
     }
 }
 
@@ -482,8 +471,6 @@ mod tests {
         );
         let banner = fs::read_to_string(f.paths.issue_dir.join(ISSUE_FILE)).unwrap();
         assert!(banner.contains(&code));
-        assert!(banner.contains(r"https://\4:6623"));
-        assert!(banner.contains(r"https://[\6]:6623"));
         let run = f.paths.run_dir.join(RUN_CODE_FILE);
         assert_eq!(fs::read_to_string(&run).unwrap().trim(), code);
         assert_eq!(
