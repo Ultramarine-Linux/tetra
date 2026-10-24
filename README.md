@@ -179,8 +179,9 @@ sudo target/debug/tetra agent-ws-serve \
 TCP has no peer credentials, the selected client is applied to every
 connection; any local process that reaches the port gets that client identity,
 but every operation still needs what it needs on the socket (a valid Tetra
-session, except the "no token" ones such as login). `--listen` rejects
-non-loopback addresses. TLS is omitted because this
+session, except the "no token" ones such as login). Handshakes with an
+`Origin` header (that is, from a web page in a browser) are refused with 403;
+connect from a backend. `--listen` rejects non-loopback addresses. TLS is omitted because this
 loopback-only development endpoint is not a remote transport and cannot replace
 the process credentials of the Unix socket. Use the Unix socket in production.
 See [docs/auth-protocol.md](docs/auth-protocol.md#development-tcp-listener)

@@ -892,7 +892,14 @@ fn redact_secrets(manifest: &mut AppManifest) {
             *value = YamlValue::String(REDACTED.to_owned());
         }
     }
-    if let crate::types::AppRecipeSource::Inline { recipe, .. } = &mut manifest.recipe {
+    if let crate::types::AppRecipeSource::Inline { recipe, templates } = &mut manifest.recipe {
+        // Template bodies are the units and companion files the app renders
+        // to, which `quadlets.read` keeps with administrators; a template can
+        // also spell out a secret itself (a literal or a `default(...)`).
+        // Names stay so the page can still say what the recipe ships.
+        for body in templates.values_mut() {
+            REDACTED.clone_into(body);
+        }
         let secret_default = crate::catalog::AppRecipe::load_str(recipe).map_or(true, |parsed| {
             parsed
                 .parameters
@@ -1433,6 +1440,12 @@ resources:
         )
         .unwrap();
         assert_eq!(get["app"]["name"], "demo");
+        let templates = get["app"]["recipe"]["templates"].as_object().unwrap();
+        assert!(!templates.is_empty());
+        assert!(
+            templates.values().all(|body| body == REDACTED),
+            "template bodies are withheld: {templates:?}"
+        );
         assert_eq!(get["units"][0]["exists"], true);
         assert_eq!(get["files"][0]["filename"], "site/index.html");
 

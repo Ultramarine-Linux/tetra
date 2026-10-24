@@ -3,7 +3,7 @@ name: Nginx static site
 description: Serve static files with nginx using a Quadlet-managed container.
 category: web
 icon: nginx
-version: 0.1.0
+version: 0.2.0
 requires:
   - podman
   - quadlets

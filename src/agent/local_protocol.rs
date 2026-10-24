@@ -26,8 +26,15 @@ use tokio::{
     sync::{Semaphore, mpsc},
 };
 use tokio_tungstenite::{
-    accept_async_with_config,
-    tungstenite::{Message, protocol::WebSocketConfig},
+    accept_hdr_async_with_config,
+    tungstenite::{
+        Message,
+        handshake::server::{
+            ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
+        },
+        http::StatusCode,
+        protocol::WebSocketConfig,
+    },
 };
 
 use crate::auth::{
@@ -50,6 +57,36 @@ pub(crate) fn websocket_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_MESSAGE_BYTES))
+}
+
+/// Whether a handshake's `Origin` header matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origins {
+    /// The Unix socket: peers are identified by their credentials.
+    Any,
+    /// Loopback TCP: refuse handshakes from web pages.
+    RefuseBrowsers,
+}
+
+impl Origins {
+    /// The handshake callback enforcing this policy.
+    // The callback's types are tungstenite's; its error is an HTTP response.
+    #[allow(clippy::result_large_err)]
+    fn checker(
+        self,
+    ) -> impl FnOnce(&HandshakeRequest, HandshakeResponse) -> Result<HandshakeResponse, ErrorResponse>
+    {
+        move |request, response| {
+            if self == Self::RefuseBrowsers && request.headers().contains_key("origin") {
+                let mut refused = ErrorResponse::new(Some(
+                    "browser connections are refused by the development listener".to_owned(),
+                ));
+                *refused.status_mut() = StatusCode::FORBIDDEN;
+                return Err(refused);
+            }
+            Ok(response)
+        }
+    }
 }
 
 /// Requests one connection may have in flight.
@@ -95,18 +132,47 @@ impl LocalServer {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        if let Err(error) = self.run(stream, client).await {
+        self.handle_with(stream, client, peer, Origins::Any).await;
+    }
+
+    /// [`handle`](Self::handle) for a listener any local process can reach
+    /// (the development TCP listener): a handshake that carries an `Origin`
+    /// header comes from a web page, which browsers let connect to any
+    /// WebSocket, so it is refused. The dashboard and OOBE backends send no
+    /// `Origin`.
+    pub async fn handle_refusing_browsers<S>(
+        self,
+        stream: S,
+        client: Option<ClientKind>,
+        peer: String,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.handle_with(stream, client, peer, Origins::RefuseBrowsers)
+            .await;
+    }
+
+    async fn handle_with<S>(
+        self,
+        stream: S,
+        client: Option<ClientKind>,
+        peer: String,
+        origins: Origins,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        if let Err(error) = self.run(stream, client, origins).await {
             eprintln!("local peer {peer} closed with error: {error:#}");
         }
     }
 
-    async fn run<S>(self, stream: S, client: Option<ClientKind>) -> Result<()>
+    async fn run<S>(self, stream: S, client: Option<ClientKind>, origins: Origins) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let socket = tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
-            accept_async_with_config(stream, Some(websocket_config())),
+            accept_hdr_async_with_config(stream, origins.checker(), Some(websocket_config())),
         )
         .await
         .context("WebSocket handshake timed out")?

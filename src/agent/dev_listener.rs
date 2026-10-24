@@ -13,6 +13,11 @@
 //! the listener only binds loopback addresses, and why it must never ship:
 //! any process on the host can reach it.
 //!
+//! Browsers let any web page open a WebSocket to any address, loopback
+//! included, and only mark it with an `Origin` header. Handshakes that carry
+//! one are refused, so a page open on the development machine cannot use the
+//! listener; the dashboard and OOBE backends send no `Origin`.
+//!
 //! There is no TLS. The listener is loopback-only and development-only; plain
 //! TLS would not identify the local process, while mutual TLS would require a
 //! separate client-credential setup. Do not expose it to other hosts.
@@ -77,7 +82,7 @@ pub async fn serve(listener: TcpListener, server: LocalServer, client: ClientKin
         let server = server.clone();
         tokio::spawn(async move {
             server
-                .handle(stream, Some(client), format!("tcp:{address}"))
+                .handle_refusing_browsers(stream, Some(client), format!("tcp:{address}"))
                 .await;
             drop(permit);
         });
@@ -203,5 +208,36 @@ mod tests {
         assert!(info.ok, "{:?}", info.error);
         assert_eq!(info.result.unwrap()["user"]["username"], "alice");
         socket.close(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_handshakes_from_web_pages() {
+        use tokio_tungstenite::tungstenite::{Error, client::IntoClientRequest, http::HeaderValue};
+
+        let dir = tempfile::tempdir().unwrap();
+        let host = TestHost::new(dir.path()).unwrap();
+        let server = LocalServer {
+            auth: host.service.clone(),
+            host_fingerprint: "fingerprint".into(),
+            shells: crate::agent::shell::ShellServer::system("tetra-shell".into()),
+        };
+        let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, server, ClientKind::Dashboard));
+
+        let mut browser = format!("ws://{address}/").into_client_request().unwrap();
+        browser
+            .headers_mut()
+            .insert("origin", HeaderValue::from_static("https://example.com"));
+        match connect_async(browser).await {
+            Err(Error::Http(response)) => assert_eq!(response.status(), 403),
+            other => panic!("expected a 403, got {other:?}"),
+        }
+
+        // No `Origin`: a backend, which still gets in.
+        let (mut socket, _) = connect_async(format!("ws://{address}/")).await.unwrap();
+        let ServerFrame::Hello { .. } = receive(&mut socket).await else {
+            panic!("expected hello")
+        };
     }
 }

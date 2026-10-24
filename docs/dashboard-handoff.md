@@ -220,12 +220,17 @@ export function bundleSha256(recipe: string, templates: Record<string, string>):
   the default for non-admins.
 - **`apps.get`** shows secret parameter values as `"********"`. Send the
   placeholder back unchanged on update and Tetra keeps the stored value.
+  Template bodies under `app.recipe.templates` are `"********"` as well
+  (names kept); don't display them as content.
 - **Services in apps scope:** `services.list`/`status` with
   `"scope": "apps"` now default to `run_as: apps` (the account's user
   manager); no need to send it.
 - **nginx-site recipe layout:** content is in `site/` and config in `conf/`
-  of the bundle (only `site/` is served); an `apps.update` moves existing
-  installs.
+  of the bundle (only `site/` is served). The recipe is now version 0.2.0.
+  A plain `apps.update` re-renders the snapshot stored at install time, so
+  existing installs keep the old layout (and keep serving `app.json`) until
+  they are updated *with the new recipe source*; offer that upgrade when the
+  catalog's version is newer than the app's `recipe_version`.
 - **Apps-scope ports:** `apps.create`/`update` in apps scope refuse a
   `PublishPort=` host port below 1024 (rootless can't bind it); offer 1024+
   in the UI.
