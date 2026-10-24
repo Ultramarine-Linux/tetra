@@ -652,9 +652,13 @@ async fn run_daemon(
     let shells = ShellServer::system(cli.shell_pam_service);
     // Web shells a previous run left behind (a crash or restart hangs up
     // their terminals, which a shell may ignore). Asynchronous, and it
-    // leaves alone the shells this run opens meanwhile.
-    let sweep = shells.clone();
-    tokio::spawn(async move { sweep.stop_leftover_units().await });
+    // leaves alone the shells this run opens meanwhile. Only the real
+    // daemon: a development listener run on the same host would otherwise
+    // stop `tetra.service`'s live shells.
+    if matches!(listener, Listener::Socket { .. }) {
+        let sweep = shells.clone();
+        tokio::spawn(async move { sweep.stop_leftover_units().await });
+    }
     let server = LocalServer {
         auth: auth.clone(),
         host_fingerprint,

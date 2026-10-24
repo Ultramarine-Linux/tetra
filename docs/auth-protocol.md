@@ -500,9 +500,10 @@ unit (`systemd-run --user`, user services with `loginctl enable-linger`)
 are not stopped. Output waits when the dashboard reads slower than the
 shell writes, so neither side buffers without bound. If Tetra stops,
 systemd kills its systemd-run processes, which hangs up every shell's
-terminal; a shell that ignores `SIGHUP` keeps running in its unit until
-Tetra starts again, which stops every `tetra-shell-*.service` it did not
-start itself.
+terminal, and `tetra.service`'s `ExecStopPost=` stops every
+`tetra-shell-*.service`, so a shell that ignores `SIGHUP` goes too. If Tetra
+crashes and is restarted, the new run stops every `tetra-shell-*.service` it
+did not start itself.
 
 ### Access and setup completion
 
