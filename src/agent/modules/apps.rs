@@ -1832,7 +1832,7 @@ resources:
     }
 
     /// The nginx-site recipe (a test fixture copy of the one in
-    /// Ultramarine-Server/recipes) serves only `site/` (not `app.json`) and
+    /// Ultramarine-Linux/recipes) serves only `site/` (not `app.json`) and
     /// relabels what it mounts.
     #[test]
     fn nginx_site_serves_only_its_site_directory() {

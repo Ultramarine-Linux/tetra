@@ -90,20 +90,22 @@ cargo build --no-default-features --features recipes,quadlets
 ## Render Recipes
 
 Tetra doesn't ship recipes. The app recipes and their Tera templates live in
-[Ultramarine-Server/recipes](https://github.com/Ultramarine-Server/recipes);
+[Ultramarine-Linux/recipes](https://github.com/Ultramarine-Linux/recipes);
 the dashboard fetches them and sends them to Tetra inline. To render one
 locally, clone that repository and point `--templates-dir` at its `templates/`
-directory (`recipe.yaml` below is any recipe from that checkout):
+directory:
 
 ```sh
-git clone https://github.com/Ultramarine-Server/recipes ../recipes
-cargo run -- render recipe.yaml --templates-dir ../recipes/templates --output-dir ./quadlets
+git clone https://github.com/Ultramarine-Linux/recipes ../recipes
+cargo run -- render ../recipes/recipes/official/nginx-site/recipe.yaml \
+  --templates-dir ../recipes/templates --output-dir ./quadlets
 ```
 
 Preview without writing:
 
 ```sh
-cargo run -- render recipe.yaml --templates-dir ../recipes/templates --dry-run
+cargo run -- render ../recipes/recipes/official/nginx-site/recipe.yaml \
+  --templates-dir ../recipes/templates --dry-run
 ```
 
 Parameter values are supplied as a simple YAML map:

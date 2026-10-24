@@ -351,8 +351,8 @@ pinned policy and require the explicit custom-only opt-out. This is an image pol
 for arbitrary host configuration in administrator-supplied recipes.
 See [Quadlet documentation](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html).
 
-Tetra doesn't ship recipes. The official recipes live in
-[Ultramarine-Server/recipes](https://github.com/Ultramarine-Server/recipes),
+Tetra doesn't ship recipes. The official and community recipes live in
+[Ultramarine-Linux/recipes](https://github.com/Ultramarine-Linux/recipes),
 whose checks require every `Image=` to be pinned as `name@sha256:<digest>`.
 Tags are retained for humans; Podman accepts `tag@digest` and pulls the
 digest. Refresh pins deliberately when updating templates; installation never

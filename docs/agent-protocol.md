@@ -584,7 +584,7 @@ the computed digest. Context actions are unchanged. No catalog fetching occurs.
 See [image policy and limitations](recipes.md#rendered-image-policy).
 
 `render` payload (`templates_dir` here is the `templates/` directory of an
-[Ultramarine-Server/recipes](https://github.com/Ultramarine-Server/recipes)
+[Ultramarine-Linux/recipes](https://github.com/Ultramarine-Linux/recipes)
 checkout; Tetra doesn't ship templates):
 
 ```json
