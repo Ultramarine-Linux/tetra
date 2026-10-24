@@ -1,8 +1,10 @@
 [Unit]
 Description=Tetra Host Agent
 Requires=tetra.socket
-After=tetra.socket network-online.target
-Wants=network-online.target
+After=tetra.socket
+# No network-online.target: clients come over the Unix socket, and the OOBE
+# needs Tetra to bring the network up in the first place (Wi-Fi). The
+# outbound control-plane connection retries with backoff until it is up.
 
 [Service]
 Type=simple
