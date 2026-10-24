@@ -1,11 +1,34 @@
+[workspace]
+members = ["crates/tetra-recipe"]
+# Plain `cargo build/test/clippy` (as the shared CI workflow runs them) cover
+# the recipe crate too, not only the root package.
+default-members = [".", "crates/tetra-recipe"]
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/Ultramarine-Linux/tetra"
+homepage = "https://github.com/Ultramarine-Linux/tetra"
+
+# Versions shared by `tetra` and `tetra-recipe`, kept in one place.
+[workspace.dependencies]
+anyhow = "1"
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_norway = "0.9"
+sha2 = "0.11"
+tempfile = "3"
+tera = "2.0"
+
 [package]
 name = "tetra"
 version = "0.2.3"
-edition = "2024"
-license = "AGPL-3.0-or-later"
+edition.workspace = true
+license.workspace = true
 description = "A modular host agent for Ultramarine Server and cloud hosts"
-repository = "https://github.com/Ultramarine-Linux/tetra"
-homepage = "https://github.com/Ultramarine-Linux/tetra"
+repository.workspace = true
+homepage.workspace = true
 documentation = "https://developer.fyralabs.com/tetra"
 
 [features]
@@ -52,7 +75,8 @@ dev-listener = []
 
 
 [dependencies]
-anyhow = "1"
+tetra-recipe = { path = "crates/tetra-recipe" }
+anyhow.workspace = true
 base64 = "0.23"
 clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = "3.0"
@@ -60,16 +84,16 @@ futures-util = { version = "0.3", default-features = false, features = [
     "sink",
     "std",
 ] }
-rand = "0.10"
+rand.workspace = true
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls-native-roots-no-provider",
 ] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_norway = "0.9"
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
 socket2 = { version = "0.6", features = ["all"] }
-tera = "2.0"
+tera.workspace = true
 tokio = { version = "1", features = [
     "io-util",
     "macros",
@@ -95,7 +119,7 @@ x509-parser = "0.18.1"
 chacha20poly1305 = "0.10"
 nix = { version = "0.31", features = ["fs", "signal", "user"] }
 pam-client = { version = "0.5", default-features = false }
-sha2 = "0.11"
+sha2.workspace = true
 subtle = "2.6"
 totp-rs = { version = "6", features = ["gen_secret", "otpauth"] }
 webauthn-rs = { version = "0.5", features = ["conditional-ui"] }
@@ -105,7 +129,7 @@ nix = { version = "0.31", features = ["term"] }
 # Integration tests use the fakes in `tetra::auth::testing`.
 tetra = { path = ".", default-features = false, features = ["testing"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
-tempfile = "3"
+tempfile.workspace = true
 time = "0.3"
 # The in-process mTLS controller fixture in `tests/remote_enrollment.rs`.
 tokio-rustls = "0.26"

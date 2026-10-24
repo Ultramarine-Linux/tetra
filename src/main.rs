@@ -35,7 +35,7 @@ use tetra::{
         pam::{self as tetra_pam, LibPam},
         seal::SystemdCreds,
     },
-    catalog::{RenderOptions, RenderedResource},
+    catalog::{RenderOptions, RenderedResource, WriteRendered as _},
     enrollment::{self, store::DEFAULT_ENROLLMENT_DIR, store::Enrollment},
 };
 

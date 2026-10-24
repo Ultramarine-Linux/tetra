@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{RenderedResource, ResourceKind};
+use crate::{RenderedResource, ResourceKind};
 
 /// Caller-supplied catalog classification; not proof of publisher identity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

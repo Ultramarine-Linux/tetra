@@ -351,11 +351,12 @@ pinned policy and require the explicit custom-only opt-out. This is an image pol
 for arbitrary host configuration in administrator-supplied recipes.
 See [Quadlet documentation](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html).
 
-Bundled nginx:alpine, mariadb:11, nextcloud:latest, and redis:7-alpine use
-multi-platform index digests retrieved using `skopeo inspect --raw` on
-2026-10-23. Tags are retained for humans; Podman accepts `tag@digest` and pulls
-the digest (verified with `podman pull` for bundled nginx). Refresh these pins
-deliberately when updating templates; installation never resolves tags.
+Tetra doesn't ship recipes. The official recipes live in
+[Ultramarine-Server/recipes](https://github.com/Ultramarine-Server/recipes),
+whose checks require every `Image=` to be pinned as `name@sha256:<digest>`.
+Tags are retained for humans; Podman accepts `tag@digest` and pulls the
+digest. Refresh pins deliberately when updating templates; installation never
+resolves tags.
 
 `AppManifest.source` stores verified provenance with the computed lowercase
 digest; `allow_unpinned_images` records the policy. Old manifests load with no
@@ -372,7 +373,7 @@ rechecks the stored/replacement bundle and newly rendered images.
   install them via the `quadlets.install.files` agent action.
 - Bind-mount companion *subdirectories* of the bundle, never the bundle itself:
   `apps` keeps `app.json` (the app's values, secrets included) at the bundle
-  root. The shipped `nginx-site` recipe puts content in `site/` and its nginx
+  root. The official `nginx-site` recipe puts content in `site/` and its nginx
   config in `conf/`, and mounts `Volume={{ bundle_dir }}/site:/usr/share/nginx/html:ro,z`.
   Use `,z` (shared `container_file_t`), not `,Z`: the bundle belongs to the
   apps account, so rootless Podman may relabel it, but Tetra rewrites its

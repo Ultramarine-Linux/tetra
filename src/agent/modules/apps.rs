@@ -1831,13 +1831,14 @@ resources:
         .unwrap();
     }
 
-    /// The shipped nginx-site recipe serves only `site/` (not `app.json`)
-    /// and relabels what it mounts.
+    /// The nginx-site recipe (a test fixture copy of the one in
+    /// Ultramarine-Server/recipes) serves only `site/` (not `app.json`) and
+    /// relabels what it mounts.
     #[test]
     fn nginx_site_serves_only_its_site_directory() {
         let base = tempfile::tempdir().unwrap();
         let files = tempfile::tempdir().unwrap();
-        let templates = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
+        let templates = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/templates");
         let response = dispatch(
             "create",
             json!({

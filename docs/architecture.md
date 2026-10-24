@@ -13,7 +13,7 @@ tetra/
 │   ├── main.rs           # CLI entry point (subcommands, argument parsing)
 │   ├── lib.rs            # Public API: agent, auth, catalog, enrollment, types
 │   ├── prelude.rs        # The few imports nearly every file needs (anyhow, serde, Value, Path, fs, io)
-│   ├── catalog.rs        # Recipe engine (YAML → Tera → Quadlet units)
+│   ├── catalog.rs        # Re-exports `tetra-recipe`; writes rendered files (`WriteRendered`)
 │   ├── types/            # Shared module payload types (serde), one file per module area
 │   ├── auth/             # Login, sessions, authorization (see auth-protocol.md)
 │   │   ├── service/      # AuthService: every local-socket operation (one file per area; shell_ops.rs: shell.ticket)
@@ -80,15 +80,20 @@ tetra/
 │           ├── updates.rs
 │           ├── remote_access.rs
 │           └── virtual_machines.rs
+├── crates/
+│   └── tetra-recipe/     # Recipe engine (YAML → Tera → Quadlet units), digest, image policy
 ├── tests/                # Integration tests (see Testing)
 └── systemd/, pam/, examples/
 ```
 
 ## The recipe engine (`catalog`)
 
-The recipe engine (`src/catalog.rs`) turns YAML recipes into rendered Quadlet
-unit files and companion files using [Tera](https://keats.github.io/tera/docs/)
-templates.
+The recipe engine (the `tetra-recipe` workspace crate in
+`crates/tetra-recipe`, re-exported as `tetra::catalog`) turns YAML recipes
+into rendered Quadlet unit files and companion files using
+[Tera](https://keats.github.io/tera/docs/) templates. It has no host-agent
+dependencies, so the recipes repository tooling uses the same schema,
+validation, bundle digest and image policy.
 
 Key concepts:
 
