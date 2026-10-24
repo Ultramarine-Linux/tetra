@@ -1,3 +1,0 @@
-[Network]
-NetworkName={{ app_id }}-net
-Driver=bridge

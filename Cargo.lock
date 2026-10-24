@@ -2096,6 +2096,7 @@ dependencies = [
  "tempfile",
  "tera",
  "tetra",
+ "tetra-recipe",
  "time",
  "tokio",
  "tokio-rustls",
@@ -2104,6 +2105,20 @@ dependencies = [
  "webauthn-authenticator-rs",
  "webauthn-rs",
  "x509-parser 0.18.1",
+]
+
+[[package]]
+name = "tetra-recipe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "sha2",
+ "tempfile",
+ "tera",
 ]
 
 [[package]]

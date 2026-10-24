@@ -310,19 +310,19 @@ fn disk_snapshot_and_bundled_templates_pass() {
     for (filename, contents) in [
         (
             "nginx.container",
-            include_str!("../templates/containers/nginx-site.container.tera"),
+            include_str!("fixtures/templates/containers/nginx-site.container.tera"),
         ),
         (
             "mariadb.container",
-            include_str!("../templates/containers/mariadb.container.tera"),
+            include_str!("fixtures/templates/containers/mariadb.container.tera"),
         ),
         (
             "nextcloud.container",
-            include_str!("../templates/containers/nextcloud.container.tera"),
+            include_str!("fixtures/templates/containers/nextcloud.container.tera"),
         ),
         (
             "redis.container",
-            include_str!("../templates/containers/redis.container.tera"),
+            include_str!("fixtures/templates/containers/redis.container.tera"),
         ),
     ] {
         verify_images(&[resource(filename, contents)], false, None).unwrap();

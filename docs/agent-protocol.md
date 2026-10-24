@@ -583,12 +583,14 @@ writes, including dry runs. Responses include verified `source` metadata and
 the computed digest. Context actions are unchanged. No catalog fetching occurs.
 See [image policy and limitations](recipes.md#rendered-image-policy).
 
-`render` payload:
+`render` payload (`templates_dir` here is the `templates/` directory of an
+[Ultramarine-Server/recipes](https://github.com/Ultramarine-Server/recipes)
+checkout; Tetra doesn't ship templates):
 
 ```json
 {
   "recipe_path": "schema.yaml",
-  "templates_dir": "./templates",
+  "templates_dir": "../recipes/templates",
   "values_path": "examples/nextcloud.values.yaml",
   "output_dir": "./quadlets",
   "dry_run": true
@@ -2305,7 +2307,7 @@ disables it and removes the drop-in and the sealed token; as with
   "action": "render",
   "payload": {
     "recipe_path": "schema.yaml",
-    "templates_dir": "./templates",
+    "templates_dir": "../recipes/templates",
     "values_path": "examples/nextcloud.values.yaml",
     "dry_run": true
   }
