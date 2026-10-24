@@ -21,10 +21,16 @@
 //! here. Full update management (status, history, manual runs) is a later
 //! module.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::json;
+
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 use crate::agent::module_support::{
-    Commands, NoPayload, drop_in, install_drop_in, parse_action, unit_enabled,
+    Commands, ModuleInfo, ModuleStatus, NoPayload, drop_in, install_drop_in, parse_action,
+    unit_enabled,
 };
 use crate::auth::service::{AuthConfig, DEFAULT_STATE_DIR};
 use crate::auth::store::{self, Extra, Header, Record};
@@ -195,9 +201,6 @@ struct SetPolicy {
 }
 
 fn handle(paths: &Paths, action: &str, payload: Value) -> Result<Value> {
-    if let Some(response) = INFO.metadata_response(action, &payload) {
-        return Ok(response);
-    }
     let action: Action = parse_action(action, payload)?;
     let variant = Variant::detect(Path::new(OSTREE_BOOTED));
     let timer_enabled = || unit_enabled(variant.timer());
@@ -232,14 +235,14 @@ fn get_policy(paths: &Paths, variant: Variant, timer_enabled: bool) -> Result<Va
     let policy = store::read::<PolicyFile>(&paths.policy)?.map(|file| file.policy);
     let effective = effective_policy(paths, variant, timer_enabled);
     let mismatch = policy.is_some() && policy != effective;
-    Ok(jsonf! {
-        policy,
-        variant,
+    Ok(json!({
+        "policy": policy,
+        "variant": variant,
         "timer": variant.timer(),
-        timer_enabled,
-        effective,
-        mismatch,
-    })
+        "timer_enabled": timer_enabled,
+        "effective": effective,
+        "mismatch": mismatch,
+    }))
 }
 
 /// Enable or disable the variant's timer (and on mutable hosts install or
@@ -288,7 +291,9 @@ fn set_policy(
     if !dry_run {
         let updated_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX));
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+            });
         let mut file = stored.map_or_else(
             || PolicyFile {
                 header: Header::default(),
@@ -304,7 +309,14 @@ fn set_policy(
         );
         store::write(&paths.policy, &mut file)?;
     }
-    Ok(jsonf! { policy, variant, timer, "stored": !dry_run, dry_run, "commands": commands.done })
+    Ok(json!({
+        "policy": policy,
+        "variant": variant,
+        "timer": timer,
+        "stored": !dry_run,
+        "dry_run": dry_run,
+        "commands": commands.done,
+    }))
 }
 
 #[cfg(test)]
@@ -333,13 +345,9 @@ mod tests {
 
     /// `set_policy` as a dry run.
     fn plan(paths: &Paths, variant: Variant, policy: Policy) -> Result<Value> {
-        set_policy(
-            paths,
-            variant,
-            policy,
-            Commands::new(true),
-            &|| unreachable!("a dry run does not check the timer"),
-        )
+        set_policy(paths, variant, policy, Commands::new(true), &|| {
+            unreachable!("a dry run does not check the timer")
+        })
     }
 
     /// `set_policy` for real, with a `systemctl` that fails `failing`
@@ -414,8 +422,11 @@ mod tests {
         let paths = paths(dir.path());
         assert!(install_drop_in(&paths.dnf_drop_in(), DNF_DROP_IN, false).unwrap());
         assert_eq!(
-            fs::read_to_string(dir.path().join("systemd/dnf5-automatic.service.d/50-tetra.conf"))
-                .unwrap(),
+            fs::read_to_string(
+                dir.path()
+                    .join("systemd/dnf5-automatic.service.d/50-tetra.conf")
+            )
+            .unwrap(),
             "# Managed by Tetra (updates.set_policy).\n[Service]\nExecStart=\n\
              ExecStart=/usr/bin/dnf5 automatic --timer --installupdates\n"
         );
@@ -448,7 +459,11 @@ mod tests {
         assert_eq!(response["effective"], "automatic");
         assert_eq!(response["mismatch"], false);
 
-        fs::write(&paths.policy, r#"{"schema": 1, "compat": 1, "policy": "automatic"}"#).unwrap();
+        fs::write(
+            &paths.policy,
+            r#"{"schema": 1, "compat": 1, "policy": "automatic"}"#,
+        )
+        .unwrap();
         for (variant, timer_enabled, drop_in, effective, mismatch) in [
             (Variant::Bootc, true, false, json!("automatic"), false),
             (Variant::Bootc, false, false, json!("notify"), true),
@@ -461,8 +476,14 @@ mod tests {
                 install_drop_in(&paths.dnf_drop_in(), DNF_DROP_IN, false).unwrap();
             }
             let response = get_policy(&paths, variant, timer_enabled).unwrap();
-            assert_eq!(response["effective"], effective, "{variant:?} {timer_enabled}");
-            assert_eq!(response["mismatch"], mismatch, "{variant:?} {timer_enabled}");
+            assert_eq!(
+                response["effective"], effective,
+                "{variant:?} {timer_enabled}"
+            );
+            assert_eq!(
+                response["mismatch"], mismatch,
+                "{variant:?} {timer_enabled}"
+            );
         }
     }
 
@@ -471,7 +492,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = paths(dir.path());
         let path = &paths.policy;
-        assert_eq!(get_policy(&paths, Variant::Bootc, false).unwrap()["policy"], Value::Null);
+        assert_eq!(
+            get_policy(&paths, Variant::Bootc, false).unwrap()["policy"],
+            Value::Null
+        );
         // A file written by a newer release keeps its unknown fields.
         fs::write(
             path,
@@ -506,7 +530,8 @@ mod tests {
         )
         .unwrap();
         apply(&paths, Variant::Bootc, Policy::Notify, "", false).unwrap();
-        let stored: Value = serde_json::from_str(&fs::read_to_string(&paths.policy).unwrap()).unwrap();
+        let stored: Value =
+            serde_json::from_str(&fs::read_to_string(&paths.policy).unwrap()).unwrap();
         assert_eq!(stored["policy"], "notify");
         assert_eq!(stored["window"], "sun 03:00");
         assert!(stored["updated_at"].as_i64().unwrap() > 0);
@@ -556,7 +581,10 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(
-            store::read::<PolicyFile>(&paths.policy).unwrap().unwrap().policy,
+            store::read::<PolicyFile>(&paths.policy)
+                .unwrap()
+                .unwrap()
+                .policy,
             Policy::Notify
         );
     }
@@ -573,8 +601,11 @@ mod tests {
     fn get_policy_takes_null_or_an_empty_object() {
         let dir = tempfile::tempdir().unwrap();
         let module = UpdatesModule::with_paths(paths(dir.path()));
-        fs::write(dir.path().join("updates.json"), r#"{"schema": 1, "compat": 1, "policy": "notify"}"#)
-            .unwrap();
+        fs::write(
+            dir.path().join("updates.json"),
+            r#"{"schema": 1, "compat": 1, "policy": "notify"}"#,
+        )
+        .unwrap();
         for payload in [Value::Null, json!({})] {
             let response = module.handle("get_policy", payload, None).unwrap();
             // Read from the module's paths.
@@ -587,10 +618,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let module = UpdatesModule::with_paths(paths(dir.path()));
         module
-            .handle("set_policy", json!({"policy": "sometimes", "dry_run": true}), None)
+            .handle(
+                "set_policy",
+                json!({"policy": "sometimes", "dry_run": true}),
+                None,
+            )
             .unwrap_err();
         let response = module
-            .handle("set_policy", json!({"policy": "notify", "dry_run": true}), None)
+            .handle(
+                "set_policy",
+                json!({"policy": "notify", "dry_run": true}),
+                None,
+            )
             .unwrap();
         assert_eq!(response["policy"], "notify");
         assert!(INFO.is_privileged("set_policy"));

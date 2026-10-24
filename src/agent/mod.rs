@@ -4,44 +4,39 @@
 //! Architecture at a glance:
 //!
 //! - [`Dispatcher`] routes an [`AgentCommand`] `{module, action, payload}`
-//!   envelope to the matching [`AgentModule`] and returns an [`AgentResponse`].
-//! - [`modules`] holds one `AgentModule` implementation per host-management
+//!   envelope to the matching [`Mod`](modules::Mod) and returns an [`AgentResponse`].
+//! - [`modules`] holds one [`Mod`](modules::Mod) implementation per host-management
 //!   surface (settings, files, services, quadlets, recipes, …), each gated by
 //!   a Cargo feature so installs only ship what they need.
 //! - [`module_support`] provides the shared plumbing every module uses:
 //!   `ModuleInfo` metadata, the `capabilities`/`plan` meta-actions, the dry-run
 //!   command runner, and the shared SELinux-labeling helper.
-//! - [`backend`] wraps the dispatcher in a Kameo actor so transports can handle
-//!   commands concurrently without sharing a `&mut Dispatcher`.
-//! - Transports — [`local_socket`], [`vsock`] and [`websocket`] — feed the same
-//!   envelope shape into the same backend. [`local_socket`] is the only
-//!   listener in production; [`transport`] holds the shared endpoint-parsing
+//! - [`queue`] runs commands from every transport one at a time on the
+//!   blocking pool.
+//! - Transports — [`local_socket`] and [`websocket`] — feed the same envelope
+//!   shape into the same queue. [`local_socket`] is the only listener in
+//!   production; the development-only `dev_listener` serves the same session
+//!   protocol on loopback TCP. [`transport`] holds the outbound endpoint
 //!   config.
 
-pub mod backend;
+pub mod apps_account;
 pub mod command;
 pub mod config;
-pub mod crypto;
 #[cfg(feature = "dev-listener")]
 pub mod dev_listener;
 pub mod dispatcher;
 pub mod identity;
 pub mod local_protocol;
 pub mod local_socket;
-pub mod messages;
 pub mod module_support;
 pub mod modules;
 pub mod peer;
-pub mod protocol;
 pub mod queue;
 pub mod remote;
+pub mod shell;
 pub mod transport;
-pub mod verify_password;
-pub mod vsock;
+pub mod tree;
 pub mod websocket;
-pub mod websocket_server;
 
-pub use backend::AgentBackend;
 pub use command::{AgentCommand, AgentResponse};
 pub use dispatcher::Dispatcher;
-pub use messages::DispatchCommand;

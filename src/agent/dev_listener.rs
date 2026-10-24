@@ -1,116 +1,207 @@
-//! Development TCP listener for the authenticated WebSocket protocol
-//! (`agent-ws-serve`).
+//! Development TCP listener for the session protocol (`agent-ws-serve`).
 //!
 //! Compiled only with the `dev-listener` feature, so release builds cannot
-//! listen on the network. Production clients use [`super::local_socket`].
+//! listen on the network. It serves exactly what the Unix socket serves
+//! ([`super::local_protocol`]: `hello`, then token-authenticated requests to
+//! the same [`AuthService`](crate::auth::AuthService)), so a dashboard or OOBE
+//! checkout can run against a real Tetra without the socket, its group, or
+//! the service accounts.
+//!
+//! TCP has no peer credentials, so the listener cannot tell the dashboard
+//! from the OOBE, or either from any other local process. Every connection is
+//! treated as the one [`ClientKind`] given on the command line. That is why
+//! the listener only binds loopback addresses, and why it must never ship:
+//! any process on the host can reach it.
+//!
+//! There is no TLS. The listener is loopback-only and development-only; plain
+//! TLS would not identify the local process, while mutual TLS would require a
+//! separate client-credential setup. Do not expose it to other hosts.
+//! Production uses the Unix socket.
 
-use std::{fs::File, io::BufReader, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
-use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
+use tokio::{net::TcpListener, sync::Semaphore};
 
-use super::websocket_server::ServerState;
+use super::{
+    local_protocol::LocalServer,
+    local_socket::{MAX_CONNECTIONS, transient_accept_error},
+};
+use crate::auth::sessions::ClientKind;
 
-#[derive(Debug, Clone)]
-pub struct WebSocketServerConfig {
-    pub listen: SocketAddr,
-    /// Explicit controller key for development. Once enrolled, the persisted
-    /// key under `identity_dir` is used on subsequent starts.
-    pub controller_public_key: Option<String>,
-    /// One-time token accepted only while no controller key is enrolled.
-    pub enrollment_token: Option<String>,
-    pub identity_dir: PathBuf,
-    /// Paths to TLS certificate and key
-    pub tls_cert_key_path: Option<(PathBuf, PathBuf)>,
-}
-impl WebSocketServerConfig {
-    fn tls_acceptor(&self) -> Result<Option<TlsAcceptor>> {
-        Ok((self.tls_cert_key_path.as_ref())
-            .map(Self::load_tls_config)
-            .transpose()?
-            .map(Arc::new)
-            .map(TlsAcceptor::from))
-    }
+/// Default address of `agent-ws-serve`.
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:7780";
 
-    fn load_tls_config((cert_path, key_path): &(PathBuf, PathBuf)) -> Result<rustls::ServerConfig> {
-        let mut cert_reader = BufReader::new(File::open(cert_path).with_context(|| {
-            format!("failed to open TLS certificate `{}`", cert_path.display())
-        })?);
-        let certificates = rustls_pemfile::certs(&mut cert_reader)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to parse TLS certificate PEM")?;
-        let mut key_reader = BufReader::new(
-            File::open(key_path)
-                .with_context(|| format!("failed to open TLS key `{}`", key_path.display()))?,
-        );
-        let key = rustls_pemfile::private_key(&mut key_reader)
-            .context("failed to parse TLS private key PEM")?
-            .ok_or_else(|| anyhow::anyhow!("TLS private key PEM contains no private key"))?;
-        rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certificates, key)
-            .context("invalid TLS certificate/private-key pair")
-    }
-
-    pub async fn serve(self) -> Result<()> {
-        let tls_acceptor = self.tls_acceptor()?;
-        validate_listener_security(&self.listen, tls_acceptor.is_some())?;
-
-        let state = ServerState::load(
-            &self.identity_dir,
-            self.controller_public_key,
-            self.enrollment_token,
-        )?;
-        let listener = TcpListener::bind(self.listen).await.with_context(|| {
-            format!(
-                "failed to bind development WebSocket listener on {}",
-                self.listen
-            )
-        })?;
-
-        eprintln!(
-            "serving authenticated Tetra WebSocket on {}://{}",
-            if tls_acceptor.is_some() { "wss" } else { "ws" },
-            self.listen
-        );
-        state.log_identity();
-
-        loop {
-            let (stream, peer) = listener.accept().await?;
-            let state = state.clone();
-            let tls_acceptor = tls_acceptor.clone();
-            tokio::spawn(async move {
-                match tls_acceptor {
-                    Some(acceptor) => match acceptor.accept(stream).await {
-                        Ok(stream) => state.handle(stream, peer.to_string()).await,
-                        Err(error) => eprintln!("TLS peer {peer} failed handshake: {error}"),
-                    },
-                    None => state.handle(stream, peer.to_string()).await,
-                }
-            });
-        }
-    }
+/// Bind `listen`, refusing anything but a loopback address.
+pub async fn bind(listen: SocketAddr) -> Result<TcpListener> {
+    ensure_loopback(listen)?;
+    let listener = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("failed to bind the development listener on {listen}"))?;
+    Ok(listener)
 }
 
-#[inline]
-fn validate_listener_security(listen: &SocketAddr, tls_enabled: bool) -> Result<()> {
+fn ensure_loopback(listen: SocketAddr) -> Result<()> {
+    // `to_canonical` so that `::ffff:127.0.0.1` counts as loopback too.
     ensure!(
-        listen.ip().is_loopback() || tls_enabled,
-        "non-loopback WebSocket listeners require --tls-cert and --tls-key"
+        listen.ip().to_canonical().is_loopback(),
+        "the development listener only binds loopback addresses (127.0.0.0/8 or ::1), not {}",
+        listen.ip()
     );
     Ok(())
+}
+
+/// Accept connections forever and run the session protocol on each as
+/// `client`.
+pub async fn serve(listener: TcpListener, server: LocalServer, client: ClientKind) -> Result<()> {
+    eprintln!(
+        "development listener: serving the session protocol on ws://{} as the {client:?} \
+         to any local process",
+        listener.local_addr()?
+    );
+    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    loop {
+        let (stream, address) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) if transient_accept_error(&error) => {
+                eprintln!("failed to accept a development client: {error}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+            Err(error) => return Err(error).context("failed to accept a development client"),
+        };
+        let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
+            eprintln!("refusing a development client: {MAX_CONNECTIONS} connections are open");
+            continue;
+        };
+        let server = server.clone();
+        tokio::spawn(async move {
+            server
+                .handle(stream, Some(client), format!("tcp:{address}"))
+                .await;
+            drop(permit);
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        agent::local_protocol::{ClientFrame, ServerFrame},
+        auth::{
+            api::{Request, Response},
+            testing::TestHost,
+        },
+    };
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{Value, json};
+    use tokio::net::TcpStream;
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
-    #[test]
-    fn rejects_non_loopback_plaintext_listener() {
-        let address: SocketAddr = "192.0.2.1:7780".parse().unwrap();
-        validate_listener_security(&address, false).unwrap_err();
-        validate_listener_security(&address, true).unwrap();
-        validate_listener_security(&"127.0.0.1:7780".parse().unwrap(), false).unwrap();
+    type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    #[tokio::test]
+    async fn refuses_non_loopback_addresses() {
+        for address in [
+            "0.0.0.0:7780",
+            "192.0.2.1:7780",
+            "[::]:7780",
+            "[2001:db8::1]:7780",
+        ] {
+            ensure_loopback(address.parse().unwrap()).unwrap_err();
+        }
+        for address in [
+            "127.0.0.1:7780",
+            "127.1.2.3:7780",
+            "[::1]:7780",
+            "[::ffff:127.0.0.1]:7780",
+        ] {
+            ensure_loopback(address.parse().unwrap()).unwrap();
+        }
+        bind("0.0.0.0:0".parse().unwrap()).await.unwrap_err();
+    }
+
+    async fn receive(socket: &mut Socket) -> ServerFrame {
+        let message = socket.next().await.unwrap().unwrap();
+        serde_json::from_str(message.to_text().unwrap()).unwrap()
+    }
+
+    async fn request(
+        socket: &mut Socket,
+        id: &str,
+        token: Option<&str>,
+        op: &str,
+        params: Value,
+    ) -> Response {
+        let frame = ClientFrame::Request(Request {
+            id: id.into(),
+            token: token.map(str::to_owned),
+            op: op.into(),
+            params,
+        });
+        let text = serde_json::to_string(&frame).unwrap();
+        socket.send(Message::Text(text.into())).await.unwrap();
+        let ServerFrame::Response(response) = receive(socket).await else {
+            panic!("expected a response to {op}")
+        };
+        assert_eq!(response.id, id);
+        response
+    }
+
+    #[tokio::test]
+    async fn a_tcp_client_says_hello_and_logs_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = TestHost::new(dir.path()).unwrap();
+        host.accounts.add("alice", 1000, &[]);
+        host.passwords.set("alice", "hunter2");
+        let server = LocalServer {
+            auth: host.service.clone(),
+            host_fingerprint: "fingerprint".into(),
+            shells: crate::agent::shell::ShellServer::system("tetra-shell".into()),
+        };
+        let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, server, ClientKind::Oobe));
+
+        let (mut socket, _) = connect_async(format!("ws://{address}/")).await.unwrap();
+        let ServerFrame::Hello {
+            client,
+            host_fingerprint,
+            ..
+        } = receive(&mut socket).await
+        else {
+            panic!("expected hello")
+        };
+        assert_eq!(client, ClientKind::Oobe, "the --client kind applies");
+        assert_eq!(host_fingerprint, "fingerprint");
+
+        let wrong = request(
+            &mut socket,
+            "1",
+            None,
+            "auth.password",
+            json!({"username": "alice", "password": "wrong"}),
+        )
+        .await;
+        assert!(!wrong.ok);
+
+        let login = request(
+            &mut socket,
+            "2",
+            None,
+            "auth.password",
+            json!({"username": "alice", "password": "hunter2"}),
+        )
+        .await;
+        assert!(login.ok, "{:?}", login.error);
+        let result = login.result.unwrap();
+        assert_eq!(result["status"], "authenticated", "{result}");
+        let token = result["token"].as_str().unwrap();
+
+        let info = request(&mut socket, "3", Some(token), "session.info", json!({})).await;
+        assert!(info.ok, "{:?}", info.error);
+        assert_eq!(info.result.unwrap()["user"]["username"], "alice");
+        socket.close(None).await.unwrap();
     }
 }

@@ -2,60 +2,67 @@
 
 Tetra is a modular host agent and recipe renderer for the Ultramarine Server
 Dashboard. It is written in Rust and organized around a small set of cohesive
-layers: the recipe engine, the command dispatcher, the actor backend, the
-transport layer, and the feature-gated modules.
+layers: the recipe engine, the command dispatcher, the dispatch queue, the
+transport layer, the auth service, and the feature-gated modules.
 
 ## Crate layout
 
 ```
 tetra/
 ├── src/
-│   ├── main.rs          # CLI entry point (subcommands, argument parsing)
-│   ├── lib.rs           # Public API: agent + catalog + prelude
-│   ├── catalog.rs       # Recipe engine (YAML → Tera → Quadlet units)
-│   ├── types.rs          # Shared module payload types (serde)
+│   ├── main.rs           # CLI entry point (subcommands, argument parsing)
+│   ├── lib.rs            # Public API: agent, auth, catalog, enrollment, types
+│   ├── prelude.rs        # The few imports nearly every file needs (anyhow, serde, Value, Path, fs, io)
+│   ├── catalog.rs        # Recipe engine (YAML → Tera → Quadlet units)
+│   ├── types/            # Shared module payload types (serde), one file per module area
 │   ├── auth/             # Login, sessions, authorization (see auth-protocol.md)
-│   │   ├── service.rs    # AuthService: every local-socket operation
+│   │   ├── service/      # AuthService: every local-socket operation (one file per area; shell_ops.rs: shell.ticket)
 │   │   ├── api.rs        # Request/response/error types
 │   │   ├── accounts.rs   # Login eligibility and admin groups
 │   │   ├── pam.rs        # PAM password verification
 │   │   ├── totp.rs, recovery.rs, passkey.rs  # Second factor and passkeys
 │   │   ├── sessions.rs   # Session tokens
+│   │   ├── shell.rs      # Web shell tickets
+│   │   ├── users.rs      # Per-user credential records (auth/users/<uid>.json)
 │   │   ├── authz.rs      # Permission table, grants, setup allowlist
 │   │   ├── access.rs     # access.json, WebAuthn relying party, dashboard site
+│   │   ├── dns.rs        # DNS-01 providers and credentials for access.set
+│   │   ├── launcher.rs   # Launcher entries and the public page
 │   │   ├── setup.rs      # First-boot setup code
 │   │   ├── audit.rs      # Action log
+│   │   ├── host.rs       # Host commands of the auth service (Caddy, dashboard, OOBE)
 │   │   ├── seal.rs       # systemd-creds store key
+│   │   ├── secrets.rs    # Sealed credentials for other services (/var/lib/tetra/secrets)
 │   │   ├── store.rs      # Versioned root-only JSON files
-│   │   └── testing.rs    # Fakes for PAM, accounts, sealing, clock
+│   │   ├── clock.rs      # Injectable wall clock
+│   │   └── testing.rs    # Fakes for PAM, accounts, sealing, host (`testing` feature or tests only)
 │   ├── enrollment/
 │   │   ├── mod.rs        # `tetra enroll` / `tetra unenroll` (CSR, device flow)
+│   │   ├── renewal.rs    # Client certificate renewal over the mTLS session
 │   │   └── store.rs      # Root-only enrollment record under /var/lib/tetra/remote
 │   └── agent/
 │       ├── mod.rs              # Re-exports and module-level docs
-│       ├── dispatcher.rs       # Command routing registry
-│       ├── backend.rs          # Kameo actor wrapping the dispatcher
+│       ├── apps_account.rs     # The ultramarine-apps account user apps run under
+│       ├── dispatcher.rs       # Command routing registry, RunAs
 │       ├── queue.rs            # Bounded transport-to-dispatch queue
 │       ├── remote.rs           # remote.enabled gate for the outbound session
 │       ├── command.rs          # AgentCommand / AgentResponse types
 │       ├── config.rs           # Runtime config (/etc/tetra/tetra.json)
-│       ├── messages.rs         # Internal actor message types
-│       ├── protocol.rs         # JSON frame protocol for transports
-│       ├── crypto.rs           # Ed25519 signing/verification
 │       ├── identity.rs         # Host keypair generation and persistence
 │       ├── local_socket.rs     # Local Unix socket listener (production)
 │       ├── local_protocol.rs   # Session protocol frames for local clients
 │       ├── peer.rs             # SO_PEERCRED client identification
-│       ├── verify_password.rs  # Shadow password verification (dev listener)
-│       ├── transport.rs        # Shared endpoint/TLS configuration
+│       ├── shell.rs            # Web shell: a local connection that became a terminal
+│       ├── shell/frames.rs     # Shell stream control frames
+│       ├── shell/pty.rs        # PTY + systemd-run --pty, behind PtySpawner
+│       ├── transport.rs        # Outbound endpoint/TLS configuration (wss:// only)
+│       ├── tree.rs             # File operations from directory fds (openat2), for the apps home
 │       ├── websocket.rs        # Outbound WSS control-plane client
-│       ├── websocket_server.rs # Controller-key WebSocket protocol (dev listener)
-│       ├── dev_listener.rs     # Dev-only TCP listener (`dev-listener` feature)
-│       ├── vsock.rs            # Virtio-vsock smoke-test transport
+│       ├── dev_listener.rs     # Dev-only loopback TCP listener
 │       ├── module_support.rs   # Shared module helpers
+│       ├── modules.rs          # Mod trait, actions! macro, module registry
 │       └── modules/            # One module per host-management surface
-│           ├── mod.rs          # Default dispatcher builder
-│           ├── settings.rs     # Always compiled; host facts
+│           ├── settings.rs     # Always compiled; host facts and locale
 │           ├── apps.rs
 │           ├── files.rs
 │           ├── recipes.rs
@@ -63,13 +70,18 @@ tetra/
 │           ├── services.rs
 │           ├── selinux.rs
 │           ├── storage.rs
-│           ├── network.rs      # network/{keyfile,paths,addresses,apply}.rs
+│           ├── network.rs      # network/{keyfile,paths,addresses,apply,certs,wifi}.rs
 │           ├── samba.rs
 │           ├── nfs.rs
 │           ├── podman.rs
 │           ├── users.rs
 │           ├── reverse_proxy.rs
+│           ├── power.rs
+│           ├── updates.rs
+│           ├── remote_access.rs
 │           └── virtual_machines.rs
+├── tests/                # Integration tests (see Testing)
+└── systemd/, pam/, examples/
 ```
 
 ## The recipe engine (`catalog`)
@@ -85,13 +97,21 @@ Key concepts:
 - `Resource` — a file to render (container, network, volume, pod, kube, or plain file).
 - `RenderedResource` — the final filename + contents produced by two-pass Tera rendering.
 
-Rendering is stateless and deterministic. The engine is used both by the CLI
-(`render` subcommand) and by the `recipes` agent module.
+Rendering is deterministic apart from generated parameter values. The engine is
+used by the CLI (`render` subcommand) and by the `recipes` and `apps` agent
+modules. Before agent render/install writes, `catalog::verification` checks the
+exact recipe/template snapshot against caller-supplied SHA-256 provenance and
+enforces digest-pinned images (custom-only explicit opt-out). Tetra does not
+fetch catalogs or authenticate publishers. Apps persist verified inline snapshots,
+source metadata/digests, and image policy in their manifest; see
+[recipes.md](recipes.md#install-time-source-verification-and-image-pinning).
 
 ## The dispatcher (`agent::dispatcher`)
 
-The dispatcher is a registry of `AgentModule` implementations. A command is a
-JSON envelope:
+The dispatcher is a registry of `Mod` implementations, keyed by module name in
+a `BTreeMap` (so `agent.capabilities` lists modules in name order).
+`Dispatcher::full()` registers every module compiled into the build. A command
+is a JSON envelope:
 
 ```json
 {
@@ -104,54 +124,85 @@ JSON envelope:
 
 Dispatcher flow:
 
-1. Verify the command signature placeholder (future: full Ed25519 verification).
+1. Reject a command whose `signature` is an empty string. The field is not
+   otherwise checked; no production transport signs commands.
 2. If `module == "agent"` and `action == "capabilities"`, return the metadata for every registered module.
-3. Look up the module by name.
-4. Call `module.handle(action, payload, user)`, converting any `Err` into an `AgentResponse::error`.
+3. Look up the module by name (`unknown module` otherwise).
+4. Ask `module.metadata(action, payload)`, which answers the shared `capabilities` and `plan` actions.
+5. Take `run_as` out of the payload (or use `module.default_run_as(action, payload)`) to
+   pick the user host commands run as: the signed-in user, the
+   `ultramarine-apps` account, root, or both user and root.
+6. Call `module.handle(action, payload, user)`.
+
+Any `Err` becomes an `AgentResponse::error` with the command's `id`.
 
 Modules are stateless (`handle` takes `&self`). Host state lives in systemd, the
-filesystem, etc., not in the module.
-
-## The actor backend (`agent::backend`)
-
-Transports are async, but the dispatcher is synchronous. To let multiple
-transports share the same dispatcher without `&mut` contention, the dispatcher
-is wrapped in a Kameo actor (`AgentBackend`).
-
-- `AgentBackend::spawn_default()` builds the default feature-gated dispatcher and returns an `ActorRef`.
-- Each transport task `ask`s the actor with a `DispatchCommand`.
-- Kameo serializes messages on the actor's task, so the dispatcher's `&self`-only API stays sound.
+filesystem, etc., not in the module. The two modules that keep files under
+Tetra's state directory (`updates`, `remote_access`) hold only their paths;
+`AuthConfig::dispatcher()` registers them with the daemon's `--state-dir`.
 
 ## The dispatch queue (`agent::queue`)
 
-Before a command reaches the actor, it passes through a bounded
-`DispatchQueue`. This prevents an unbounded number of transport tasks from
-waiting when a slow host mutation is in progress.
+Transports are async, but the dispatcher is synchronous. The local socket and
+the outbound WSS session share one bounded `DispatchQueue`, whose single worker
+runs `Dispatcher::dispatch` on Tokio's blocking pool, one command at a time.
+A slow module never stalls the async runtime, and a panicking module fails
+only its own command. The bound means a full queue returns a retryable error
+instead of letting an unbounded number of transport tasks wait while a slow
+host mutation is in progress.
 
 - Default capacity: 64 commands.
 - Admission is non-blocking: callers get `QueueError::Full` rather than an unbounded wait.
-- A single worker serializes currently dispatched commands.
-- This conservative policy prevents concurrent host mutation races (systemd, files, Quadlets, storage, etc.).
+- A single worker serializes commands, which prevents concurrent host mutation races (systemd, files, Quadlets, storage, etc.).
+- Every host command a module runs is killed (with its process group) after
+  15 minutes (`module_support::COMMAND_TIMEOUT`), so a hung `systemctl`,
+  `podman` or `virsh` cannot stall the queue forever.
+- A caller that stops waiting does not cancel its command: it still runs, and
+  the response is dropped. Use command ids to reconcile.
 
 Future work: a typed read-only lane with bounded concurrency, without weakening
 mutation ordering.
 
 ## Modules (`agent::modules`)
 
-Each module implements `AgentModule` and is gated by a Cargo feature. The
-`settings` module is always compiled so the dashboard can discover basic host
-facts even when other features are disabled.
+Each module implements the `Mod` trait (`src/agent/modules.rs`) and is gated by
+a Cargo feature. The `settings` module is always compiled so the dashboard can
+discover basic host facts even when other features are disabled.
+
+```rust
+pub trait Mod: Send + Sync {
+    fn info(&self) -> ModuleInfo;
+    fn name(&self) -> &'static str { self.info().name }
+    fn metadata(&self, action: &str, payload: &Value) -> Option<Value> {
+        self.info().metadata_response(action, payload)
+    }
+    fn default_run_as(&self, action: &str, payload: &Value) -> RunAs { RunAs::User }
+    fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value>;
+}
+```
+
+`ModuleInfo` lists the module's actions and its `privileged_actions`, which
+always run as root. Unprivileged actions run as the `user` the dispatcher
+passes, through `runuser` (with `XDG_RUNTIME_DIR` set when that user's
+manager runs): the session's user, or whoever the payload's `run_as` names.
+A module whose host state belongs to the apps account (`podman`; `services`
+for `list`/`status` in apps scope) overrides `default_run_as` to
+`RunAs::Apps`; modules never choose users on their own.
 
 ### Adding a new module
 
 1. Create `src/agent/modules/my_module.rs`.
-2. Implement `AgentModule`:
+2. Implement `Mod` and declare the actions with `actions!`:
 
 ```rust
-use crate::agent::{AgentModule, module_support::{ModuleInfo, ModuleStatus, handle_metadata, unsupported_action}};
-use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::json;
 
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, positional, run_for};
+use crate::agent::modules::Mod;
+use crate::prelude::*;
+
+#[derive(Clone, Copy, Debug)]
 pub struct MyModule;
 
 const INFO: ModuleInfo = ModuleInfo {
@@ -159,43 +210,54 @@ const INFO: ModuleInfo = ModuleInfo {
     feature: "my-module",
     description: "Does something useful",
     status: ModuleStatus::Available,
-    actions: &["capabilities", "do_something"],
-    privileged_actions: &[],
+    actions: &["capabilities", "plan", "status", "do_something"],
+    privileged_actions: &["do_something"],
 };
 
-impl AgentModule for MyModule {
+impl Mod for MyModule {
     fn info(&self) -> ModuleInfo { INFO }
 
-    fn handle(&self, action: &str, payload: Value, _user: Option<&str>) -> Result<Value> {
-        if let Some(response) = handle_metadata(INFO, action, &payload) {
-            return Ok(response);
-        }
-        match action {
-            "do_something" => {
-                // Parse payload, do work, return JSON
-                Ok(json!({ "ok": true }))
-            }
-            _ => unsupported_action(INFO.name, action),
-        }
+    fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
+        Action::from_payload(action, payload)?.handle(user)
     }
 }
+
+actions!(Action [payload user] => {
+    // No payload: accepts any object, or `null`.
+    Status => Ok(json!({ "ok": true })),
+    // Inline payload struct; `payload` and `user` are in scope.
+    DoSomething {
+        name: String,
+        #[serde(default)]
+        dry_run: bool,
+    } => Ok(run_for(
+        &INFO, "do_something", user,
+        "my-tool", ["apply", positional("name", &payload.name)?], payload.dry_run,
+    )?.into_json()),
+    // Or a named payload type: `Read: ReadRequest => { ... }`.
+});
 ```
 
-3. Add the feature gate in `src/agent/modules/mod.rs`:
+   `actions!` generates one `Deserialize` struct per action and an enum whose
+   variants are the actions in snake case. `Action::from_payload` reads an
+   omitted payload (`null`) as `{}`, so actions whose fields all have defaults
+   accept it, and unknown actions fail with a serde error. A module whose
+   handlers need state (`updates` and `remote_access` carry their paths)
+   writes the enum by hand and calls `module_support::parse_action`.
+
+3. Add the module to the `modules![...]` list in `src/agent/modules.rs`, as
+   `file_name: "cargo-feature" => TypeName`. The macro declares the
+   feature-gated `mod`, re-exports the type and registers it in
+   `register_all`, which `Dispatcher::full()` calls:
 
 ```rust
-#[cfg(feature = "my-module")]
-pub mod my_module;
+modules![
+    // ...
+    my_module: "my-module" => MyModule,
+];
 ```
 
-4. Register it in `default_dispatcher()`:
-
-```rust
-#[cfg(feature = "my-module")]
-let dispatcher = dispatcher.with_module(my_module::MyModule);
-```
-
-5. Add the feature to `Cargo.toml`:
+4. Add the feature to `Cargo.toml`:
 
 ```toml
 [features]
@@ -203,22 +265,53 @@ default = ["...", "my-module"]
 my-module = []
 ```
 
+5. Classify every action in `TABLE` in `src/auth/authz.rs`. Unlisted actions
+   are administrator-only, and a test fails until each compiled action is
+   listed.
+
+`capabilities` and `plan` are answered by the dispatcher through
+`Mod::metadata` before `handle` is called. Any signed-in user may call
+them, so they must stay static: put host state (like `storage`'s ZFS
+inventory) behind an action the authorization table gates.
+
 When a payload type is shared with callers or reused across modules — like
 `ServiceRequest` or the `apps` module's `AppCreateRequest`/`AppManifest` —
-define it in `src/types.rs` so both the agent and external consumers can
+define it in `src/types/` so both the agent and external consumers can
 depend on one serde schema.
 
 ### Shared helpers (`module_support`)
 
-- `handle_metadata` — automatically serves the shared `capabilities` and `plan` actions for every module.
-- `run_command_output_as` — run a shell command, optionally as `TETRA_UNPRIVILEGED_USER`, with stdout/stderr capture.
+- `run` / `run_dry` / `run_for` — run a host command through
+  `run_command_output_as`: `run_dry(program, args, dry_run)` previews it when
+  `dry_run` is set, and `run_for(&INFO, action, user, program, args, dry_run)`
+  runs unprivileged actions as `user` (privileged ones as root). They return a
+  `CommandResult`; `into_json()` turns it into the response object
+  (`command`, `status`, `stdout`, `stderr`, `dry_run`), and
+  `into_json_stdout()` also parses stdout into `data`. Commands time out after
+  `COMMAND_TIMEOUT` (15 minutes).
+- `run_command_with_input` — feed a secret on stdin instead of the command line.
+- `positional` — refuse an empty payload value, or one starting with `-`,
+  before it becomes a positional argument (so `podman rm -a` cannot happen).
+- `option_arg` — append `--flag value` when an optional value is set.
+- `safe_join` — join a relative path under a base directory, rejecting absolute paths and `..`.
+- `write_under` — `safe_join`, then an atomic write with a given mode
+  through `tree::Tree` (parent directories created, no symlink below the
+  base followed).
 - `apply_selinux` — run `semanage fcontext` + `restorecon` when a payload includes `selinux` options.
-- `safe_join` — resolve a path under a base directory while rejecting traversal escapes.
+- `tree::Tree` — every read, write, listing and removal of Quadlets and
+  bundles (`quadlets::scope_tree` picks the tree for a scope): paths are
+  resolved from a directory descriptor with `openat2(RESOLVE_BENEATH |
+  RESOLVE_NO_SYMLINKS)`, and what is written is handed to the
+  `ultramarine-apps` account (`apps_account::Owner`) with `fchown` on its
+  descriptor. See [User apps and the apps account](#user-apps-and-the-apps-account).
+- `restorecon` — reset a path to the policy's default label (skipped without SELinux).
+- `parse_action` — decode `{action: payload}` into an action enum.
+- `Commands` — record a sequence of commands for one action, including failures that are tolerated.
 
 ## Transports
 
-Tetra exposes the same command envelope over multiple transports. All transports
-feed into the same `DispatchQueue`.
+The production transports feed the same command envelope into the same
+`DispatchQueue`.
 
 ### Local Unix socket (`agent-serve`)
 
@@ -234,11 +327,22 @@ token, and `auth::AuthService` authenticates and authorizes it. See
 - `local_socket.rs` — socket activation, fallback bind, accept loop.
 - `peer.rs` — maps the peer UID to the dashboard or the OOBE.
 - `local_protocol.rs` — `hello`, `request` and `response` frames.
+- `shell.rs`, `shell/` — web shells. A connection whose first request is
+  `shell.open` (with a ticket from `shell.ticket`) becomes a terminal: Tetra
+  opens a PTY, runs the user's login shell as that user through
+  `systemd-run --pty` (`PAMName=tetra-shell`), and pipes binary messages to
+  and from the PTY, with JSON `resize` and `exit` control frames. The
+  dashboard only relays bytes; no other listener is involved. Shells end with
+  their session, after 30 minutes without input, or when the connection
+  closes, and are limited to 4 per user and 16 per host. See
+  [auth-protocol.md](auth-protocol.md#web-shell).
 
 ### Outbound WSS (remote control)
 
 Tetra dials out to a control plane over WSS using mTLS. This avoids
-firewall/NAT issues because the connection is outbound. It is gated by
+firewall/NAT issues because the connection is outbound. `control_plane_url`
+must be `wss://`, and the client certificate, client key and server CA are all
+required (`TransportConfig::wss_url`). The session is gated by
 `remote.enabled` in `/etc/tetra/tetra.json` (default `false`). `agent-serve`
 re-reads the file on `SIGHUP`, starts the session when the gate opens and drops
 it when the gate closes. `agent-connect` runs the session standalone under the
@@ -252,33 +356,35 @@ Key files:
 - `config.rs` — runtime config (`remote.*`), fails closed on invalid files.
 - `remote.rs` — supervisor that runs or drops the session as the setting changes, and the `SIGHUP` reload.
 - `websocket.rs` — outbound WSS client with reconnection.
-- `transport.rs` — shared config parsing (`control_plane_url`, client cert/key paths, CA path).
+- `transport.rs` — `control_plane_url` and the client cert/key/CA paths.
+- `enrollment/renewal.rs` — renews the client certificate over the session.
 
-### Inbound WebSocket (`agent-ws-serve`)
+### Development transport (`dev-listener` feature)
 
-Development transport, compiled only with the `dev-listener` Cargo feature.
+`dev_listener.rs` is only compiled with the `dev-listener` Cargo feature.
 Release builds leave it off, so production binaries cannot listen on the
-network. An authenticated WebSocket listener that accepts
-Ed25519-signed command frames from a controller client. Requires an explicitly
-configured controller public key before accepting commands.
+network.
 
-- Loopback `ws://` is allowed without TLS.
-- Non-loopback addresses require `--tls-cert` and `--tls-key`.
-- `dev_listener.rs` — TCP bind, optional TLS, loopback-or-TLS check.
-- `websocket_server.rs` — challenge/auth handshake and session management.
-
-### Vsock (`agent-vsock-serve`)
-
-VM guest smoke-test transport over virtio-vsock. One command per connection.
-Not intended for production; future work is to route it through the shared
-`DispatchQueue`.
+**Loopback WebSocket (`agent-ws-serve`).** Runs the daemon and serves the same
+`LocalServer` session protocol and `AuthService` as the Unix socket, over TCP
+for dashboard or OOBE development. Every request still needs a Tetra-issued
+session token and goes through the normal authorization and action log. TCP
+has no peer credentials, so `--client dashboard|oobe` (default `dashboard`)
+is applied to every connection. Any process on the host can connect and claim
+that configured client; use it only for development. `--listen` refuses every
+non-loopback address. TLS is intentionally omitted: this listener is for
+loopback-only development; plain TLS would not identify the local process,
+while mutual TLS would require a separate client-credential setup. It does not
+make the dev listener suitable for remote access. Production uses
+`SO_PEERCRED` on the Unix socket.
 
 ### Local dispatch (`agent-dispatch`)
 
-One-shot CLI that accepts a JSON command envelope file and routes it through the
-same dispatcher. Useful for debugging and integration testing.
+One-shot CLI that reads a JSON command envelope from a file (or stdin) and
+routes it through `Dispatcher::full()`. No authorization; useful for debugging
+and integration testing.
 
-## Authentication and elevation
+## Authentication and authorization
 
 ### Local clients
 
@@ -286,16 +392,121 @@ Users log in through Tetra (PAM password plus TOTP, or a passkey) and get a
 session token; the local socket identifies the client from its peer
 credentials. Every module action is authorized from the user's admin status
 and grants (`auth::authz`). Unprivileged actions run as the session user via
-`runuser`; privileged ones as root. See [auth-protocol.md](auth-protocol.md).
+`runuser` (or as `ultramarine-apps`, with `run_as: apps` or the module's
+default); privileged ones as root. A web shell always runs as the session's
+user, in its own transient unit; elevation is `sudo` inside it. See
+[auth-protocol.md](auth-protocol.md).
+
+## User apps and the apps account
+
+User apps are rootless Quadlets of one system account, `ultramarine-apps`
+(UID/GID 242, home `/var/lib/ultramarine-apps`, from
+`systemd/tetra.sysusers.conf` and `systemd/tetra.tmpfiles.conf`), whoever
+installs them. `apps` and `quadlets` default to this `apps` scope
+(`types::AppScope`); `system` scope keeps rootful Quadlets for real system
+services. There is no per-user scope.
+
+- Files: units in `~/.config/containers/systemd`, bundles in
+  `~/.local/share/tetra/quadlets/<app>`, written by Tetra as root and owned
+  by the account. See [Files in the apps home](#files-in-the-apps-home).
+- Host setup (`AppsAccount::provision`, on `apps.create`/`update` with
+  `converge`): subordinate UID/GID ranges (`usermod --add-subuids/
+  --add-subgids`, since `systemd-sysusers` allocates none), lingering, the
+  user manager started, and the rootful storage labels for its
+  `~/.local/share/containers/storage` (`semanage fcontext -a -e`).
+- systemd: `systemctl --user -M ultramarine-apps@` (`ServiceScope::Apps`).
+- Reads: `podman` defaults to `run_as: apps`; `agent-serve` warns at startup
+  when the account is missing or its IDs are not 242.
+
+### Files in the apps home
+
+The account owns its home, and the root of every rootless container is the
+account on the host, so anything in the home can be swapped for a symlink
+between a check by path and a use by path. Tetra therefore stays root but
+never uses a path below the home (`agent::tree::Tree`, `rustix`); it does not
+switch its filesystem UID (`setfsuid`), which is per thread and so a trap
+on Tokio's blocking pool.
+
+- The home must be an absolute path that is not `/`, a system directory
+  (`/usr`, `/etc`, `/var`, `/var/lib`, ...) or below one of `/usr`, `/etc`,
+  `/boot`, `/dev`, `/proc`, `/sys`, `/var/lib/tetra`
+  (`apps_account::check_home`), in case the account database points it
+  somewhere it should not. It is opened with `O_DIRECTORY | O_NOFOLLOW`
+  from its parent's descriptor. Before a write, the parent must be root's
+  and writable by no one else (so the home's entry cannot be swapped), and
+  the home must be a directory owned by the account (`systemd-tmpfiles`
+  creates it so), or one Tetra made with `mkdirat` (`0700`) in that same
+  operation. Any other existing directory, root's included, is refused
+  rather than given away. The home is then given to the account with
+  `fchown`.
+- Each directory below it is opened with `openat2` on its parent's
+  descriptor, with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+  RESOLVE_NO_MAGICLINKS`, so a symlink anywhere, the last component
+  included, fails (`ELOOP`) instead of being followed. Missing directories
+  are made with `mkdirat` (`0755`), and every directory from the home down
+  is handed to the account with `fchown` on its descriptor.
+  `RESOLVE_NO_XDEV` is not used: the account cannot mount anything in the
+  host's mount namespace, so a mount point below the home is the
+  administrator's (a separate disk for app data) and keeps working.
+- Files are written to an `O_TMPFILE` in their directory (an `O_CREAT |
+  O_EXCL | O_NOFOLLOW` file with a random name where the filesystem lacks
+  `O_TMPFILE`), given to the account and their mode (`0600` for units and
+  `app.json`, `0644` for companions) with `fchown`/`fchmod`, synced, linked
+  under a random name with `linkat("/proc/self/fd/N", AT_SYMLINK_FOLLOW)`
+  (`AT_EMPTY_PATH`, which needs `CAP_DAC_READ_SEARCH`, without `/proc`) and
+  `renameat`-ed over the target; the directory is synced last. A symlink at
+  the target is replaced, never followed.
+- Reads (`app.json`, `quadlets.read`, templates) go through `openat2` too,
+  with `O_NOFOLLOW | O_NONBLOCK` (a FIFO cannot hang the agent), and only a
+  regular file with one link is read, so a hard link to a file elsewhere is
+  not (`fs.protected_hardlinks` already stops the account from making one
+  to a file it cannot write).
+- Removals are `unlinkat` on the parent's descriptor; `apps.remove` empties
+  the bundle entry by entry the same way, removing symlinks rather than
+  what they point to. Listings read directory descriptors and skip
+  symlinks.
+- Directories outside the home (system scope, payload `base_dir` overrides,
+  a recipe's output directory) are root's and trusted: the directory itself
+  is the anchor, opened by path, and everything below it goes through the
+  same descriptor-relative code.
+
+All of this is blocking I/O and runs on the blocking pool with the rest of
+the module (see [Threading](#threading-and-concurrency-model)). `openat2`
+needs Linux 5.6.
+
+Ownership is only changed when Tetra runs as root and the action is not a dry
+run (`Owner::for_apps`); without root, files stay the caller's. Tests
+replace `fchown` with a recorder (`Owner::with_chown`) and check that it was
+handed the descriptor of the file that ends up at the path.
+
+SELinux labels are not set by path: a new file gets its label from its
+directory at creation. Two things still run `restorecon` on paths in the
+home, as root: the `selinux` options of `quadlets.write`/`install` and
+`apps.create`/`update` (an administrator's request), and the one-time
+`restorecon -R` of the account's container storage in
+`AppsAccount::provision` (which first creates the storage through `Tree`,
+and records success in `/var/lib/tetra/apps-storage-labels`). `restorecon`
+resolves the path's directories with `realpath(3)` and walks a tree with `fts` (`FTS_PHYSICAL | FTS_NOCHDIR`),
+relabeling each entry by its full path, so it does not follow a symlink
+it finds, but a directory swapped for a symlink while it runs could have it
+relabel a file elsewhere to the label the policy gives the home's path.
+DAC still applies to that file, so this is a mislabeling (and denial of
+service) risk rather than a way to read or write it. Closing it means
+labeling by descriptor (`fsetfilecon` with the context from
+`selabel_lookup`, which needs libselinux), or running `restorecon` as the
+account inside its user namespace, where the kernel only lets it relabel
+files the account owns.
 
 ### Remote and development transports
 
 - Outbound WSS uses mTLS (client certificate + server CA verification). Its
-  commands are authorized as the remote controller and logged as remote
-  actions.
-- The development TCP listener uses Ed25519 challenge-response with
-  signed commands (session id, sequence, timestamp, nonce; five-minute skew;
-  bounded replay cache) and the old password elevation.
+  commands are authorized as the remote controller, which may run every
+  action, and logged as remote actions. The `user` field of a remote command
+  is cleared, so every remote action runs as root.
+- The development TCP listener uses the same token-based session protocol as
+  the Unix socket, including PAM/TOTP or passkeys, per-request authorization,
+  and session-bound user execution. It is loopback-only and is not a production
+  transport.
 
 ## Data paths
 
@@ -303,12 +514,15 @@ Default mutable paths (bootc-friendly):
 
 | Path                       | Purpose                                     |
 | -------------------------- | ------------------------------------------- |
-| `/var/lib/tetra/identity/` | Host Ed25519 keypair and controller key.    |
+| `/var/lib/tetra/identity/` | Host Ed25519 keypair, used for the host fingerprint in `hello`. |
 | `/var/lib/tetra/auth/`     | Login state: sealed store key, per-user credentials, grants, sessions, setup code (root-only). |
-| `/var/lib/tetra/access.json`, `setup-complete`, `audit/` | Access mode, setup marker, action log. |
+| `/var/lib/tetra/access.json`, `launcher.json`, `updates.json`, `setup-complete`, `audit/` | Access mode, launcher, update policy, setup marker, action log. |
+| `/var/lib/tetra/secrets/`  | Credentials for other services, sealed with `systemd-creds`. |
 | `/var/lib/tetra/remote/`   | Remote-control client key, certificate, server CA and controller record (root-only). |
-| `/run/tetra/`              | Runtime/session data.                       |
-| `/var/lib/tetra/config/`   | Optional configuration overrides.           |
+| `/var/lib/tetra/quadlets/` | Companion files and `app.json` manifests of system-scope apps. |
+| `/var/lib/tetra/apps-storage-labels` | Records that the apps account's container storage got the labels of rootful storage. |
+| `/var/lib/ultramarine-apps/` | Home of the apps account: apps-scope Quadlets (`.config/containers/systemd`), bundles (`.local/share/tetra/quadlets`) and rootless Podman storage, owned by the account. |
+| `/run/tetra/`              | The socket, the setup code for the console, short-lived files. |
 
 Generated identities, enrollment state, and rotation metadata must live in
 mutable paths. Installed policy/unit files may live in immutable deployment
@@ -317,25 +531,44 @@ content.
 ## Threading and concurrency model
 
 ```text
-[Transport tasks]       [Queue]              [Actor]              [Modules]
+[Transport tasks]       [Queue]              [Blocking pool]      [Modules]
       |                    |                     |                     |
       |-- accept conn -->  |                     |                     |
       |-- parse frame -->  |                     |                     |
-      |-- admit cmd ---->  |-- DispatchQueue --> |-- AgentBackend -->  |-- Dispatcher
-      |                    |  (bounded, 64)      |  (Kameo actor)      |  (BTreeMap registry)
+      |-- admit cmd ---->  |-- DispatchQueue --> |-- spawn_blocking -> |-- Dispatcher
+      |                    |  (bounded, 64)      |  (one at a time)    |  (BTreeMap registry)
       |                    |                     |                     |
 ```
 
-- Tokio accepts connections concurrently.
-- A single queue worker serializes commands before they reach the actor.
-- Kameo serializes actor message handling, but long-running module actions do
-  not block other transports because each `ask` is awaited independently by its
-  caller.
+- Tokio accepts connections concurrently, and the local socket handles
+  requests concurrently (login, sessions and other non-module operations do
+  not wait for the queue).
+- Web shells never touch the queue: each runs on its own connection task,
+  with one task per direction pumping bytes and a supervisor that checks the
+  session every 5 seconds.
+- A single queue worker serializes module commands and runs each one on the
+  blocking pool, so long-running module actions, and blocking file I/O such
+  as `agent::tree`'s, never block the async transports.
 
 ## Testing
 
 - Unit tests live next to the code they test (`#[cfg(test)]` modules).
-- Integration tests are in `tests/agent_dispatcher.rs`.
+  The web shell's stream runs over a real socket against a fake
+  `PtySpawner` (`agent::shell::pty::FakeSpawner`); the real systemd shell
+  test is `#[ignore]`d (it needs root:
+  `sudo TETRA_TEST_SHELL_USER=alice cargo test -- --ignored real_systemd`).
+- Integration tests in `tests/` use the fakes in `tetra::auth::testing` (the
+  `testing` feature, enabled for them through `dev-dependencies`), with shared
+  helpers in `tests/common/mod.rs`:
+  - `agent_dispatcher.rs` — dispatcher and queue routing, `capabilities`/`plan`, module actions (mostly dry runs and temp directories).
+  - `auth_login.rs` — password, TOTP, recovery codes and sessions.
+  - `auth_passkeys.rs` — passkey registration and login, passkey availability.
+  - `auth_authorization.rs` — admins, default permissions, grants, the action log.
+  - `auth_launcher.rs` — launcher visibility, `launcher.can_access`, the public page.
+  - `auth_setup.rs` — the setup code, setup session and completion.
+  - `auth_oobe.rs` — the OOBE flow: setup allowlist, `access.set`, throttle, handoff.
+  - `auth_shell.rs` — web shell tickets: single use, expiry, binding to the session and account, the session checks of a running shell.
+  - `remote_enrollment.rs` — `tetra enroll`/`unenroll`, the mTLS session and certificate renewal, against an in-process controller (runs the real binary).
 - The `agent-dispatch` CLI is the easiest way to exercise a module manually:
 
 ```sh

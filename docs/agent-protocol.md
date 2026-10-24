@@ -1,16 +1,8 @@
 # Tetra Agent Protocol
 
-This document describes the JSON protocol used between an outside
-dashboard/controller and the Tetra host agent.
-
-The local CLI command `tetra agent-dispatch` accepts the same command envelope
-that the transports carry.
-
-For host-to-guest virtio-vsock smoke testing, `tetra agent-vsock-serve` runs a
-Linux-only guest listener that accepts one raw `AgentCommand` JSON object per
-connection and replies with one raw `AgentResponse` JSON object. This is a
-development harness for testing the VM vsock path from the host, not the final
-dashboard session protocol.
+This document describes the JSON command envelope used by the Tetra host
+agent. The local CLI command `tetra agent-dispatch` accepts the same envelope
+that module transports carry.
 
 ## Connection Negotiation
 
@@ -21,17 +13,29 @@ in through Tetra and each request carries a session token. Module commands are
 sent with the `module.dispatch` operation using the envelope documented below.
 Production installs do not listen on the network.
 
+For local development, `agent-ws-serve` (built with `--features dev-listener`)
+serves the same WebSocket session protocol on loopback TCP. Build it and run
+with the same privileges and PAM setup as the daemon (usually root):
+
+```sh
+cargo build --features dev-listener
+sudo target/debug/tetra agent-ws-serve \
+  --listen 127.0.0.1:7780 --client dashboard
+```
+
+`--listen` refuses non-loopback addresses. TCP has no peer credentials, so
+`--client dashboard|oobe` (default `dashboard`) is applied to every
+connection; any local process can claim that client. The listener uses the
+same Tetra-issued session tokens and `AuthService` as the Unix socket.
+It is development-only and has no TLS. See
+[auth-protocol.md](auth-protocol.md#development-tcp-listener).
+
 An outbound connection to a remote control plane is optional and ships
 disabled. It runs only while `remote.enabled` is `true` in
-`/etc/tetra/tetra.json`, and turning it off drops a live session. On regular
-hosts this is WSS with mTLS. When the agent runs inside a VM, the same JSON frame protocol may
-be carried over a virtio-vsock stream to the VM host so the VM can be controlled
-from the same dashboard interface without exposing guest networking.
-
-The repository includes an outbound WSS client, run by `tetra agent-serve` when
-`remote.enabled` is set, or standalone via `tetra agent-connect`. The
-JSON command envelope documented below is the stable application payload that
-the transport carries.
+`/etc/tetra/tetra.json`, and turning it off drops a live session. It is WSS
+with mTLS, run by `tetra agent-serve` when `remote.enabled` is set, or
+standalone via `tetra agent-connect`. The JSON command envelope documented
+below is the stable application payload that the transport carries.
 
 Transport configuration:
 
@@ -44,30 +48,17 @@ Transport configuration:
 }
 ```
 
-VM guest agent using host vsock CID:
+Fields (all required):
 
-```json
-{
-  "control_plane_url": "vsock://host:2048"
-}
-```
-
-VM guest agent using an explicit numeric CID:
-
-```json
-{
-  "control_plane_url": "vsock://2:2048"
-}
-```
-
-Fields:
-
-- `control_plane_url`: Endpoint the agent connects to. Supported schemes are
-  `wss://`, `ws://`, and `vsock://CID:PORT`.
-- `client_cert_path`: Agent client certificate for mTLS. Required for WSS.
-- `client_key_path`: Private key for the client certificate. Required for WSS.
+- `control_plane_url`: Endpoint the agent connects to. Must be `wss://`;
+  any other scheme is refused.
+- `client_cert_path`: Agent client certificate for mTLS.
+- `client_key_path`: Private key for the client certificate.
 - `server_ca_path`: CA bundle used to verify the dashboard/control-plane server
-  certificate. Required for WSS.
+  certificate.
+
+The same fields can be set as `remote.transport` in `/etc/tetra/tetra.json`.
+Without them, Tetra uses the enrollment written by `tetra enroll`.
 
 Run the outbound agent. After `tetra enroll` no flags are needed; `--config`
 and `--host-id` override the enrollment:
@@ -77,26 +68,19 @@ tetra agent-connect
 tetra agent-connect --config /etc/tetra/agent-transport.json --host-id host-01
 ```
 
-For `vsock://` endpoints, `CID` may be numeric or one of the aliases
-`hypervisor` (`0`), `local` (`1`), or `host` (`2`). VM guest agents usually use
-`vsock://host:PORT`; the VM host is responsible for accepting that stream and
-routing frames to the dashboard/control plane session for the matching VM.
-
 ### Recommended Lifecycle
 
 1. `enroll`: `tetra enroll` (only while `remote.enabled` is true) sends a CSR
    with the `clientAuth` extended key usage. After approval the controller
    returns the signed client certificate, its server CA, a stable host id and
    the `wss://` URL. See [remote-enrollment.md](remote-enrollment.md).
-2. `connect`: The agent opens `control_plane_url`. For WSS, it uses mTLS and
-   the dashboard verifies the client certificate. For vsock, the host-side
-   acceptor maps the stream to the VM inventory record before forwarding frames
-   to the dashboard.
+2. `connect`: The agent opens `control_plane_url` with mTLS, and the
+   dashboard verifies the client certificate.
 3. `hello`: Immediately after WSS open, the agent sends a small hello frame with
    agent metadata. The dashboard uses this to mark the host online.
 4. `capabilities`: The dashboard sends `agent.capabilities` as its first
-   command or relies on a capabilities frame in the hello response. The
-   dashboard should cache the enabled module/action set per connection.
+   command (the hello frame carries no capabilities) and should cache the
+   enabled module/action set per connection.
 5. `dispatch`: The dashboard sends one `AgentCommand` per requested operation.
    The agent replies with the matching `AgentResponse.id`.
 6. `heartbeat`: The agent and dashboard exchange pings or heartbeat frames so
@@ -154,25 +138,6 @@ Response frame:
   }
 }
 ```
-
-### Host-to-Guest Vsock Smoke Test
-
-Inside the VM guest:
-
-```sh
-tetra agent-vsock-serve --port 2048
-```
-
-From the VM host, connect to the guest CID:
-
-```sh
-printf '%s' '{"id":"cmd-1","module":"settings","action":"get_system","payload":{}}' \
-  | socat - VSOCK-CONNECT:GUEST_CID:2048
-```
-
-The smoke-test listener accepts the command envelope directly, without the
-outer `{ "type": "command" }` transport frame, so it matches `agent-dispatch`
-and the `/dispatch` HTTP development endpoint.
 
 Heartbeat frame:
 
@@ -232,6 +197,15 @@ Use mTLS for transport identity:
 - Agent/client certificate is validated by the dashboard.
 - The dashboard maps the client certificate identity to exactly one host id.
 
+On the host, an mTLS session is authorized as the remote controller, which may
+run every module action, including payload fields that are administrator-only
+on the local socket. Tetra records each remote action in its action log with
+`origin: "remote"` and the host id. The `user` field of a command from the
+control plane is ignored, so remote commands run as root, except reads of a
+module whose default is the apps account (`podman`, see
+[Run As](#run-as)), which run as `ultramarine-apps` unless the payload says
+`"run_as": "root"`.
+
 Use command authorization separately from transport authentication:
 
 - Only authorized dashboard users should be able to create commands.
@@ -241,9 +215,7 @@ Use command authorization separately from transport authentication:
 - Record the dashboard user, command id, host id, module, action, payload hash,
   and response outcome in an audit log.
 
-The `signature` field in `AgentCommand` is reserved for signed command
-envelopes. The current dispatcher only rejects an empty signature string; full
-signature verification is future transport/policy work.
+Commands are not signed: the mTLS session is what authenticates them.
 
 ### Reconnect And Idempotency
 
@@ -258,6 +230,11 @@ Controller guidance:
 - Make mutating workflows explicit and visible to the user.
 - Use `dry_run: true` to preview host command plans.
 - Re-fetch capabilities after every reconnect.
+
+Commands run one at a time on the host. When Tetra's queue is full it answers
+with an `error` frame (`Tetra command queue is full; retry after backoff`)
+instead of a `response`; retry with backoff. A host command that runs longer
+than 15 minutes is killed and its action fails.
 
 ## Protocol Contract
 
@@ -283,8 +260,11 @@ Fields:
   all have defaults (such as `power.reboot` or `remote_access.tailscale_disable`
   with `dry_run`), accept it. Like unknown fields elsewhere, the fields of an
   object given to an action that takes no payload are ignored.
-- `signature`: Optional command signature. Empty string is rejected. Full
-  signature verification is transport/policy work and is not implemented here.
+- `signature`: Optional and ignored, except that an empty string is rejected.
+  Commands are not signed or verified on the local socket or the WSS session.
+- `user`: Set by Tetra, not the caller. On the local socket it is the
+  session's user, so unprivileged actions run as that user; in commands from
+  a remote controller it is cleared, so they run as root.
 
 Responses always have this shape:
 
@@ -332,7 +312,8 @@ Response payload:
       "feature": "core",
       "description": "Agent and host settings that are always available.",
       "status": "available",
-      "actions": ["capabilities", "get_system"]
+      "actions": ["capabilities", "get_system", "set_hostname", "set_keymap", "set_locale", "set_timezone"],
+      "privileged_actions": ["set_hostname", "set_keymap", "set_locale", "set_timezone"]
     }
   ]
 }
@@ -341,10 +322,44 @@ Response payload:
 Every module also supports:
 
 - `capabilities`: Returns that module's `ModuleInfo`.
-- `plan`: Returns module metadata and echoes the requested payload. This is a
-  lightweight planning endpoint, not a dry-run replacement.
+- `plan`: Returns `{module, feature, status, requested}`, echoing the
+  payload. This is a lightweight planning endpoint, not a dry-run replacement.
+
+Both are answered by the dispatcher for every module, whether or not the
+module's `actions` lists them.
 
 ## Shared Conventions
+
+### Run As
+
+Unprivileged actions (reads such as `podman.containers`,
+`virtual_machines.list` or `selinux.booleans`) run their host commands as the
+signed-in user, so a user sees their own session VMs, except in `podman`,
+whose reads run as `ultramarine-apps`, the account every user app runs under
+(see [apps](#apps)), so the Containers page shows the apps' containers.
+Privileged actions always run as root. An unprivileged action's payload may
+add `"run_as"`:
+
+- `"user"`: as the signed-in user (the default, except in `podman` and
+  `services.list`/`status` in apps scope).
+- `"apps"`: as `ultramarine-apps` (the default in `podman`, and for
+  `services.list`/`status` with `"scope": "apps"`).
+- `"root"`: as root, showing the host's view (rootful containers, every VM).
+- `"both"`: runs the action as the signed-in user and as root, and returns
+  `{"user": {"ok": true, "result": ...}, "root": {"ok": false, "error": "..."}}`.
+  Refused for privileged actions and when there is no signed-in user.
+
+Tetra switches users with `runuser -u <user> --`, setting `XDG_RUNTIME_DIR`
+to `/run/user/<uid>` when that user's manager runs (so rootless Podman and
+`systemctl --user` find it; the apps account's lingers). Which `run_as` a
+module uses without one is its `Mod::default_run_as`; the dispatcher applies
+it, so modules never pick users themselves.
+
+`run_as` is removed from the payload before the module sees it. `"root"` and
+`"both"` are administrator-only; `"user"` and `"apps"` are open to anyone
+who may run the action. Commands from the remote controller, the setup
+session and the `agent-dispatch` CLI have no user and run as root (as
+`ultramarine-apps` in `podman`).
 
 ### Dry Run
 
@@ -438,12 +453,28 @@ Some read actions also parse `stdout` into a stable JSON field, such as `data`,
 
 ## Modules
 
-The enabled module set depends on build features. Default features currently
-include `apps`, `files`, `recipes`, `selinux`, `services`, and `quadlets`.
+The enabled module set depends on build features. Default features are
+`apps`, `files`, `recipes`, `selinux`, `services`, `quadlets`,
+`reverse-proxy`, `podman`, `samba`, `nfs`, `users`, `storage`, `network`,
+`power`, `updates` and `remote-access`; `virtual-machines` is optional.
+`settings` is always compiled.
+
+Actions listed as privileged (`privileged_actions` in `capabilities`) always
+run as root. The others run as the session's user (through `runuser`) on the
+local socket, and as root for remote controllers and the setup session,
+unless `run_as` or the module's default says otherwise (see
+[Run As](#run-as)).
+
+Payload values that become positional arguments of a host command (service,
+container, VM and account names, paths given to `df`, `umount`, `mount`,
+`restorecon` or `semanage`, and the like) may not be empty or start with `-`,
+so they can never be read as an option. Unknown payload fields are ignored
+unless a section says otherwise.
 
 Request payloads are plain JSON objects. Payload types shared across modules —
-such as `SelinuxOptions`, `ServiceScope`, and the `apps` module's `App*`
-requests — are defined in `src/types.rs` and deserialized with `serde`.
+such as `ServiceScope`, `AppScope`, and the `apps` module's `App*` requests —
+are defined in `src/types/`; the shared `SelinuxOptions` lives in
+`src/agent/module_support.rs`. All are deserialized with `serde`.
 
 ### settings
 
@@ -494,13 +525,19 @@ Feature: `files`
 Actions:
 
 - `read`
-- `write`
+- `write` (privileged)
 
 `read` payload:
 
 ```json
 { "path": "/etc/example.conf" }
 ```
+
+`read` returns `{path, contents}`. Both actions only accept a regular file:
+a FIFO, device, socket or directory is refused (without blocking on it).
+`read` refuses files larger than 16 MiB and files that are not UTF-8.
+`write` creates the file if needed and otherwise replaces its contents in
+place, keeping its owner, mode and SELinux label.
 
 `write` payload:
 
@@ -532,10 +569,19 @@ Feature: `recipes`
 
 Actions:
 
-- `render`
+- `render` (privileged: it writes `output_dir`, so `run_as: both` is refused)
 - `render_inline`
 - `context`
 - `context_inline`
+
+`render` and `render_inline` accept `source: {catalog: "official"|"community"|"custom",
+url?, sha256}` and `allow_unpinned_images: false`. The digest covers exact recipe
+and template bytes using the [canonical v1 algorithm](recipes.md#canonical-bundle-digest-v1).
+Omitted source means custom with pinning enforced. Only custom may explicitly
+opt out; official/community opt-out and any digest mismatch are errors before
+writes, including dry runs. Responses include verified `source` metadata and
+the computed digest. Context actions are unchanged. No catalog fetching occurs.
+See [image policy and limitations](recipes.md#rendered-image-policy).
 
 `render` payload:
 
@@ -569,7 +615,7 @@ Response payload:
 ```
 
 Recipe resource kinds include Quadlet resources (`container`, `network`,
-`volume`, `pod`, `kube`) and `file` companion resources. Companion file
+`volume`, `image`, `pod`, `kube`) and `file` companion resources. Companion file
 resources are intended to be installed through `quadlets.install.files`, under
 the mutable companion-file bundle directory.
 
@@ -579,13 +625,16 @@ the mutable companion-file bundle directory.
 {
   "recipe": "recipe_id: nginx-site\nname: Nginx static site\nversion: 0.1.0\n...",
   "templates": {
-    "containers/nginx-site.container.tera": "[Container]\nContainerName={{ app_id }}\n"
+    "containers/nginx-site.container.tera": "[Container]\nContainerName={{ app_id }}\nImage=docker.io/library/nginx:alpine@sha256:a3554c0d0b48177b1413c26e01f695334428020d9df01243fbae3e11cfd17417\n"
   },
   "values": {
     "app_id": "demo-web"
   }
 }
 ```
+
+The response holds the parsed `recipe`, rendered `resources`, and verified `source`.
+`render_inline` writes nothing.
 
 This action is intended for recipe bundles fetched from a remote catalog by a
 dashboard or control plane. Tetra does not need to be updated when new recipes
@@ -613,8 +662,14 @@ Recommended remote catalog shape:
 ```
 
 `context_inline` accepts the same `recipe` and `values` fields as
-`render_inline`, and returns resolved parameter context without rendering
-templates.
+`render_inline` (no `templates`), and returns the parsed `recipe` and the
+resolved parameter `context` without rendering templates.
+
+`render` and `context` read the recipe, templates and values from host paths,
+and `render` writes to `output_dir` unless `dry_run` is set, so both are
+administrator-only on the local socket, as is `render_inline` (a template can
+loop for a very long time on the one-at-a-time queue). Only `context_inline`
+can be granted.
 
 `context` payload:
 
@@ -638,31 +693,55 @@ Actions:
 
 - `list`
 - `read`
-- `write`
-- `delete`
+- `write` (privileged)
+- `delete` (privileged)
 - `validate`
-- `install`
+- `install` (privileged)
 - `list_files`
 
 Shared payload fields:
 
-- `scope`: `"user"` or `"system"`. Defaults to `"user"`.
+- `scope`: `"apps"` (the default) or `"system"`, as in `apps`. Apps scope is
+  the rootless Quadlets of the `ultramarine-apps` account, whoever is signed
+  in; system scope is rootful, for real system services. The `"user"` scope
+  of earlier releases (the signed-in user's home) is gone and refused: user
+  apps belong to the shared apps account, not to whoever installed them.
 - `base_dir`: Optional override. Useful for tests and custom deployments.
 - `files_base_dir`: Optional override for companion files.
 
 Default Quadlet unit directories:
 
-- User scope: `$HOME/.config/containers/systemd`
+- Apps scope: `~ultramarine-apps/.config/containers/systemd`
+  (`/var/lib/ultramarine-apps/...`; the home comes from the account database)
 - System scope: `/etc/containers/systemd`
 
 Default companion file directories:
 
-- User scope: `$XDG_DATA_HOME/tetra/quadlets` or `$HOME/.local/share/tetra/quadlets`
+- Apps scope: `~ultramarine-apps/.local/share/tetra/quadlets`
 - System scope: `/var/lib/tetra/quadlets`
 
 During `install`, companion files are written under a per-Quadlet bundle directory
 derived from the first Quadlet resource name. For example, `app.container` companion
-files default to `/var/lib/tetra/quadlets/app` in system scope.
+files default to `~ultramarine-apps/.local/share/tetra/quadlets/app` in apps
+scope and `/var/lib/tetra/quadlets/app` in system scope.
+
+In apps scope, every file and directory Tetra writes below the account's home
+is handed to `ultramarine-apps` (`fchown` on the open file before it gets its
+final name; modes stay `0600` for units and `0644` for companions, directories are
+`0755` and the home `0700`), and the `write` and `install` responses say so
+with `"owner": "ultramarine-apps"` (`"root"` in system scope). Since the
+account (and so an app container's root) owns that tree, no path in it is
+followed through a symlink: a symlink at a directory on the way fails the
+action (`... contains a symlink; refusing to follow it`), one at the file
+being written is replaced, `delete` removes a symlink itself, `read` refuses
+anything but a regular file with a single link, and listings skip symlinks
+(`apps.list` reports a symlinked bundle as invalid).
+A write is refused if the home belongs to anyone but the account or Tetra.
+Without root (tests, development) files keep their owner. See
+[architecture.md](architecture.md#files-in-the-apps-home). `quadlets` only writes files: run
+`services.daemon_reload` with `"scope": "apps"` afterwards, and use
+`apps.create` (which also prepares the account, see [apps](#apps)) to install
+apps.
 
 Supported Quadlet filename extensions:
 
@@ -675,7 +754,7 @@ Supported Quadlet filename extensions:
 `list` payload:
 
 ```json
-{ "scope": "user" }
+{ "scope": "apps" }
 ```
 
 `write` payload:
@@ -725,10 +804,18 @@ Supported Quadlet filename extensions:
 `files` are companion files written under the mutable companion-file bundle directory,
 support nested relative paths, and are rejected if the path escapes the bundle directory.
 
+Validation (`validate`, `write`, `install`) checks the extension, that the
+contents are not empty, and that they contain a Quadlet section header
+(`[Container]`, `[Kube]`, `[Network]`, `[Pod]` or `[Volume]`); it is not a
+full `quadlet -dryrun`. Files are written atomically, unit files with mode
+`0600` (they can hold secrets) and companion files `0644`. A path that is
+absolute, contains `..` or passes through a symlink below the base directory
+is refused by `read`, `write`, `delete` and `install`.
+
 `list_files` payload:
 
 ```json
-{ "scope": "user" }
+{ "scope": "apps" }
 ```
 
 `list_files` returns all regular files under the selected base directory, including
@@ -736,17 +823,17 @@ companion files:
 
 ```json
 {
-  "base_dir": "/home/example/.config/containers/systemd",
-  "files_base_dir": "/home/example/.local/share/tetra/quadlets",
+  "base_dir": "/var/lib/ultramarine-apps/.config/containers/systemd",
+  "files_base_dir": "/var/lib/ultramarine-apps/.local/share/tetra/quadlets",
   "files": [
     {
       "filename": "app.container",
-      "path": "/home/example/.config/containers/systemd/app.container",
+      "path": "/var/lib/ultramarine-apps/.config/containers/systemd/app.container",
       "quadlet": true
     },
     {
       "filename": "app/index.html",
-      "path": "/home/example/.local/share/tetra/quadlets/app/index.html",
+      "path": "/var/lib/ultramarine-apps/.local/share/tetra/quadlets/app/index.html",
       "quadlet": false
     }
   ]
@@ -760,7 +847,7 @@ To read a companion file from the companion-file directory, include
 
 ```json
 {
-  "scope": "user",
+  "scope": "apps",
   "filename": "app.container",
   "dry_run": true
 }
@@ -774,24 +861,67 @@ Cooks recipes into installed Quadlet-backed apps and manages their lifecycle.
 An app is a named bundle: rendered Quadlet units land in the Quadlet scan
 directory, while companion files and a manifest (`app.json`) live under a
 per-app directory inside the companion-file data root (the same roots used by
-the `quadlets` module). The manifest records the recipe source, parameter
+the `quadlets` module).
+
+Every action takes `scope`, an `AppScope`:
+
+- `"apps"` (the default): a rootless app of the `ultramarine-apps` system
+  account (UID/GID 242, home `/var/lib/ultramarine-apps`). Units go to its
+  `~/.config/containers/systemd`, the bundle to its
+  `~/.local/share/tetra/quadlets/<name>`, all owned by the account (see
+  [quadlets](#quadlets)), and the services run in its lingering user manager
+  (`systemctl --user -M ultramarine-apps@`).
+- `"system"`: a rootful app, for real system services:
+  `/etc/containers/systemd`, `/var/lib/tetra/quadlets/<name>` (root's) and
+  the system manager.
+
+The manifest records the scope, and `get`, `update` and `remove` refuse an
+app whose manifest names another scope, so an app stays where it was
+installed: apps that earlier releases installed in system scope keep working
+with `"scope": "system"` (they are not listed in apps scope).
+
+`list` takes `scope`: `"apps"` (the default), `"system"` or `"all"`, and
+returns `{apps: [...], invalid: [...], roots: [{scope, files_base_dir}]}`,
+plus `files_base_dir` when one scope is listed. Each app carries its `scope`.
+Any `scope` other than `"apps"`, on any `apps` or `quadlets` action, needs the
+`system_services` grant: system scope belongs to the system services page. Tetra does not
+move them; reinstalling one in apps scope (and moving its data) is up to the
+administrator. A `"user"` scope (earlier releases' per-user home) is refused,
+and a manifest that says `user` is listed as `invalid`. The manifest records the recipe source, parameter
 values, installed unit filenames, and companion files so `update` can
 re-render and `remove` can clean up without the caller resending the recipe.
 
-Request payloads deserialize into the `App*` types in `src/types.rs`
+Request payloads deserialize into the `App*` types in `src/types/apps.rs`
 (`AppCreateRequest`, `AppUpdateRequest`, `AppGetRequest`, `AppListRequest`,
 `AppRequest` for `remove`), and the manifest is the serialized `AppManifest`
 type. The recipe source is `AppRecipeSource`: exactly one of an inline recipe
 (`recipe` plus optional `templates`) or an on-disk recipe (`recipe_path` plus
-optional `templates_dir`).
+optional `templates_dir`). An on-disk recipe is read once, when `create` or
+`update` receives it, and stored as an inline snapshot. A stored manifest with
+an on-disk recipe (from an older release) is accepted only in system scope:
+apps-scope manifests live in the apps account's home, which that account (and
+so its containers) can write, so one naming an on-disk recipe is refused by
+`get`, `update` and `remove` and listed as `invalid`. `get` never reads a
+recipe from disk; for a system-scope on-disk recipe it shows every value as
+`"********"`, since it cannot tell which are secrets.
 
 Actions:
 
 - `list`
 - `get`
-- `create`
-- `update`
-- `remove`
+- `create` (privileged)
+- `update` (privileged)
+- `remove` (privileged)
+
+`create`/`update` also accept `source: {catalog: "official"|"community"|"custom",
+url?, sha256}` and `allow_unpinned_images`. Pinning is enabled by default; only
+custom may explicitly opt out. Supplied source digests are always checked before
+install writes. Missing source on create/replacement means custom. On update
+without a replacement recipe, omitted source and opt-out retain the manifest
+policy; replacement resets policy unless explicitly supplied. The manifest
+records verified `source` (including computed digest) and `allow_unpinned_images`,
+and disk recipes are stored as inline snapshots. Old manifests deserialize with
+no source and pinning enabled. See [verification algorithm and image policy](recipes.md#install-time-source-verification-and-image-pinning).
 
 App names may contain letters, digits, `.`, `_`, and `-`, and must not start
 with `.` or `-`.
@@ -801,10 +931,10 @@ with `.` or `-`.
 ```json
 {
   "name": "my-site",
-  "scope": "user",
+  "scope": "apps",
   "recipe": "id: nginx-site\n...",
   "templates": {
-    "app.container": "[Container]\nImage=docker.io/nginx:alpine\n"
+    "app.container": "[Container]\nImage=docker.io/library/nginx:alpine@sha256:a3554c0d0b48177b1413c26e01f695334428020d9df01243fbae3e11cfd17417\n"
   },
   "values": {
     "app_id": "my-site"
@@ -834,18 +964,65 @@ defaults and per-instance overrides can ship in one call.
 
 If the recipe declares a `bundle_dir` parameter and the caller does not
 supply a value for it, `create` and `update` inject the app's bundle
-directory path (e.g. `/var/lib/tetra/quadlets/my-site`) so templates can
+directory path (e.g. `/var/lib/ultramarine-apps/.local/share/tetra/quadlets/my-site`)
+so templates can
 bind-mount companion files with `Volume={{ bundle_dir }}/...` without the
 caller knowing the agent's layout. An explicitly supplied `bundle_dir`
 always wins, and recipes that do not declare the parameter are unaffected
-(undeclared values never reach the render context).
+(undeclared values never reach the render context). Mount subdirectories
+(`Volume={{ bundle_dir }}/site:/usr/share/nginx/html:ro,z`), not the bundle
+root, which holds `app.json`; a pinned kube unit's `Yaml=` must be
+`{{ bundle_dir }}/<bundled file>` in the real bundle directory (see the
+[image policy](recipes.md#rendered-image-policy)).
 
 `create` renders the recipe, writes the Quadlet units and companion files,
 writes `<bundle>/app.json`, optionally applies SELinux contexts to the bundle,
-and — unless `converge` is `false` — runs `systemctl daemon-reload`, then
-enables and starts the derived services. Service names are derived from unit
+and — unless `converge` is `false` — prepares the apps account (apps scope),
+runs `systemctl daemon-reload`, then starts the derived services. Quadlet services are generated units, which
+`systemctl enable` refuses; a unit's `[Install]` section (for example
+`WantedBy=default.target`) is what starts it at boot. Service names are derived from unit
 filenames: `.container` and `.kube` units map to `<stem>.service`, `.pod`
 units to `<stem>-pod.service`; network and volume units have no service.
+`converge` defaults to `true`; `create` and `update` never run `systemctl
+enable` or `disable`.
+
+Preparing the apps account (`account` in the response; empty in system
+scope or with `converge: false`) makes sure the host can run rootless apps,
+skipping what is already there:
+
+1. Subordinate UIDs and GIDs, which `systemd-sysusers` does not allocate:
+   when `/etc/subuid` or `/etc/subgid` has no range for `ultramarine-apps`
+   (by name or UID), `usermod --add-subuids FIRST-LAST --add-subgids
+   FIRST-LAST ultramarine-apps` with the first free range of 65536 IDs from
+   524288 up, as `useradd` picks them (Fedora's `SUB_UID_MIN`/`COUNT`).
+2. Lingering: `loginctl enable-linger ultramarine-apps` unless
+   `/var/lib/systemd/linger/ultramarine-apps` exists (the packaged
+   `tetra.tmpfiles.conf` creates it), then `systemctl start user@242.service`,
+   so the account's manager is running before Tetra talks to it.
+3. On SELinux hosts, unless `/var/lib/tetra/apps-storage-labels` records
+   that it was done: `semanage fcontext -a -e /var/lib/containers/storage
+   /var/lib/ultramarine-apps/.local/share/containers/storage` (skipped when
+   the policy's `file_contexts.subs` already has it), creating that
+   directory (owned by the account) and `restorecon -R` on it, so rootless
+   storage gets the labels of rootful storage (a home under `/var/lib` gets
+   none of the `HOME_DIR` rules that label rootless storage in `/home`). The
+   record is written only once `restorecon` succeeds, so a failed relabel
+   is retried on the next converge.
+
+The account must exist (`systemd-sysusers`); converging in apps scope fails
+otherwise. Rootless containers cannot publish ports below 1024 unless the
+host lowers `net.ipv4.ip_unprivileged_port_start`, so in apps scope `create`
+and `update` refuse a `PublishPort=` host port below it (best effort: kube
+`hostPort` and raw `PodmanArgs` are not parsed); put a reverse proxy in
+front instead. Units must use `WantedBy=default.target` (as the shipped
+recipes do): the user manager has no `multi-user.target`.
+
+A parameter with a `generate` strategy (such as `random_32`) and neither a
+value nor a default is generated once and stored in the manifest with the
+other values, so later `update`s keep it instead of generating a new secret.
+`app.json` is written atomically and private (`0600`, the apps account's in
+apps scope, root's in system scope), because it holds those values. The `create` and `update` responses return the manifest as stored,
+secrets included; only `get` redacts them.
 
 Response:
 
@@ -854,7 +1031,7 @@ Response:
   "app": {
     "version": 1,
     "name": "my-site",
-    "scope": "user",
+    "scope": "apps",
     "recipe_id": "nginx-site",
     "recipe_version": "0.1.0",
     "recipe": { "source": "inline", "recipe": "...", "templates": {} },
@@ -864,12 +1041,14 @@ Response:
     "created_at": 1750000000,
     "updated_at": 1750000000
   },
-  "base_dir": "/home/example/.config/containers/systemd",
-  "bundle_dir": "/home/example/.local/share/tetra/quadlets/my-site",
-  "manifest_path": "/home/example/.local/share/tetra/quadlets/my-site/app.json",
+  "base_dir": "/var/lib/ultramarine-apps/.config/containers/systemd",
+  "bundle_dir": "/var/lib/ultramarine-apps/.local/share/tetra/quadlets/my-site",
+  "owner": "ultramarine-apps",
+  "manifest_path": "/var/lib/ultramarine-apps/.local/share/tetra/quadlets/my-site/app.json",
   "units": ["my-site.container"],
   "files": ["index.html"],
   "services": ["my-site.service"],
+  "account": [],
   "systemd": [],
   "selinux": [],
   "written": true,
@@ -880,7 +1059,7 @@ Response:
 `list` payload:
 
 ```json
-{ "scope": "user" }
+{ "scope": "apps" }
 ```
 
 Returns one summary per app plus an `invalid` array naming bundle directories
@@ -889,18 +1068,18 @@ directories):
 
 ```json
 {
-  "files_base_dir": "/home/example/.local/share/tetra/quadlets",
+  "files_base_dir": "/var/lib/ultramarine-apps/.local/share/tetra/quadlets",
   "apps": [
     {
       "name": "my-site",
       "recipe_id": "nginx-site",
       "recipe_version": "0.1.0",
-      "scope": "user",
+      "scope": "apps",
       "units": ["my-site.container"],
       "services": ["my-site.service"],
       "created_at": 1750000000,
       "updated_at": 1750000000,
-      "bundle_dir": "/home/example/.local/share/tetra/quadlets/my-site"
+      "bundle_dir": "/var/lib/ultramarine-apps/.local/share/tetra/quadlets/my-site"
     }
   ],
   "invalid": []
@@ -910,11 +1089,14 @@ directories):
 `get` payload:
 
 ```json
-{ "name": "my-site", "scope": "user" }
+{ "name": "my-site", "scope": "apps" }
 ```
 
-Returns the full manifest plus the unit and companion-file listings (each with
-its absolute path and an `exists` flag) and the derived services.
+Returns the manifest plus the unit listing (each unit with its absolute path
+and an `exists` flag), the companion files and the derived services. `get` is
+open to users granted `apps: view`, so the values of the recipe's `secret`
+parameters are replaced by `"********"` (every value is, if the stored recipe
+cannot be read).
 
 `update` payload:
 
@@ -930,27 +1112,35 @@ Loads the stored manifest, optionally replaces the recipe source (same fields
 as `create`, for recipe upgrades), merges `values` per key over the stored
 values so previously collected secrets do not need to be resent, re-renders,
 installs the new bundle, deletes units and companion files that are no longer
-rendered, rewrites the manifest, and restarts the derived services when
-`converge` is enabled.
+rendered, rewrites the manifest, and (unless `converge` is `false`) runs
+`daemon-reload` and restarts the derived services. The response adds
+`removed_units` and `removed_files`.
+
+A value of `"********"` for a secret parameter (for any parameter, if the
+recipe cannot be read) is ignored and the stored value kept, so the values
+from `get` can be sent back unchanged.
 
 `remove` payload:
 
 ```json
 {
   "name": "my-site",
-  "scope": "user",
+  "scope": "apps",
   "converge": true,
   "dry_run": true
 }
 ```
 
-Stops and disables the derived services (failures are reported inline in the
+Stops the derived services (failures are reported inline in the
 `systemd` array and tolerated), deletes the Quadlet units, runs
 `daemon-reload`, and removes the bundle directory. Volumes created by Podman
 for the app's `.volume` units are intentionally preserved.
 
 `create`, `update`, and `remove` all honor `dry_run`, which previews the file
-writes and the exact `systemctl` commands without changing the host. Setting
+writes and the exact `usermod`, `loginctl`, `semanage` and `systemctl`
+commands without changing the host. In apps scope these are
+`systemctl --user -M ultramarine-apps@ daemon-reload` and
+`systemctl --user -M ultramarine-apps@ start|restart|stop <service>`. Setting
 `converge: false` skips systemd interaction entirely, which is useful for
 staging files on hosts without systemd.
 
@@ -965,16 +1155,33 @@ Actions:
 - `list`
 - `status`
 - `logs`
-- `start`
-- `stop`
-- `restart`
-- `enable`
-- `disable`
+- `daemon_reload` (privileged)
+- `start` (privileged)
+- `stop` (privileged)
+- `restart` (privileged)
+- `enable` (privileged)
+- `disable` (privileged)
 
-`list` payload (`scope` is optional and defaults to `system`):
+Every action takes an optional `scope`:
+
+- `system` (the default): the system manager.
+- `user`: the user manager of whoever the command runs as (`systemctl
+  --user`, `journalctl --user`).
+- `apps`: the user manager of `ultramarine-apps`, where apps-scope apps run.
+  As root (privileged actions, `run_as: root`) that is `systemctl --user -M
+  ultramarine-apps@`, and `logs` reads `journalctl _UID=<uid>
+  _SYSTEMD_USER_UNIT=<service>`; reads with `"run_as": "apps"` use plain
+  `--user` as the account itself. A signed-in user's own `runuser` cannot
+  reach the account's manager, so `list` and `status` in this scope default
+  to `run_as: apps`. `logs` does not: journald keeps a system UID's entries in
+  the system journal, which the account cannot read, so it runs as the
+  signed-in user (who reads them through the journal's ACLs, as an
+  administrator does) or as root.
+
+`list` payload:
 
 ```json
-{ "scope": "user" }
+{ "scope": "apps", "run_as": "apps" }
 ```
 
 Response payload includes raw command output and parsed `services`:
@@ -1005,10 +1212,20 @@ Response payload includes raw command output and parsed `services`:
 { "service": "sshd.service", "lines": 100 }
 ```
 
-Mutation payload:
+`lines` defaults to 100.
+
+Mutation payload (`start`, `stop`, `restart`, `enable`, `disable` run
+`systemctl <action> <service>`):
 
 ```json
 { "service": "sshd.service", "dry_run": true }
+```
+
+`daemon_reload` runs `systemctl daemon-reload`, for example after writing
+Quadlet files with the `quadlets` module:
+
+```json
+{ "scope": "system", "dry_run": true }
 ```
 
 ### selinux
@@ -1021,13 +1238,13 @@ Backed by `sestatus`, `getenforce`, `getsebool`, `setsebool`, `semanage`, and
 Actions:
 
 - `status`
-- `enforce`
+- `enforce` (privileged)
 - `booleans`
-- `set_boolean`
+- `set_boolean` (privileged)
 - `file_contexts`
-- `add_file_context`
-- `delete_file_context`
-- `restore_context`
+- `add_file_context` (privileged)
+- `delete_file_context` (privileged)
+- `restore_context` (privileged)
 
 `status` payload:
 
@@ -1106,9 +1323,9 @@ Actions:
 - `list`
 - `status`
 - `zfs`
-- `mount`
-- `unmount`
-- `configure`
+- `mount` (privileged)
+- `unmount` (privileged)
+- `configure` (privileged)
 
 `list` returns parsed `/proc/mounts` and `/proc/partitions` data.
 
@@ -1166,6 +1383,13 @@ and `datasets` from `zpool list` and `zfs list`. Missing ZFS support returns
 }
 ```
 
+`configure` appends `entry` to `fstab_path` (default `/etc/fstab`). The entry
+must be one line of 2 to 6 fields and not a comment. The response has
+`fstab_path`, `configured`, `dry_run` and `selinux`.
+
+`status` runs `df -h PATH` and returns `{result, dry_run, zfs}`. `mount` runs
+`mount [-t fstype] [-o options] source target`.
+
 ### samba
 
 Feature: `samba`
@@ -1174,10 +1398,10 @@ Actions:
 
 - `list_shares`
 - `get_config`
-- `set_config`
-- `reload`
-- `enable`
-- `disable`
+- `set_config` (privileged)
+- `reload` (privileged)
+- `enable` (privileged)
+- `disable` (privileged)
 
 Default config path: `/etc/samba/smb.conf`
 
@@ -1208,6 +1432,18 @@ Service actions accept:
 { "dry_run": true }
 ```
 
+`list_shares` returns `{path, shares}`, `get_config` `{path, contents}`.
+`set_config` replaces the whole file (send the complete `smb.conf`, including
+`[global]`) in place, keeping its owner, mode and label; the shared `selinux`
+object defaults its `path` to the config file, so pass the share directory to
+label it. As with `files`, the config must be a regular file, and reads are
+limited to 16 MiB. `reload` runs `systemctl reload-or-restart smb.service`;
+`enable` and `disable` run `systemctl enable --now`/`disable --now` on it.
+
+`set_config` is administrator-only on the local socket (an `smb.conf` can run
+commands as root), and users granted `sharing` may only use the default
+`path`.
+
 ### nfs
 
 Feature: `nfs`
@@ -1216,10 +1452,10 @@ Actions:
 
 - `list_exports`
 - `get_config`
-- `set_config`
-- `reload`
-- `enable`
-- `disable`
+- `set_config` (privileged)
+- `reload` (privileged)
+- `enable` (privileged)
+- `disable` (privileged)
 
 Default config path: `/etc/exports`
 
@@ -1250,6 +1486,15 @@ Service actions accept:
 { "dry_run": true }
 ```
 
+`list_exports` returns `{path, exports}`, `get_config` `{path, contents}`.
+`set_config` replaces the whole file in place, like `samba.set_config`.
+`reload` runs `exportfs -ra`; `enable` and `disable` run `systemctl enable
+--now`/`disable --now` on `nfs-server.service`.
+
+`set_config` is administrator-only on the local socket (an export with
+`no_root_squash` is root-equivalent), and users granted `sharing` may only
+use the default `path`.
+
 ### network
 
 Feature: `network`
@@ -1262,6 +1507,7 @@ Actions:
 - `routes`
 - `configure` (privileged)
 - `confirm` (privileged)
+- `pending` (privileged)
 - `get_config` (privileged)
 - `set_config` (privileged)
 - `reload` (privileged)
@@ -1397,22 +1643,70 @@ and its default SELinux label, then loads and activates it.
 
 With `dry_run`, the response holds the `path`, `uuid` and rendered `keyfile`
 and nothing is written. Otherwise the response also reports `applied`,
-`activation_error` (or `null`), `addresses_before` and `addresses_after`.
+`activation_error` (or `null`), `addresses_before`, `addresses_after`,
+`gateways_before` and `gateways_after`.
 
-Safe apply: before activating, Tetra records the interface's routable
-addresses. If none of them is present again shortly after activation, the
-response has `"confirmation_required": true`, a `confirmation_token`, and
-`rollback_in_seconds` (60). Unless the caller sends `confirm` within that time,
-Tetra restores the previous keyfile (or deletes the new one) and reactivates
-the previously active profile. Only one change can await confirmation at a
-time. The pending rollback is held in memory, so a Tetra restart or reboot
-inside the window keeps the new configuration.
+Safe apply: before writing anything, Tetra records the interface's routable
+addresses and the gateways of its default routes, and creates a
+NetworkManager checkpoint of the interface's device (`CheckpointCreate` over
+D-Bus, with `DELETE_NEW_CONNECTIONS`). If none of those addresses is present
+again shortly after activation, or the interface had default routes and none
+of their gateways is, the change needs confirmation. If the profile also
+failed to activate, it is undone at once (through the checkpoint) and the
+action fails. Otherwise the response has `"confirmation_required": true`, a
+`confirmation_token`, `rollback_in_seconds` (60), `rollback_by`
+(`networkmanager`, or `tetra` without a checkpoint) and `checkpoint` (its
+D-Bus path, or `null`). A change that keeps the host reachable destroys its
+checkpoint right away and needs no confirmation.
+
+Unless the caller sends `confirm` within that time, NetworkManager itself
+rolls the device back to the checkpoint: it restores the previously active
+profile (on disk too) and reactivates it, and deletes a profile the change
+added. This happens inside NetworkManager, so it does not depend on Tetra:
+a Tetra crash or restart inside the window, or one in the middle of
+applying, still gets the old network back. A few seconds later Tetra
+finishes the rollback: it puts the previous keyfile back byte for byte
+(also for a changed profile that was not the active one, which the
+checkpoint does not cover), removes a new keyfile NetworkManager did not, and
+reactivates the previous profile if NetworkManager did not.
+
+The pending change, previous keyfile included, is recorded in
+`/var/lib/tetra/network/pending.json` (directory `0700`, file `0600`, root
+only) until it settles, so `pending` and `confirm` keep working after a Tetra
+restart. Tetra picks the record up on its first network action after
+starting. If the rollback is overdue by then (Tetra was down past the
+deadline), or NetworkManager restarted and dropped the checkpoint without
+rolling back (it keeps checkpoints in memory only), Tetra rolls the change
+back itself at the deadline, including after a reboot. If NetworkManager
+cannot create a checkpoint (no D-Bus, a NetworkManager older than 1.6, or
+another tool's checkpoint already covering the device), Tetra logs a
+warning and rolls back by itself from the same record (`rollback_by:
+"tetra"`); then a Tetra restart inside the window delays the rollback until
+Tetra is back. Only one change can await confirmation at a time.
+
+The checkpoint covers only the configured interface's device, but
+`DELETE_NEW_CONNECTIONS` makes its rollback delete every profile added
+anywhere while the change was pending (including in-memory profiles
+NetworkManager generates for devices that appeared meanwhile, such as a new
+container's veth).
 
 `confirm` payload:
 
 ```json
 { "token": "..." }
 ```
+
+The change usually cuts the connection its response was sent on, so
+`pending` (no payload) returns the change awaiting confirmation, if any:
+`{"pending": {"confirmation_token", "interface", "path",
+"rollback_in_seconds", "rollback_by", "checkpoint"}}` or
+`{"pending": null}`. `confirm` destroys the checkpoint; it fails if the
+change was already rolled back, or if NetworkManager is unreachable (the
+change then stays pending and still rolls back). `set_config` refuses the
+keyfile of a pending change. When a change needs confirmation, the outbound
+control-plane session drops and redials at once instead of waiting out its
+idle timeout, so a controller should call `pending` and `confirm` after it
+reconnects.
 
 `scan_wifi` lists the networks a wireless interface can see, from
 `nmcli device wifi list`:
@@ -1502,6 +1796,101 @@ relabels it with `restorecon`.
 { "dry_run": true }
 ```
 
+### reverse_proxy
+
+Feature: `reverse-proxy`
+
+Manages Caddy sites for hosted services, one `*.caddyfile` per domain in
+`/etc/caddy/Caddyfile.d`, which terra-caddy's default Caddyfile imports. The
+file name is the domain with `.` replaced by `_` (`app.example.com` →
+`app_example_com.caddyfile`).
+
+Actions:
+
+- `list`
+- `render`
+- `write` (privileged)
+- `delete` (privileged)
+- `reload` (privileged)
+
+Every action except `reload` accepts `config_dir` to use another directory.
+Only administrators and remote controllers may set it; everyone else gets the
+default.
+
+`list` takes `{}` and returns `{config_dir, sites}`, sorted by domain. A site
+is `{filename, path, domain, upstream, tls}`. Only files Tetra wrote are
+listed: ones whose first line is `# Managed by Tetra reverse_proxy` and that
+carry a readable `# tetra:` metadata line. The dashboard's and the OOBE's own
+sites are not listed.
+
+`render` and `write` payload:
+
+```json
+{
+  "domain": "app.example.com",
+  "upstream": "127.0.0.1:8080",
+  "tls": true,
+  "reload": true,
+  "dry_run": false
+}
+```
+
+`write` creates or replaces the site:
+
+```caddyfile
+# Managed by Tetra reverse_proxy
+# tetra: {"domain":"app.example.com","upstream":"127.0.0.1:8080","tls":true}
+app.example.com {
+	reverse_proxy 127.0.0.1:8080
+}
+```
+
+- `domain` is trimmed, lowercased and stripped of a trailing dot, then must
+  be a DNS name: dot-separated labels of 1–63 letters, digits and inner
+  hyphens, at most 253 characters. Wildcards are not accepted.
+- `upstream` is trimmed and must be one address made only of letters,
+  digits, `.`, `-`, `_`, `:`, `[`, `]` and `/`, containing a `:` (host and
+  port), such as `127.0.0.1:8080` or `[::1]:8080`. Whitespace, braces and
+  newlines are refused, so a payload cannot add upstreams or directives to
+  the site.
+- `tls` defaults to `true` (Caddy's automatic HTTPS). `false` writes an
+  `http://domain` site address, served over plain HTTP without a
+  certificate.
+- The file is written atomically with mode `0644` (Caddy reads it as
+  `caddy`), creating `config_dir` if needed.
+- `write` and `delete` refuse an existing file that does not start with the
+  managed header (an operator's own site), and domains whose file name would
+  be one of Tetra's own sites (`00-ultramarine-dashboard.caddyfile`,
+  `00-ultramarine-setup.caddyfile`).
+- With `reload: true` (default `false`), Caddy is reloaded after the change
+  (`systemctl reload caddy.service`). A failed reload does not fail the
+  action, since the file already changed: its error is returned in
+  `reload_error`.
+
+`render` previews the site without writing: `{config_dir, filename, contents,
+site, dry_run, reload}`. `write` returns `{config_dir, filename, path,
+contents, site, written, dry_run, reload, reload_error}`, where `reload` is
+the reload's command result or `null`.
+
+`delete` payload:
+
+```json
+{ "domain": "app.example.com", "reload": true, "dry_run": false }
+```
+
+It removes the site (a missing file is not an error) and returns
+`{config_dir, filename, path, deleted, dry_run, reload, reload_error}`.
+
+`reload` takes `{ "dry_run": false }` and runs `systemctl reload
+caddy.service`.
+
+`list` and `render` need `network: view`; `write`, `delete` and `reload` need
+`network: manage`.
+
+Sites written by released versions up to 0.2.3 to
+`/etc/caddy/tetra-sites/<domain>.caddy` are moved here when `tetra
+agent-serve` starts (see "Caddy" in [auth-protocol.md](auth-protocol.md#caddy)).
+
 ### podman
 
 Feature: `podman`
@@ -1514,19 +1903,31 @@ Actions:
 - `volumes`
 - `networks`
 - `logs`
-- `start`
-- `stop`
-- `restart`
-- `remove`
+- `start` (privileged)
+- `stop` (privileged)
+- `restart` (privileged)
+- `remove` (privileged)
+
+Reads run as `ultramarine-apps` by default, so they show the containers,
+images, volumes and networks of user apps; send `"run_as": "root"`
+(administrators) for rootful ones, or `"run_as": "user"` for the signed-in
+user's own (see [Run As](#run-as)). Mutations always run as root, so they
+act on rootful containers; manage apps through `apps` and `services` with
+`"scope": "apps"` instead.
 
 List actions return raw command output plus parsed JSON in `data`.
 
-`inspect` returns `podman inspect NAME` output in `data`.
+`inspect` returns `podman inspect NAME` output in `data`. Environment values
+are replaced by `********` (`Config.Env` and the `--env`/`-e` arguments in
+`Config.CreateCommand`, in `data` and `stdout`), since apps keep secrets
+there (`Environment=DB_PASSWORD=...`) and the Containers page may be granted
+to non-administrators. `"show_env": true` returns them unredacted and is
+administrator-only.
 
 `inspect` payload:
 
 ```json
-{ "name": "app" }
+{ "name": "app", "show_env": false }
 ```
 
 `logs` payload:
@@ -1535,7 +1936,10 @@ List actions return raw command output plus parsed JSON in `data`.
 { "name": "app", "lines": 100 }
 ```
 
-Mutation payload:
+`lines` defaults to 100. `logs` returns the command result without parsing.
+
+Mutation payload (`start`, `stop`, `restart`, and `remove`, which runs
+`podman rm` without `--force`):
 
 ```json
 { "name": "app", "dry_run": true }
@@ -1550,14 +1954,14 @@ Actions:
 - `list`
 - `groups`
 - `status`
-- `create`
-- `update`
-- `delete`
-- `set_password`
-- `set_authorized_keys`
-- `add_admin`
+- `create` (privileged)
+- `update` (privileged)
+- `delete` (privileged)
+- `set_password` (privileged)
+- `set_authorized_keys` (privileged)
+- `add_admin` (privileged)
 
-Every action except `list` and `status` is privileged.
+Every action except `list`, `groups` and `status` is privileged.
 
 Account names (`name`) and the `groups` of `update` must be 1–32
 characters from `A-Z a-z 0-9 _ . -`, not start with `-` or `.`, not be all
@@ -1657,11 +2061,11 @@ Actions:
 - `list`
 - `status`
 - `logs`
-- `start`
-- `stop`
-- `restart`
-- `create`
-- `delete`
+- `start` (privileged)
+- `stop` (privileged)
+- `restart` (privileged)
+- `create` (privileged)
+- `delete` (privileged)
 
 `list` returns parsed `domains`.
 
@@ -1690,6 +2094,11 @@ Mutation payloads:
 ```json
 { "xml_path": "/var/lib/libvirt/images/vm1.xml", "dry_run": true }
 ```
+
+`logs` returns the `libvirtd.service` journal (`lines` defaults to 100).
+`start` runs `virsh start`, `stop` a graceful `virsh shutdown`, `restart`
+`virsh reboot`, `create` registers a persistent domain with `virsh define`,
+and `delete` runs `virsh undefine`, which keeps the disk images.
 
 ### power
 
@@ -1906,7 +2315,7 @@ disables it and removes the drop-in and the sealed token; as with
   "module": "quadlets",
   "action": "install",
   "payload": {
-    "scope": "user",
+    "scope": "apps",
     "dry_run": true,
     "resources": [
       {
@@ -1925,6 +2334,7 @@ disables it and removes the drop-in and the sealed token; as with
   "action": "restart",
   "payload": {
     "service": "nextcloud-app.service",
+    "scope": "apps",
     "dry_run": true
   }
 }

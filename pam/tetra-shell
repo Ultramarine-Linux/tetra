@@ -1,0 +1,24 @@
+#%PAM-1.0
+# Ultramarine Server web shells. Tetra starts each shell as a transient
+# service (systemd-run --pty -p PAMName=tetra-shell), and systemd runs the
+# account and session stacks below for it. The user already logged in to the
+# dashboard through Tetra (ultramarine-dashboard), so nothing authenticates
+# here: systemd never calls the auth stack, and pam_deny keeps it that way.
+#
+# Modeled on /etc/pam.d/login: account checks (nologin, expiry), the user's
+# SELinux context, the audit loginuid, limits, and a logind session (so
+# XDG_RUNTIME_DIR, systemctl --user and rootless Podman work).
+# Shipped by the tetra package.
+auth       required     pam_deny.so
+account    required     pam_nologin.so
+account    include      system-auth
+password   required     pam_deny.so
+# pam_selinux.so close should be the first session rule
+session    required     pam_selinux.so close
+session    required     pam_loginuid.so
+# pam_selinux.so open should only be followed by sessions to be executed in the user context
+session    required     pam_selinux.so open
+session    required     pam_namespace.so
+session    optional     pam_keyinit.so force revoke
+session    include      system-auth
+session    include      postlogin

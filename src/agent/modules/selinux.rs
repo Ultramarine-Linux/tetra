@@ -12,6 +12,12 @@
 //! code; they share the `SelinuxOptions` payload via `apply_selinux()` in
 //! `module_support.rs`.
 
+use itertools::Itertools;
+use serde_json::json;
+
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, NO_ARGS, positional, run_for};
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 /// SELinux module entry point registered under feature `selinux`.
@@ -60,25 +66,25 @@ impl Mod for SelinuxModule {
 
 actions!(Action [payload user] => {
     Status => {
-        let result = crate::cmd!({&INFO, "status", user} "sestatus")?;
-        Ok(jsonf! {
-            result.command, result.status, result.stdout, result.stderr, result.dry_run,
+        let result = run_for(&INFO, "status", user, "sestatus", NO_ARGS, false)?;
+        Ok(json!({
+            "command": result.command, "status": result.status, "stdout": result.stdout, "stderr": result.stderr, "dry_run": result.dry_run,
             "selinux": parse_sestatus(&result.stdout),
-        })
+        }))
     },
     Enforce => {
-        let result = crate::cmd!({&INFO, "enforce", user} "getenforce")?;
-        Ok(jsonf! {
-            result.command, result.status, result.stdout, result.stderr, result.dry_run,
+        let result = run_for(&INFO, "enforce", user, "getenforce", NO_ARGS, false)?;
+        Ok(json!({
+            "command": result.command, "status": result.status, "stdout": result.stdout, "stderr": result.stderr, "dry_run": result.dry_run,
             "mode": result.stdout.trim(),
-        })
+        }))
     },
     Booleans => {
-        let result = crate::cmd!({&INFO, "booleans", user} "getsebool" ["-a"])?;
-        Ok(jsonf! {
-            result.command, result.status, result.stdout, result.stderr, result.dry_run,
+        let result = run_for(&INFO, "booleans", user, "getsebool", ["-a"], false)?;
+        Ok(json!({
+            "command": result.command, "status": result.status, "stdout": result.stdout, "stderr": result.stderr, "dry_run": result.dry_run,
             "booleans": parse_getsebool(&result.stdout),
-        })
+        }))
     },
     SetBoolean {
         name: String,
@@ -92,34 +98,49 @@ actions!(Action [payload user] => {
         if payload.persistent {
             args.push("-P".to_owned());
         }
+        positional("name", &payload.name)?;
         args.push(payload.name);
         args.push(boolean_value(payload.value).to_owned());
-        crate::cmd!({&INFO, "set_boolean", user} (payload.dry_run) "setsebool" => &args ; json)
+        Ok(run_for(&INFO, "set_boolean", user, "setsebool", &args, payload.dry_run)?.into_json())
     },
     FileContexts => {
-        let result = crate::cmd!({&INFO, "file_contexts", user} "semanage" ["fcontext", "-l"])?;
-        Ok(jsonf! {
-            result.command, result.status, result.stdout, result.stderr, result.dry_run,
+        let result = run_for(&INFO, "file_contexts", user, "semanage", ["fcontext", "-l"], false)?;
+        Ok(json!({
+            "command": result.command, "status": result.status, "stdout": result.stdout, "stderr": result.stderr, "dry_run": result.dry_run,
             "file_contexts": parse_semanage_fcontext(&result.stdout),
-        })
+        }))
     },
     AddFileContext {
         path_pattern: String,
         context_type: String,
         #[serde(default)]
         dry_run: bool,
-    } => crate::cmd!((payload.dry_run){&INFO, "add_file_context", user} "semanage" [
-        "fcontext",
-        "-a",
-        "-t",
-        &payload.context_type,
-        &payload.path_pattern,
-    ] json),
+    } => Ok(run_for(
+        &INFO, "add_file_context", user,
+        "semanage",
+        [
+            "fcontext",
+            "-a",
+            "-t",
+            positional("context_type", &payload.context_type)?,
+            positional("path_pattern", &payload.path_pattern)?,
+        ],
+        payload.dry_run,
+    )?.into_json()),
     DeleteFileContext {
         path_pattern: String,
         #[serde(default)]
         dry_run: bool,
-    } => crate::cmd!((payload.dry_run){&INFO, "delete_file_context", user} "semanage" ["fcontext", "-d", &payload.path_pattern] json),
+    } => Ok(run_for(
+        &INFO, "delete_file_context", user,
+        "semanage",
+        [
+            "fcontext",
+            "-d",
+            positional("path_pattern", &payload.path_pattern)?,
+        ],
+        payload.dry_run,
+    )?.into_json()),
     RestoreContext {
         path: String,
         #[serde(default)]
@@ -129,8 +150,11 @@ actions!(Action [payload user] => {
     } => {
         let mut args = Vec::new();
         args.extend(payload.recursive.then_some("-R"));
-        args.extend(["-v", &payload.path]);
-        crate::cmd!((payload.dry_run){&INFO, "restore_context", user} "restorecon" => &args ; json)
+        args.extend(["-v", positional("path", &payload.path)?]);
+        Ok(run_for(
+            &INFO, "restore_context", user,
+            "restorecon", &args, payload.dry_run,
+        )?.into_json())
     },
 });
 
@@ -160,11 +184,11 @@ fn parse_sestatus(stdout: &str) -> Value {
 fn parse_getsebool(stdout: &str) -> Vec<Value> {
     (stdout.lines().filter_map(|line| line.split_once("-->")))
         .map(|(name, value)| {
-            jsonf! {
+            json!({
                 "name": name.trim(),
                 "enabled": matches!(value.trim(), "on" | "1" | "true"),
                 "value": value.trim(),
-            }
+            })
         })
         .collect()
 }
@@ -188,12 +212,12 @@ fn parse_semanage_fcontext(stdout: &str) -> Vec<Value> {
             let [path_pattern, file_type @ .., context] = &fields[..] else {
                 return None;
             };
-            Some(jsonf! {
-                path_pattern,
+            Some(json!({
+                "path_pattern": path_pattern,
                 "file_type": file_type.join(" "),
-                context,
+                "context": context,
                 "context_type": extract_context_type(context),
-            })
+            }))
         })
         .collect()
 }
@@ -215,6 +239,7 @@ fn normalize_key(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::modules::Act;
 
     #[test]
     fn parses_sestatus_output() {

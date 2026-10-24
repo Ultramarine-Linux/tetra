@@ -21,7 +21,7 @@
 //! it), and a lone `client.crt.next` that staging or discarding was (remove
 //! it).
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rcgen::KeyPair;
 
@@ -45,7 +45,7 @@ pub struct ClientFiles {
 
 impl ClientFiles {
     /// The client files `transport` uses, or `None` when it has no client
-    /// certificate (vsock, or an incomplete config).
+    /// certificate (an incomplete config).
     #[must_use]
     pub fn from_transport(transport: &TransportConfig) -> Option<Self> {
         Some(Self {
@@ -125,12 +125,7 @@ fn rename(from: &Path, to: &Path) -> Result<()> {
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => {
-            Err(error).with_context(|| format!("failed to remove `{}`", path.display()))
-        }
-        _ => Ok(()),
-    }
+    crate::auth::store::remove(path)
 }
 
 /// Validity window of a client certificate, in Unix seconds.
@@ -143,9 +138,10 @@ pub struct Lifetime {
 impl Lifetime {
     /// Read the leaf certificate's validity from the PEM file at `path`.
     pub fn read(path: &Path) -> Result<Self> {
+        use rustls::pki_types::{CertificateDer, pem::PemObject as _};
         let pem = fs::read(path)
             .with_context(|| format!("failed to read client certificate `{}`", path.display()))?;
-        let leaf = rustls_pemfile::certs(&mut pem.as_slice())
+        let leaf = CertificateDer::pem_slice_iter(&pem)
             .next()
             .context("client certificate PEM is empty")?
             .context("failed to parse client certificate PEM")?;
@@ -259,6 +255,20 @@ mod tests {
             Some("/var/lib/tetra/remote/client.key.next")
         );
         assert_eq!(staged.server_ca_path, transport.server_ca_path);
+    }
+
+    #[test]
+    fn staged_files_are_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let files = files(root.path());
+        files.stage("new key", "new cert").unwrap();
+        for path in [files.staged_key(), files.staged_certificate()] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]

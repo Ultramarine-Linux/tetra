@@ -7,8 +7,13 @@
 //! `samba_share_t` in the same request that defines the share — otherwise
 //! SELinux will deny smbd access to the path on enforcing hosts.
 
+use serde_json::json;
+
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus};
+use crate::agent::modules::Mod;
 use crate::{
-    agent::module_support::apply_selinux,
+    agent::module_support::{apply_selinux, run_for},
     prelude::*,
     types::{DryRunRequest, SambaConfigRequest, SambaWriteConfigRequest},
 };
@@ -44,11 +49,6 @@ impl Mod for SambaModule {
     }
 
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
-        // Standard metadata fast-path: `capabilities` and `plan` are answered
-        // from `INFO` without touching the system.
-        if let Some(response) = INFO.metadata_response(action, &payload) {
-            return Ok(response);
-        }
         Action::from_payload(action, payload)?.handle(user)
     }
 }
@@ -56,11 +56,11 @@ impl Mod for SambaModule {
 actions!(Action [payload user] => {
     ListShares: SambaConfigRequest => {
         let contents = payload.read()?;
-        Ok(jsonf!{ payload.path, "shares": parse_samba_shares(&contents) })
+        Ok(json!({ "path": payload.path, "shares": parse_samba_shares(&contents) }))
     },
     GetConfig: SambaConfigRequest => {
         let contents = payload.read()?;
-        Ok(jsonf!{ payload.path, contents })
+        Ok(json!({ "path": payload.path, "contents": contents }))
     },
     SetConfig: SambaWriteConfigRequest => {
         // The whole file is replaced; callers are expected to build the
@@ -75,16 +75,25 @@ actions!(Action [payload user] => {
             Some(&payload.path),
             payload.dry_run,
         )?;
-        Ok(jsonf! {
-            payload.path,
+        Ok(json!({
+            "path": payload.path,
             "written": !payload.dry_run,
-            payload.dry_run,
-            selinux,
-        })
+            "dry_run": payload.dry_run,
+            "selinux": selinux,
+        }))
     },
-    Reload: DryRunRequest => crate::cmd!((payload.dry_run) { &INFO, "reload", user } "systemctl" ["reload-or-restart", "smb.service"] json),
-    Enable: DryRunRequest => crate::cmd!((payload.dry_run) { &INFO, "enable", user } "systemctl" ["enable", "--now", "smb.service"] json),
-    Disable: DryRunRequest => crate::cmd!((payload.dry_run) { &INFO, "disable", user } "systemctl" ["disable", "--now", "smb.service"] json),
+    Reload: DryRunRequest => Ok(run_for(
+        &INFO, "reload", user,
+        "systemctl", ["reload-or-restart", "smb.service"], payload.dry_run,
+    )?.into_json()),
+    Enable: DryRunRequest => Ok(run_for(
+        &INFO, "enable", user,
+        "systemctl", ["enable", "--now", "smb.service"], payload.dry_run,
+    )?.into_json()),
+    Disable: DryRunRequest => Ok(run_for(
+        &INFO, "disable", user,
+        "systemctl", ["disable", "--now", "smb.service"], payload.dry_run,
+    )?.into_json()),
 });
 
 /// Extracts share section names from smb.conf contents.
@@ -106,6 +115,7 @@ fn parse_samba_shares(contents: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use crate::agent::module_support::SelinuxOptions;
+    use crate::agent::modules::Act;
     use std::fs;
 
     use super::*;

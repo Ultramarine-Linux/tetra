@@ -10,6 +10,11 @@
 //! the virtual console keymap), `set_locale` (`localectl set-locale`) and
 //! `set_timezone` (`timedatectl set-timezone`).
 
+use serde_json::json;
+
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, run_for};
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 /// Marker type for the always-on settings module. It carries no state: all
@@ -51,16 +56,22 @@ actions!(Action [payload user] => {
     // `std::env::consts` are compile-time constants derived from the
     // target triple, so `get_system` performs no host probe and is safe
     // to call in any context.
-    GetSystem => Ok(jsonf! {
+    GetSystem => Ok(json!({
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "family": std::env::consts::FAMILY,
-    }),
+    })),
     SetHostname {
         hostname: String,
         #[serde(default)]
         dry_run: bool,
-    } => crate::cmd!((payload.dry_run) { &INFO, "set_hostname", user } "hostnamectl" ["set-hostname", &payload.hostname] json),
+    } => {
+        validate_hostname(&payload.hostname)?;
+        Ok(run_for(
+            &INFO, "set_hostname", user,
+            "hostnamectl", ["set-hostname", &payload.hostname], payload.dry_run,
+        )?.into_json())
+    },
     SetKeymap {
         /// X11 layout, such as `us` or `de` (comma-separated for several).
         layout: String,
@@ -81,7 +92,7 @@ actions!(Action [payload user] => {
         if let Some(variant) = variant {
             args.extend(["", variant]);
         }
-        crate::cmd!((payload.dry_run) { &INFO, "set_keymap", user } "localectl" => &args ; json)
+        Ok(run_for(&INFO, "set_keymap", user, "localectl", &args, payload.dry_run)?.into_json())
     },
     SetLocale {
         /// System locale (`LANG`), such as `en_US.UTF-8`.
@@ -91,7 +102,10 @@ actions!(Action [payload user] => {
     } => {
         validate_locale(&payload.locale)?;
         let lang = format!("LANG={}", payload.locale);
-        crate::cmd!((payload.dry_run) { &INFO, "set_locale", user } "localectl" ["set-locale", &lang] json)
+        Ok(run_for(
+            &INFO, "set_locale", user,
+            "localectl", ["set-locale", &lang], payload.dry_run,
+        )?.into_json())
     },
     SetTimezone {
         /// IANA time zone, such as `Europe/Berlin` or `UTC`.
@@ -100,9 +114,24 @@ actions!(Action [payload user] => {
         dry_run: bool,
     } => {
         validate_timezone(&payload.timezone)?;
-        crate::cmd!((payload.dry_run) { &INFO, "set_timezone", user } "timedatectl" ["set-timezone", &payload.timezone] json)
+        Ok(run_for(
+            &INFO, "set_timezone", user,
+            "timedatectl", ["set-timezone", &payload.timezone], payload.dry_run,
+        )?.into_json())
     },
 });
+
+/// A hostname for `hostnamectl set-hostname`, which also accepts a "pretty"
+/// name (spaces, Unicode). Refuses what would be read as an option (the
+/// setup session can call this) and control characters.
+fn validate_hostname(hostname: &str) -> Result<()> {
+    crate::agent::module_support::positional("hostname", hostname)?;
+    ensure!(
+        hostname.len() <= 255 && !hostname.chars().any(char::is_control),
+        "hostname must be at most 255 bytes without control characters"
+    );
+    Ok(())
+}
 
 /// XKB layout and variant names: letters, digits, `_`, `-`, and `,` between
 /// several layouts.

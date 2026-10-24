@@ -38,7 +38,11 @@ use nix::{
     sys::stat::{Mode, fchmod, mkdirat},
     unistd::{Gid, Uid, UnlinkatFlags, fchown, fsync, unlinkat},
 };
+use serde_json::json;
 
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, option_arg, run_for};
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 /// Group whose members are Tetra administrators (with `wheel`).
@@ -81,7 +85,6 @@ const INFO: ModuleInfo = ModuleInfo {
         "set_password",
         "set_authorized_keys",
         "add_admin",
-        "groups",
     ],
 };
 
@@ -96,11 +99,11 @@ impl Mod for UsersModule {
 }
 
 actions!(Action [payload user] => {
-    List => Ok(jsonf! { "users": parse_passwd(&read_file("/etc/passwd")?) }),
-    Groups => Ok(jsonf! { "groups": parse_group(&read_file("/etc/group")?) }),
+    List => Ok(json!({ "users": parse_passwd(&read_file("/etc/passwd")?) })),
+    Groups => Ok(json!({ "groups": parse_group(&read_file("/etc/group")?) })),
     Status { name: String } => {
         validate_name(&payload.name)?;
-        crate::cmd!({ &INFO, "status", user } "id" [&payload.name] json)
+        Ok(run_for(&INFO, "status", user, "id", [&payload.name], false)?.into_json())
     },
     Create {
         name: String,
@@ -115,9 +118,13 @@ actions!(Action [payload user] => {
         let mut args = Vec::new();
         // `useradd` spells the home flag `--home-dir` (unlike
         // `usermod`'s `--home` below).
-        flag!(args payload: system [shell] ["--home-dir" home]);
+        if payload.system {
+            args.push("--system".to_owned());
+        }
+        option_arg(&mut args, "--shell", payload.shell);
+        option_arg(&mut args, "--home-dir", payload.home);
         args.push(payload.name);
-        crate::cmd!((payload.dry_run) { &INFO, "create", user } "useradd" => &args ; json)
+        Ok(run_for(&INFO, "create", user, "useradd", &args, payload.dry_run)?.into_json())
     },
     Update {
         name: String,
@@ -129,13 +136,14 @@ actions!(Action [payload user] => {
     } => {
         validate_name(&payload.name)?;
         let mut args = Vec::new();
-        flag!(args payload: [shell] [home]);
+        option_arg(&mut args, "--shell", payload.shell);
+        option_arg(&mut args, "--home", payload.home);
         if let Some(groups) = payload.groups {
             groups.iter().try_for_each(|group| validate_name(group))?;
             args.extend(["--groups".into(), groups.join(",")]);
         }
         args.push(payload.name);
-        crate::cmd!((payload.dry_run) { &INFO, "update", user } "usermod" => &args ; json)
+        Ok(run_for(&INFO, "update", user, "usermod", &args, payload.dry_run)?.into_json())
     },
     Delete {
         name: String,
@@ -143,7 +151,7 @@ actions!(Action [payload user] => {
         dry_run: bool,
     } => {
         validate_name(&payload.name)?;
-        crate::cmd!((payload.dry_run) { &INFO, "delete", user } "userdel" [&payload.name] json)
+        Ok(run_for(&INFO, "delete", user, "userdel", [&payload.name], payload.dry_run)?.into_json())
     },
     SetPassword {
         name: String,
@@ -186,12 +194,12 @@ actions!(Action [payload user] => {
             &["-R"],
             payload.dry_run,
         )?;
-        Ok(jsonf! {
-            payload.name, path,
+        Ok(json!({
+            "name": payload.name, "path": path,
             "keys": payload.keys.len(),
             "written": !payload.dry_run,
-            payload.dry_run, selinux,
-        })
+            "dry_run": payload.dry_run, "selinux": selinux,
+        }))
     },
     AddAdmin {
         name: String,
@@ -199,7 +207,10 @@ actions!(Action [payload user] => {
         dry_run: bool,
     } => {
         validate_name(&payload.name)?;
-        crate::cmd!((payload.dry_run) { &INFO, "add_admin", user } "usermod" ["--append", "--groups", ADMIN_GROUP, &payload.name] json)
+        Ok(run_for(
+            &INFO, "add_admin", user,
+            "usermod", ["--append", "--groups", ADMIN_GROUP, &payload.name], payload.dry_run,
+        )?.into_json())
     },
 });
 
@@ -228,7 +239,10 @@ fn validate_name(name: &str) -> Result<()> {
 /// `chpasswd` line.
 fn validate_password_hash(hash: &str) -> Result<()> {
     ensure!(
-        !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_graphic() && byte != b':'),
+        !hash.is_empty()
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && byte != b':'),
         "password_hash must be a crypt(3) hash: printable ASCII without spaces or `:`"
     );
     Ok(())
@@ -236,7 +250,10 @@ fn validate_password_hash(hash: &str) -> Result<()> {
 
 /// Validate key lines and join them into an `authorized_keys` file.
 fn authorized_keys(keys: &[String]) -> Result<String> {
-    ensure!(keys.len() <= MAX_KEYS, "at most {MAX_KEYS} keys are accepted");
+    ensure!(
+        keys.len() <= MAX_KEYS,
+        "at most {MAX_KEYS} keys are accepted"
+    );
     let mut contents = String::new();
     for key in keys {
         let key = key.trim();
@@ -278,8 +295,13 @@ fn write_authorized_keys(home: &Path, uid: Uid, gid: Gid, contents: &[u8]) -> Re
         Ok(()) | Err(Errno::EEXIST) => {}
         Err(error) => return Err(error).context("failed to create `.ssh`"),
     }
-    let ssh_fd = openat(&home_fd, ".ssh", directory | OFlag::O_NOFOLLOW, Mode::empty())
-        .with_context(|| format!("`{}/.ssh` is not a directory", home.display()))?;
+    let ssh_fd = openat(
+        &home_fd,
+        ".ssh",
+        directory | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .with_context(|| format!("`{}/.ssh` is not a directory", home.display()))?;
     fchown(&ssh_fd, Some(uid), Some(gid)).context("failed to chown `.ssh`")?;
     fchmod(&ssh_fd, Mode::from_bits_truncate(0o700)).context("failed to chmod `.ssh`")?;
 
@@ -335,14 +357,14 @@ fn parse_passwd(contents: &str) -> Vec<Value> {
         .filter_map(|line| {
             let fields: Vec<_> = line.split(':').collect();
             (fields.len() >= 7).then(|| {
-                jsonf! {
+                json!({
                     "name": fields[0],
                     "uid": fields[2],
                     "gid": fields[3],
                     "gecos": fields[4],
                     "home": fields[5],
                     "shell": fields[6],
-                }
+                })
             })
         })
         .collect()
@@ -360,11 +382,11 @@ fn parse_group(contents: &str) -> Vec<Value> {
         .filter_map(|line| {
             let fields: Vec<_> = line.split(':').collect();
             (fields.len() >= 4).then(|| {
-                jsonf! {
+                json!({
                     "name": fields[0],
                     "gid": fields[2],
                     "members": fields[3].split(',').filter(|member| !member.is_empty()).collect::<Vec<_>>(),
-                }
+                })
             })
         })
         .collect()
@@ -373,6 +395,7 @@ fn parse_group(contents: &str) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::modules::Act;
 
     #[test]
     fn parses_passwd_entries() {
@@ -431,7 +454,10 @@ mod tests {
             }
             .handle(None)
             .unwrap_err();
-            assert!(error.to_string().contains("password_hash"), "{bad:?}: {error}");
+            assert!(
+                error.to_string().contains("password_hash"),
+                "{bad:?}: {error}"
+            );
         }
         validate_password_hash("!$6$rounds=5000$salt$hash").unwrap();
     }
@@ -491,7 +517,10 @@ mod tests {
                     None,
                 )
                 .unwrap_err();
-            assert!(error.to_string().contains("not a valid"), "{action}: {error}");
+            assert!(
+                error.to_string().contains("not a valid"),
+                "{action}: {error}"
+            );
         }
         let set_password = serde_json::json!({
             "name": "--help", "password_hash": "$y$x", "dry_run": true
@@ -575,7 +604,12 @@ mod tests {
         std::os::unix::fs::symlink(&target, home.path().join(".ssh/authorized_keys")).unwrap();
         let path = write_authorized_keys(home.path(), uid, gid, b"key\n").unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
-        assert!(!fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert!(
+            !fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), "key\n");
     }
 

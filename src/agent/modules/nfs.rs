@@ -7,9 +7,13 @@
 //! `public_content_rw_t`) in the same request — otherwise SELinux denies nfsd
 //! access to the path on enforcing hosts.
 
+use serde_json::json;
+
+use crate::actions;
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
-use crate::agent::module_support::apply_selinux;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, apply_selinux, run_for};
 use crate::types::{DryRunRequest, NfsConfigRequest, NfsWriteConfigRequest};
 
 /// NFS module entry point registered under feature `nfs`.
@@ -44,21 +48,16 @@ impl Mod for NfsModule {
     }
 
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
-        // Standard metadata fast-path: `capabilities` and `plan` are answered
-        // from `INFO` without touching the system.
-        if let Some(response) = INFO.metadata_response(action, &payload) {
-            return Ok(response);
-        }
         Action::from_payload(action, payload)?.handle(user)
     }
 }
 
 actions!(Action [payload user] => {
     ListExports: NfsConfigRequest => {
-        Ok(jsonf! { payload.path, "exports": parse_exports(&payload.read()?) })
+        Ok(json!({ "path": payload.path, "exports": parse_exports(&payload.read()?) }))
     },
     GetConfig: NfsConfigRequest => {
-        Ok(jsonf! { payload.path, "contents": payload.read()? })
+        Ok(json!({ "path": payload.path, "contents": payload.read()? }))
     },
     SetConfig: NfsWriteConfigRequest => {
         // The whole file is replaced; callers build the complete
@@ -72,21 +71,27 @@ actions!(Action [payload user] => {
             Some(&payload.path),
             payload.dry_run,
         )?;
-        Ok(jsonf! {
-            payload.path,
+        Ok(json!({
+            "path": payload.path,
             "written": !payload.dry_run,
-            payload.dry_run,
-            selinux,
-        })
+            "dry_run": payload.dry_run,
+            "selinux": selinux,
+        }))
     },
     Reload: DryRunRequest => {
-        cmd!((payload.dry_run) { &INFO, "reload", user } "exportfs" ["-ra"] json)
+        Ok(run_for(&INFO, "reload", user, "exportfs", ["-ra"], payload.dry_run)?.into_json())
     },
     Enable: DryRunRequest => {
-        cmd!((payload.dry_run) { &INFO, "enable", user } "systemctl" ["enable", "--now", "nfs-server.service"] json)
+        Ok(run_for(
+            &INFO, "enable", user,
+            "systemctl", ["enable", "--now", "nfs-server.service"], payload.dry_run,
+        )?.into_json())
     },
     Disable: DryRunRequest => {
-        crate::cmd!((payload.dry_run) { &INFO, "disable", user } "systemctl" ["disable", "--now", "nfs-server.service"] json)
+        Ok(run_for(
+            &INFO, "disable", user,
+            "systemctl", ["disable", "--now", "nfs-server.service"], payload.dry_run,
+        )?.into_json())
     }
 });
 
@@ -103,10 +108,10 @@ fn parse_exports(contents: &str) -> Vec<Value> {
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let path = fields.next()?;
-            Some(jsonf! {
-                path,
+            Some(json!({
+                "path": path,
                 "clients": fields.collect::<Vec<_>>(),
-            })
+            }))
         })
         .collect()
 }
@@ -115,6 +120,7 @@ fn parse_exports(contents: &str) -> Vec<Value> {
 mod tests {
     use super::*;
     use crate::agent::module_support::SelinuxOptions;
+    use crate::agent::modules::Act;
 
     #[test]
     fn parses_exports_file() {

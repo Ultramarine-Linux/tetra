@@ -1,6 +1,5 @@
 //! Authorization of module actions: admins, default permissions, grants and
 //! the action log.
-#![allow(clippy::tests_outside_test_module)]
 
 mod common;
 
@@ -345,4 +344,358 @@ async fn files_cannot_be_granted_and_config_dir_is_admin_only() {
                 .is_none_or(|error| error.code != ErrorCode::Forbidden)
         );
     }
+}
+
+#[tokio::test]
+async fn dispatch_outside_auth_invalidates_live_and_persisted_sessions() {
+    use std::sync::Arc;
+    use tetra::{
+        agent::{AgentCommand, queue::DispatchQueue},
+        auth::users::UserStore,
+    };
+    for (action, queued) in [
+        ("set_password", false),
+        ("delete", false),
+        ("set_password", true),
+        ("delete", true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path());
+        let token = login(&host.service, "alice").await;
+        // Simulate agent-dispatch: a separate store/cache instance, while the
+        // daemon keeps its live session store. The same dispatcher also serves
+        // remote commands through the queue.
+        let dispatcher = tetra::agent::Dispatcher::new()
+            .with_module(StubUsers)
+            .with_session_revocation(
+                UserStore::new(host.config.auth_dir().join("users")),
+                Arc::clone(&host.accounts) as _,
+            );
+        let command = |dry_run| AgentCommand {
+            id: "external".into(),
+            module: "users".into(),
+            action: action.into(),
+            payload: json!({"name":"alice", "password_hash":"$6$x", "dry_run":dry_run}),
+            signature: None,
+            user: None,
+        };
+        let mut failed = command(false);
+        failed.payload["fail"] = json!(true);
+        assert!(!dispatcher.dispatch(failed).ok);
+        assert!(
+            UserStore::new(host.config.auth_dir().join("users"))
+                .get(1000, "alice")
+                .unwrap()
+                .is_none()
+        );
+        assert!(dispatcher.dispatch(command(true)).ok);
+        ok(
+            &host.service,
+            Dashboard,
+            Some(&token),
+            "session.info",
+            json!({}),
+        )
+        .await;
+        if queued {
+            let queue = DispatchQueue::spawn(dispatcher, 4);
+            assert!(queue.dispatch(command(false)).await.unwrap().ok);
+        } else {
+            assert!(dispatcher.dispatch(command(false)).ok);
+        }
+        fails(
+            &host.service,
+            Dashboard,
+            Some(&token),
+            "session.info",
+            json!({}),
+            ErrorCode::Unauthenticated,
+        )
+        .await;
+        let restarted = host.restart().unwrap();
+        fails(
+            &restarted,
+            Dashboard,
+            Some(&token),
+            "session.info",
+            json!({}),
+            ErrorCode::Unauthenticated,
+        )
+        .await;
+    }
+}
+
+/// A `users` module that succeeds without touching the host.
+struct StubUsers;
+
+impl tetra::agent::modules::Mod for StubUsers {
+    fn info(&self) -> tetra::agent::module_support::ModuleInfo {
+        tetra::agent::module_support::ModuleInfo {
+            name: "users",
+            feature: "users",
+            description: "Stub users module",
+            status: tetra::agent::module_support::ModuleStatus::Available,
+            actions: &["set_password", "delete"],
+            privileged_actions: &[],
+        }
+    }
+
+    fn handle(
+        &self,
+        action: &str,
+        payload: serde_json::Value,
+        _user: Option<&str>,
+    ) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(payload.get("fail") != Some(&json!(true)), "stub failure");
+        Ok(json!({ "action": action }))
+    }
+}
+
+#[tokio::test]
+async fn a_new_password_ends_all_account_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = tetra::auth::testing::TestHost::with_dispatcher(dir.path(), |dispatcher| {
+        dispatcher.with_module(StubUsers)
+    })
+    .unwrap();
+    host.accounts.add("alice", 1000, &[]);
+    host.accounts.add("admin", 1001, &["wheel"]);
+    host.passwords.set("alice", "hunter2");
+    host.passwords.set("admin", "hunter2");
+    let admin = login(&host.service, "admin").await;
+    let other_admin = login(&host.service, "admin").await;
+    let alice = login(&host.service, "alice").await;
+    let set_password = |name: &str, dry_run: bool| {
+        json!({"module": "users", "action": "set_password",
+               "payload": {"name": name, "password_hash": "$6$x", "dry_run": dry_run}})
+    };
+
+    // A dry run changes nothing.
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "module.dispatch",
+        set_password("alice", true),
+    )
+    .await;
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&alice),
+        "session.info",
+        json!({}),
+    )
+    .await;
+
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "module.dispatch",
+        set_password("alice", false),
+    )
+    .await;
+    fails(
+        &host.service,
+        Dashboard,
+        Some(&alice),
+        "session.info",
+        json!({}),
+        ErrorCode::Unauthenticated,
+    )
+    .await;
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&other_admin),
+        "session.info",
+        json!({}),
+    )
+    .await;
+
+    // The dispatcher invalidates all sessions, including the caller's own.
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "module.dispatch",
+        set_password("admin", false),
+    )
+    .await;
+    fails(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "session.info",
+        json!({}),
+        ErrorCode::Unauthenticated,
+    )
+    .await;
+    fails(
+        &host.service,
+        Dashboard,
+        Some(&other_admin),
+        "session.info",
+        json!({}),
+        ErrorCode::Unauthenticated,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn grant_changes_are_in_the_action_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(dir.path());
+    let admin = login(&host.service, "admin").await;
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "admin.grants_set",
+        json!({"uid": 1000, "grants": {"storage": "view"}}),
+    )
+    .await;
+    let actions = ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "admin.actions",
+        json!({}),
+    )
+    .await;
+    let logged = &actions["actions"][0];
+    assert_eq!(logged["module"], "admin");
+    assert_eq!(logged["action"], "grants_set");
+    assert_eq!(logged["username"], "admin");
+    assert_eq!(logged["ok"], true);
+}
+
+/// A `podman` module that reports who it ran as, defaulting to the apps
+/// account like the real one.
+struct StubPodman;
+
+impl tetra::agent::modules::Mod for StubPodman {
+    fn info(&self) -> tetra::agent::module_support::ModuleInfo {
+        tetra::agent::module_support::ModuleInfo {
+            name: "podman",
+            feature: "podman",
+            description: "Stub podman module",
+            status: tetra::agent::module_support::ModuleStatus::Available,
+            actions: &["containers", "inspect"],
+            privileged_actions: &[],
+        }
+    }
+
+    fn default_run_as(&self, _: &str, _: &serde_json::Value) -> tetra::agent::dispatcher::RunAs {
+        tetra::agent::dispatcher::RunAs::Apps
+    }
+
+    fn handle(
+        &self,
+        _action: &str,
+        payload: serde_json::Value,
+        user: Option<&str>,
+    ) -> anyhow::Result<serde_json::Value> {
+        Ok(json!({ "user": user, "payload": payload }))
+    }
+}
+
+#[tokio::test]
+async fn container_views_default_to_the_apps_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = tetra::auth::testing::TestHost::with_dispatcher(dir.path(), |dispatcher| {
+        dispatcher.with_module(StubPodman)
+    })
+    .unwrap();
+    host.accounts.add("alice", 1000, &[]);
+    host.accounts.add("admin", 1001, &["wheel"]);
+    host.passwords.set("alice", "hunter2");
+    host.passwords.set("admin", "hunter2");
+    let admin = login(&host.service, "admin").await;
+    let alice = login(&host.service, "alice").await;
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "admin.grants_set",
+        json!({"uid": 1000, "grants": {"containers": "view"}}),
+    )
+    .await;
+    let containers = |payload: serde_json::Value| json!({"module": "podman", "action": "containers", "payload": payload});
+    let ran_as = |result: serde_json::Value| result["user"].clone();
+
+    let default = ok(
+        &host.service,
+        Dashboard,
+        Some(&alice),
+        "module.dispatch",
+        containers(json!({})),
+    )
+    .await;
+    assert_eq!(ran_as(default), "ultramarine-apps");
+    for (run_as, expected) in [
+        ("apps", json!("ultramarine-apps")),
+        ("user", json!("alice")),
+    ] {
+        let result = ok(
+            &host.service,
+            Dashboard,
+            Some(&alice),
+            "module.dispatch",
+            containers(json!({ "run_as": run_as })),
+        )
+        .await;
+        assert_eq!(ran_as(result), expected, "{run_as}");
+    }
+    for payload in [json!({ "run_as": "root" }), json!({ "run_as": "both" })] {
+        fails(
+            &host.service,
+            Dashboard,
+            Some(&alice),
+            "module.dispatch",
+            containers(payload),
+            ErrorCode::Forbidden,
+        )
+        .await;
+    }
+    // Environments (app secrets) are for administrators.
+    let inspect = |show_env: bool| {
+        json!({"module": "podman", "action": "inspect",
+               "payload": {"name": "db", "show_env": show_env}})
+    };
+    fails(
+        &host.service,
+        Dashboard,
+        Some(&alice),
+        "module.dispatch",
+        inspect(true),
+        ErrorCode::Forbidden,
+    )
+    .await;
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&alice),
+        "module.dispatch",
+        inspect(false),
+    )
+    .await;
+    ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "module.dispatch",
+        inspect(true),
+    )
+    .await;
+    let root = ok(
+        &host.service,
+        Dashboard,
+        Some(&admin),
+        "module.dispatch",
+        containers(json!({ "run_as": "root" })),
+    )
+    .await;
+    assert!(ran_as(root).is_null());
 }

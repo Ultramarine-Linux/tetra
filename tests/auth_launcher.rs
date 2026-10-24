@@ -1,6 +1,5 @@
 //! The launcher: per-entry visibility, administrator-only changes, the access
 //! check for apps and the public page.
-#![allow(clippy::tests_outside_test_module)]
 
 mod common;
 

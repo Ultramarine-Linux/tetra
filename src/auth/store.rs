@@ -20,12 +20,16 @@
 //!
 //! Writes are atomic (temporary file, `fsync`, `rename`), files are created
 //! `0600` and directories `0700`. [`StoreLock`] serializes read-modify-write
-//! cycles between the daemon and the root-only CLI.
+//! cycles between the daemon and the root-only CLI. [`Cached`] keeps what a
+//! file was parsed into until the file changes.
 
 use std::{
+    collections::BTreeMap,
+    ffi::OsStr,
     fs::{File, OpenOptions, Permissions},
     io::{ErrorKind, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use nix::fcntl::{Flock, FlockArg};
@@ -111,14 +115,10 @@ pub trait Record: Serialize + DeserializeOwned {
 /// Fails when the file cannot be read or parsed, or was written by a build
 /// that requires a newer reader.
 pub fn read<T: Record>(path: &Path) -> Result<Option<T>> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read `{}`", path.display()));
-        }
+    let Some(bytes) = read_optional(path)? else {
+        return Ok(None);
     };
-    let record: T = serde_json::from_str(&text)
+    let record: T = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse `{}`", path.display()))?;
     let header = record.header();
     ensure!(
@@ -128,6 +128,18 @@ pub fn read<T: Record>(path: &Path) -> Result<Option<T>> {
         header.compat
     );
     Ok(Some(record))
+}
+
+/// Read `path`, or `None` when it does not exist.
+///
+/// # Errors
+/// Fails when the file exists but cannot be read.
+pub fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read `{}`", path.display())),
+    }
 }
 
 /// Atomically write `record` to `path` with mode `0600`, stamping the header
@@ -217,7 +229,11 @@ pub fn remove(path: &Path) -> Result<()> {
 /// # Errors
 /// Fails when a directory cannot be created or the file cannot be written.
 pub fn replace_if_changed(path: &Path, contents: &[u8], mode: u32) -> Result<bool> {
-    if fs::read(path).is_ok_and(|existing| existing == contents) {
+    // Also rewrite when only the mode drifted (say a secrets file made 0644).
+    let unchanged = fs::metadata(path)
+        .is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == mode)
+        && fs::read(path).is_ok_and(|existing| existing == contents);
+    if unchanged {
         return Ok(false);
     }
     let parent = parent_of(path)?;
@@ -244,7 +260,24 @@ pub fn remove_if_exists(path: &Path) -> Result<bool> {
 /// # Errors
 /// Fails when the directory cannot be created or its mode cannot be set.
 pub fn private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("failed to create `{}`", path.display()))?;
+    // Parents get the default mode; the leaf is `0700` from the start rather
+    // than briefly umask-wide.
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create `{}`", parent.display()))?;
+    }
+    match fs::DirBuilder::new().mode(DIR_MODE).create(path) {
+        Err(error) if error.kind() != ErrorKind::AlreadyExists => {
+            return Err(error).with_context(|| format!("failed to create `{}`", path.display()));
+        }
+        // Not `is_dir()`: a symlink planted at the leaf must not be followed
+        // (and then chmod'ed).
+        _ => ensure!(
+            fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()),
+            "`{}` is not a directory",
+            path.display()
+        ),
+    }
     fs::set_permissions(path, Permissions::from_mode(DIR_MODE))
         .with_context(|| format!("failed to restrict `{}`", path.display()))
 }
@@ -277,10 +310,172 @@ impl StoreLock {
     }
 }
 
+/// `(inode, size, mtime, mtime_nsec)` of a file, `None` while it is missing.
+/// Every write renames a new file into place, so it changes the inode.
+type FileStamp = Option<(u64, u64, i64, i64)>;
+
+fn stamp(path: &Path) -> Result<FileStamp> {
+    match fs::metadata(path) {
+        Ok(meta) => Ok(Some((
+            meta.ino(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+        ))),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read `{}`", path.display())),
+    }
+}
+
+/// What store files were parsed into, one per key `K`, kept until their
+/// file changes.
+///
+/// A change is seen in the file's inode, size and mtime. Writers in this process
+/// also [`invalidate`](Self::invalidate) the key once they wrote, so a read
+/// never returns what a finished write replaced. Clones share the cache.
+/// Read-modify-write cycles read the file itself, under the [`StoreLock`].
+pub struct Cached<T: ?Sized, K = ()> {
+    state: Arc<Mutex<CacheState<T, K>>>,
+}
+
+struct CacheState<T: ?Sized, K> {
+    /// Counts invalidations, so a value read before one is not kept.
+    generation: u64,
+    entries: BTreeMap<K, (FileStamp, Arc<T>)>,
+}
+
+impl<T: ?Sized, K: Ord> Cached<T, K> {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(CacheState {
+                generation: 0,
+                entries: BTreeMap::new(),
+            })),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, CacheState<T, K>> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The value for `key`, whose file is `path`: the cached one while the
+    /// file is unchanged, otherwise `load()`'s.
+    ///
+    /// # Errors
+    /// Fails when `path` cannot be examined or `load` fails; failures are
+    /// not cached.
+    pub fn get<F, V>(&self, key: K, path: &Path, load: F) -> Result<Arc<T>>
+    where
+        F: FnOnce() -> Result<V>,
+        V: Into<Arc<T>>,
+    {
+        let generation = self.lock().generation;
+        let stamp = stamp(path)?;
+        if let Some((cached, value)) = self.lock().entries.get(&key)
+            && *cached == stamp
+        {
+            return Ok(Arc::clone(value));
+        }
+        let value: Arc<T> = load()?.into();
+        let mut state = self.lock();
+        if state.generation == generation {
+            state.entries.insert(key, (stamp, Arc::clone(&value)));
+        }
+        drop(state);
+        Ok(value)
+    }
+
+    /// Forget `key`'s value, after writing its file.
+    pub fn invalidate(&self, key: &K) {
+        let mut state = self.lock();
+        state.generation = state.generation.wrapping_add(1);
+        state.entries.remove(key);
+    }
+}
+
+impl<T: ?Sized, K: Ord> Default for Cached<T, K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: ?Sized, K> Clone for Cached<T, K> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<T: ?Sized, K> std::fmt::Debug for Cached<T, K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cached").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn cached_values_follow_writes_and_invalidation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("value.json");
+        let cache: Cached<Option<Example>> = Cached::new();
+        let loads = std::cell::Cell::new(0);
+        let get = || {
+            cache
+                .get((), &path, || {
+                    loads.set(loads.get() + 1);
+                    read::<Example>(&path)
+                })
+                .unwrap()
+                .as_ref()
+                .as_ref()
+                .map(|example| example.value)
+        };
+        // A missing file is cached as missing until it appears.
+        assert_eq!(get(), None);
+        assert_eq!(get(), None);
+        assert_eq!(loads.get(), 1);
+        write(
+            &path,
+            &mut Example {
+                value: 1,
+                ..Example::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(get(), Some(1));
+        assert_eq!(get(), Some(1));
+        assert_eq!(loads.get(), 2);
+        // Another writer's file has a new inode.
+        write(
+            &path,
+            &mut Example {
+                value: 2,
+                ..Example::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(get(), Some(2));
+        assert_eq!(loads.get(), 3);
+        cache.invalidate(&());
+        assert_eq!(get(), Some(2));
+        assert_eq!(loads.get(), 4);
+        // A read that started before an invalidation is not kept.
+        cache.invalidate(&());
+        cache
+            .get((), &path, || {
+                cache.invalidate(&());
+                read::<Example>(&path)
+            })
+            .unwrap();
+        assert_eq!(get(), Some(2));
+        assert_eq!(loads.get(), 5);
+    }
 
     #[derive(Debug, Default, Serialize, Deserialize)]
     struct Example {

@@ -4,6 +4,11 @@
 //! timer rather than run directly, so the response reaches the caller (the
 //! OOBE shows a "rebooting" screen) before the shutdown begins.
 
+use serde_json::json;
+
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, run_dry};
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 /// Marker type for the power module.
@@ -28,9 +33,6 @@ impl Mod for PowerModule {
     }
 
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
-        if let Some(response) = INFO.metadata_response(action, &payload) {
-            return Ok(response);
-        }
         Action::from_payload(action, payload)?.handle(user)
     }
 }
@@ -52,15 +54,25 @@ fn schedule(verb: &str, dry_run: bool) -> Result<Value> {
     let on_active = format!("--on-active={DELAY_SECONDS}");
     let unit = format!("--unit=tetra-power-{verb}");
     let description = format!("--description=Tetra {verb} requested through power.{verb}");
-    let result = crate::cmd!((dry_run) "systemd-run" [
-        on_active.as_str(),
-        unit.as_str(),
-        description.as_str(),
-        "--collect",
-        "systemctl",
-        verb,
-    ] json)?;
-    Ok(jsonf! { "action": verb, "in_seconds": DELAY_SECONDS, dry_run, "command": result })
+    let result = run_dry(
+        "systemd-run",
+        [
+            on_active.as_str(),
+            unit.as_str(),
+            description.as_str(),
+            "--collect",
+            "systemctl",
+            verb,
+        ],
+        dry_run,
+    )?
+    .into_json();
+    Ok(json!({
+        "action": verb,
+        "in_seconds": DELAY_SECONDS,
+        "dry_run": dry_run,
+        "command": result,
+    }))
 }
 
 #[cfg(test)]

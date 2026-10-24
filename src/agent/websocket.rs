@@ -1,15 +1,14 @@
 use std::{
     env,
-    fs::File,
-    io::BufReader,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use futures_util::{SinkExt, StreamExt};
 
 use rand::RngExt;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpStream, time::sleep};
 use tokio_tungstenite::{
@@ -17,15 +16,15 @@ use tokio_tungstenite::{
 };
 
 use super::{
-    AgentBackend, AgentCommand, AgentResponse,
-    protocol::unix_timestamp,
-    queue::{DEFAULT_QUEUE_CAPACITY, DispatchQueue, QueueError},
-    transport::{TransportConfig, TransportEndpoint},
+    AgentCommand, AgentResponse,
+    queue::{DispatchQueue, QueueError},
+    transport::TransportConfig,
 };
 use crate::{
     auth::{
         audit::{self, AuditLog, Origin},
         authz::Principal,
+        clock::unix_timestamp,
     },
     enrollment::renewal::{self, ClientFiles, Lifetime},
 };
@@ -43,6 +42,17 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// push the delay into hours; capping at 60s keeps the agent responsive to a
 /// control-plane restart.
 const MAX_RECONNECT_DELAY: Duration = Duration::from_mins(1);
+/// How often to ping the control plane, and how long it may stay silent
+/// before the session is dropped and redialed.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Upper bound for the TCP, TLS and WebSocket handshakes.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Signalled when a network change needs confirmation. `notify_one` keeps a
+/// permit, so a change made by a command this session is still dispatching
+/// is not missed.
+pub static NETWORK_CHANGED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// Configuration for the outbound WSS control-plane connection (`agent-connect`).
 ///
@@ -144,27 +154,37 @@ impl TransportFrame {
                 .send(socket)
                 .await?;
             }
-            Self::Command { command } => match queue.dispatch(command.clone()).await {
-                Ok(response) => {
-                    remote.record(&command, &response);
-                    Self::Response { response }.send(socket).await?;
-                }
-                Err(QueueError::Full) => {
-                    Self::Error {
-                        error: "Tetra command queue is full; retry after backoff".into(),
+            Self::Command { mut command } => {
+                // `user` is for transports that authenticated a host user;
+                // the controller cannot pick one (or put it in the log).
+                command.user = None;
+                // The action log only needs the envelope; don't deep-copy a
+                // (possibly multi-megabyte) payload for it.
+                let payload = std::mem::take(&mut command.payload);
+                let logged = command.clone();
+                command.payload = payload;
+                match dispatch_with_keepalive(socket, queue, command).await? {
+                    Ok(response) => {
+                        remote.record(&logged, &response);
+                        Self::Response { response }.send(socket).await?;
                     }
-                    .send(socket)
-                    .await?;
-                }
-                Err(QueueError::Closed) => {
-                    Self::Error {
-                        error: "Tetra command queue is unavailable".into(),
+                    Err(QueueError::Full) => {
+                        Self::Error {
+                            error: "Tetra command queue is full; retry after backoff".into(),
+                        }
+                        .send(socket)
+                        .await?;
                     }
-                    .send(socket)
-                    .await?;
-                    bail!("dispatch queue closed")
+                    Err(QueueError::Closed) => {
+                        Self::Error {
+                            error: "Tetra command queue is unavailable".into(),
+                        }
+                        .send(socket)
+                        .await?;
+                        bail!("dispatch queue closed")
+                    }
                 }
-            },
+            }
             Self::Ping { id, sent_at } => {
                 Self::Pong { id, sent_at }.send(socket).await?;
             }
@@ -208,36 +228,25 @@ impl Remote {
             action: command.action.clone(),
             ok: response.ok,
             error: response.error.clone(),
+            detail: None,
         });
     }
 }
 
-/// Connect to the control plane, exchange frames until the session closes, and
-/// (if `reconnect`) reconnect with backoff.
+/// Connect to the control plane and run sessions until one closes for good.
+///
+/// Reconnects with backoff when `reconnect` is set. Uses an existing dispatch queue,
+/// so the outbound session shares one dispatcher with the local transports,
+/// and records remote actions in `audit`.
 ///
 /// The outer loop is the reconnect loop; the inner [`connect_once`] is a single
 /// session.
-pub async fn run(config: WebSocketAgentConfig) -> Result<()> {
-    let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), DEFAULT_QUEUE_CAPACITY);
-    run_with_queue(config, queue, AuditLog::new(audit::DEFAULT_DIR.into())).await
-}
-
-/// [`run`] against an existing dispatch queue, so the outbound session shares
-/// one dispatcher with the local transports, recording remote actions in
-/// `audit`.
 pub async fn run_with_queue(
     config: WebSocketAgentConfig,
     queue: DispatchQueue,
     audit: AuditLog,
 ) -> Result<()> {
-    let url = match config.transport.endpoint()? {
-        TransportEndpoint::WebSocket { url } => url,
-        TransportEndpoint::Vsock(_) => {
-            bail!("agent-connect only supports ws:// and wss:// endpoints")
-        }
-    };
-
-    config.transport.validate(&url)?;
+    let url = config.transport.wss_url()?.to_owned();
 
     let mut attempt = 0_u32;
     let mut renewal = RenewalState::default();
@@ -249,6 +258,11 @@ pub async fn run_with_queue(
             Ok(SessionEnd::Renewed) => {
                 attempt = 0;
                 eprintln!("reconnecting with the renewed client certificate");
+                continue;
+            }
+            Ok(SessionEnd::NetworkChanged) => {
+                attempt = 0;
+                eprintln!("network change awaits confirmation; reconnecting");
                 continue;
             }
             Ok(SessionEnd::Closed) => {
@@ -278,6 +292,11 @@ pub async fn run_with_queue(
 enum SessionEnd {
     /// The control plane closed the connection.
     Closed,
+    /// A network change awaits confirmation and has likely cut this
+    /// connection; redial now rather than after the idle timeout, so the
+    /// controller can confirm (`network.pending`, `network.confirm`) before
+    /// the change rolls back.
+    NetworkChanged,
     /// A renewed certificate was staged; reconnect with it.
     Renewed,
 }
@@ -324,6 +343,11 @@ async fn connect_once(
             audit: audit.clone(),
         },
     };
+    // Without traffic a NAT drop or a silently dead controller would leave
+    // `socket.next()` waiting forever; ping, and reconnect after silence.
+    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_seen = tokio::time::Instant::now();
     loop {
         let wake = session
             .renewer
@@ -337,11 +361,23 @@ async fn connect_once(
                 }
                 continue;
             }
+            () = NETWORK_CHANGED.notified() => return Ok(SessionEnd::NetworkChanged),
+            _ = keepalive.tick() => {
+                ensure!(
+                    last_seen.elapsed() < IDLE_TIMEOUT,
+                    "control plane silent for {IDLE_TIMEOUT:?}"
+                );
+                socket.send(Message::Ping(Vec::new().into())).await?;
+                continue;
+            }
         };
         let Some(message) = event else {
             return Ok(SessionEnd::Closed);
         };
-        if let Some(end) = session.on_message(&mut socket, message).await? {
+        let end = session.on_message(&mut socket, message).await?;
+        // After handling too: commands are dispatched inline.
+        last_seen = tokio::time::Instant::now();
+        if let Some(end) = end {
             return Ok(end);
         }
     }
@@ -387,14 +423,42 @@ async fn open(
 
 async fn dial(url: &str, transport: &TransportConfig) -> Result<Socket> {
     let connector = tls_connector(transport)?;
-    let (socket, response) = connect_async_tls_with_config(url, None, false, Some(connector))
-        .await
-        .with_context(|| format!("failed to connect to control plane {url}"))?;
+    let (socket, response) = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connect_async_tls_with_config(url, None, false, Some(connector)),
+    )
+    .await
+    .with_context(|| format!("timed out connecting to control plane {url}"))?
+    .with_context(|| format!("failed to connect to control plane {url}"))?;
     eprintln!(
         "connected to control plane `{url}` with HTTP {}",
         response.status()
     );
     Ok(socket)
+}
+
+/// Dispatch `command`, pinging the controller while it runs: a command can
+/// take minutes (an image pull on start), and idle timeouts on the controller
+/// or a proxy must not drop the session before the response.
+async fn dispatch_with_keepalive<S>(
+    socket: &mut S,
+    queue: &DispatchQueue,
+    command: AgentCommand,
+) -> Result<Result<AgentResponse, QueueError>>
+where
+    S: SinkExt<Message> + Unpin,
+    <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
+{
+    let mut dispatch = std::pin::pin!(queue.dispatch(command));
+    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    // The first tick would fire at once.
+    keepalive.reset();
+    loop {
+        tokio::select! {
+            result = &mut dispatch => return Ok(result),
+            _ = keepalive.tick() => socket.send(Message::Ping(Vec::new().into())).await?,
+        }
+    }
 }
 
 /// Sleep until `wake`, or forever when it is `None`.
@@ -427,12 +491,8 @@ impl Session {
             Message::Binary(bytes) => {
                 serde_json::from_slice(&bytes).context("invalid websocket frame JSON")?
             }
-            // tungstenite handles Ping/Pong at the protocol layer; we just echo.
-            Message::Ping(bytes) => {
-                socket.send(Message::Pong(bytes)).await?;
-                return Ok(None);
-            }
-            Message::Pong(_) | Message::Frame(_) => return Ok(None),
+            // tungstenite answers pings itself.
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => return Ok(None),
             Message::Close(frame) => {
                 eprintln!("control plane closed websocket: {frame:?}");
                 return Ok(Some(SessionEnd::Closed));
@@ -564,29 +624,25 @@ fn tls_connector(config: &TransportConfig) -> Result<Connector> {
         .as_deref()
         .context("missing client key path for outbound WSS")?;
 
-    let mut ca_reader = BufReader::new(
-        File::open(ca_path).with_context(|| format!("failed to open server CA `{ca_path}`"))?,
-    );
     let mut roots = rustls::RootCertStore::empty();
-    for certificate in rustls_pemfile::certs(&mut ca_reader) {
+    for certificate in CertificateDer::pem_file_iter(ca_path)
+        .with_context(|| format!("failed to open server CA `{ca_path}`"))?
+    {
         roots
             .add(certificate.context("failed to parse server CA certificate")?)
             .context("failed to add server CA certificate")?;
     }
-
-    let mut cert_reader = BufReader::new(
-        File::open(cert_path)
-            .with_context(|| format!("failed to open client certificate `{cert_path}`"))?,
+    ensure!(
+        !roots.is_empty(),
+        "server CA `{ca_path}` contains no certificates"
     );
-    let certificates = rustls_pemfile::certs(&mut cert_reader)
+
+    let certificates = CertificateDer::pem_file_iter(cert_path)
+        .with_context(|| format!("failed to open client certificate `{cert_path}`"))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to parse client certificate")?;
-    let mut key_reader = BufReader::new(
-        File::open(key_path).with_context(|| format!("failed to open client key `{key_path}`"))?,
-    );
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .context("failed to parse client key")?
-        .context("client key PEM contains no private key")?;
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .with_context(|| format!("failed to read client key `{key_path}`"))?;
     let client = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_client_auth_cert(certificates, key)
@@ -605,15 +661,14 @@ fn reconnect_delay(attempt: u32) -> Duration {
     capped.saturating_add(Duration::from_millis(jitter_ms))
 }
 
-/// Best-effort hostname for the `Hello` frame. `HOSTNAME` is what systemd
-/// sets on Linux; `COMPUTERNAME` is the Windows equivalent. We don't fall
-/// back to `gethostname()` because the env vars are good enough for a
-/// display name and avoid a syscall.
-fn hostname() -> Option<String> {
-    env::var("HOSTNAME")
+/// Best-effort kernel hostname. systemd does not set `HOSTNAME` for
+/// services (it is a shell variable), so read it from procfs first.
+pub(crate) fn hostname() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
-        .or_else(|| env::var("COMPUTERNAME").ok())
-        .filter(|value| !value.trim().is_empty())
+        .or_else(|| env::var("HOSTNAME").ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -626,23 +681,6 @@ mod tests {
         assert!(reconnect_delay(10) <= MAX_RECONNECT_DELAY + Duration::from_secs(1));
     }
 
-    #[test]
-    fn rejects_incomplete_or_plaintext_outbound_tls_configuration() {
-        let incomplete = TransportConfig {
-            control_plane_url: "wss://dashboard.example.test/tetra".into(),
-            ..Default::default()
-        };
-        (incomplete.validate(&incomplete.control_plane_url)).unwrap_err();
-
-        let plaintext = TransportConfig {
-            control_plane_url: "ws://127.0.0.1:7780".into(),
-            client_cert_path: Some("client.crt".into()),
-            client_key_path: Some("client.key".into()),
-            server_ca_path: Some("ca.crt".into()),
-        };
-        (plaintext.validate(&plaintext.control_plane_url)).unwrap_err();
-    }
-
     #[tokio::test]
     async fn remote_commands_are_recorded_as_remote_actions() {
         let dir = tempfile::tempdir().unwrap();
@@ -650,7 +688,10 @@ mod tests {
             host_id: "host-01".into(),
             audit: AuditLog::new(dir.path().to_path_buf()),
         };
-        let queue = DispatchQueue::spawn(AgentBackend::spawn_default(), DEFAULT_QUEUE_CAPACITY);
+        let queue = DispatchQueue::spawn(
+            crate::agent::Dispatcher::full(),
+            crate::agent::queue::DEFAULT_QUEUE_CAPACITY,
+        );
         let frame = TransportFrame::Command {
             command: AgentCommand {
                 id: "cmd-remote".into(),

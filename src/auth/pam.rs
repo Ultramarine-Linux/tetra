@@ -75,16 +75,28 @@ fn outcome(result: Result<(), pam_client::Error>) -> PamOutcome {
     }
 }
 
+impl LibPam {
+    fn context<C: pam_client::ConversationHandler>(
+        &self,
+        username: &str,
+        rhost: Option<&str>,
+        conversation: C,
+    ) -> Result<Context<C>, PamOutcome> {
+        let error = |error: pam_client::Error| PamOutcome::Error(error.to_string());
+        let mut context =
+            Context::new(&self.service, Some(username), conversation).map_err(error)?;
+        context.set_rhost(rhost).map_err(error)?;
+        Ok(context)
+    }
+}
+
 impl PasswordBackend for LibPam {
     fn authenticate(&self, username: &str, password: &str, rhost: Option<&str>) -> PamOutcome {
         let conversation = conv_mock::Conversation::with_credentials(username, password);
-        let mut context = match Context::new(&self.service, Some(username), conversation) {
+        let mut context = match self.context(username, rhost, conversation) {
             Ok(context) => context,
-            Err(error) => return PamOutcome::Error(error.to_string()),
+            Err(outcome) => return outcome,
         };
-        if let Err(error) = context.set_rhost(rhost) {
-            return PamOutcome::Error(error.to_string());
-        }
         match outcome(context.authenticate(Flag::DISALLOW_NULL_AUTHTOK)) {
             PamOutcome::Success => outcome(context.acct_mgmt(Flag::DISALLOW_NULL_AUTHTOK)),
             other => other,
@@ -92,14 +104,10 @@ impl PasswordBackend for LibPam {
     }
 
     fn check_account(&self, username: &str, rhost: Option<&str>) -> PamOutcome {
-        let conversation = conv_null::Conversation::new();
-        let mut context = match Context::new(&self.service, Some(username), conversation) {
+        let mut context = match self.context(username, rhost, conv_null::Conversation::new()) {
             Ok(context) => context,
-            Err(error) => return PamOutcome::Error(error.to_string()),
+            Err(outcome) => return outcome,
         };
-        if let Err(error) = context.set_rhost(rhost) {
-            return PamOutcome::Error(error.to_string());
-        }
         outcome(context.acct_mgmt(Flag::NONE))
     }
 }

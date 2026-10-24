@@ -238,7 +238,7 @@ fn uid_min(login_defs: &str) -> u32 {
 
 /// Days since the epoch, the unit `/etc/shadow` uses.
 fn today() -> i64 {
-    crate::agent::protocol::unix_timestamp() / SECONDS_PER_DAY
+    crate::auth::clock::unix_timestamp() / SECONDS_PER_DAY
 }
 
 /// Interpret `name`'s line in shadow(5) text.

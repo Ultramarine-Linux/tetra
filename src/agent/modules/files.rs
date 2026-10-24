@@ -7,7 +7,11 @@
 //! pattern but scope writes to their own managed paths; this module is the
 //! general-purpose escape hatch.
 
-use crate::agent::module_support::apply_selinux;
+use serde_json::json;
+
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, apply_selinux};
+use crate::agent::modules::Mod;
 use crate::prelude::*;
 
 use crate::types::{FileReadRequest, FileWriteRequest};
@@ -32,17 +36,13 @@ impl Mod for FilesModule {
     }
 
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value> {
-        // Delegate `capabilities`/`plan` to the module descriptor first.
-        if let Some(response) = INFO.metadata_response(action, &payload) {
-            return Ok(response);
-        }
         Action::from_payload(action, payload)?.handle(user)
     }
 }
 
 actions!(Action [payload user] => {
     Read: FileReadRequest => {
-        Ok(jsonf! { payload.path, "contents": payload.read()? })
+        Ok(json!({ "path": payload.path, "contents": payload.read()? }))
     },
     Write: FileWriteRequest => {
         // Skip the actual write in dry-run; the SELinux plan below is
@@ -56,7 +56,7 @@ actions!(Action [payload user] => {
             Some(&payload.path),
             payload.dry_run,
         )?;
-        Ok(jsonf! { payload.path, "written": !payload.dry_run, payload.dry_run, selinux })
+        Ok(json!({ "path": payload.path, "written": !payload.dry_run, "dry_run": payload.dry_run, "selinux": selinux }))
     }
 });
 
@@ -64,6 +64,7 @@ actions!(Action [payload user] => {
 mod tests {
     use super::*;
     use crate::agent::module_support::SelinuxOptions;
+    use crate::agent::modules::Act;
 
     #[test]
     fn dry_run_write_does_not_create_file() {
@@ -81,6 +82,48 @@ mod tests {
         assert_eq!(response["written"], false);
         assert_eq!(response["dry_run"], true);
         assert!(!dir.path().join("managed.conf").exists());
+    }
+
+    #[test]
+    fn only_regular_files_are_read_or_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        // Neither blocks on the FIFO.
+        Read(FileReadRequest { path: fifo.clone() })
+            .handle(None)
+            .unwrap_err();
+        Write(FileWriteRequest {
+            path: fifo,
+            contents: "x".into(),
+            dry_run: false,
+            selinux: None,
+        })
+        .handle(None)
+        .unwrap_err();
+        Read(FileReadRequest {
+            path: "/dev/zero".into(),
+        })
+        .handle(None)
+        .unwrap_err();
+        Read(FileReadRequest {
+            path: dir.path().into(),
+        })
+        .handle(None)
+        .unwrap_err();
+
+        let path = dir.path().join("managed.conf");
+        fs::write(&path, "a much longer old value\n").unwrap();
+        Write(FileWriteRequest {
+            path: path.clone(),
+            contents: "new\n".into(),
+            dry_run: false,
+            selinux: None,
+        })
+        .handle(None)
+        .unwrap();
+        let response = Read(FileReadRequest { path }).handle(None).unwrap();
+        assert_eq!(response["contents"], "new\n");
     }
 
     #[test]

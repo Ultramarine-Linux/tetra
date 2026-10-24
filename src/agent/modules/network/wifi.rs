@@ -10,11 +10,14 @@
 
 use std::{collections::BTreeMap, fmt::Write as _};
 
+use itertools::Itertools;
 use serde::Serialize;
 
-use super::keyfile::{CertRoots, REDACTED, keyfile_value, render_8021x, validate_8021x};
+use super::keyfile::{
+    CertRoots, REDACTED, keyfile_value, render_8021x, render_connection, render_ip, validate_8021x,
+};
 use crate::prelude::*;
-use crate::types::{EapMethod, NetworkConnectWifiRequest, WifiSecurity};
+use crate::types::{EapMethod, Ipv4Config, Ipv6Config, NetworkConnectWifiRequest, WifiSecurity};
 
 /// The longest SSID 802.11 allows, in bytes.
 const MAX_SSID_BYTES: usize = 32;
@@ -71,8 +74,15 @@ pub fn parse_scan(output: &str) -> Vec<Network> {
     let mut networks: BTreeMap<String, Network> = BTreeMap::new();
     for line in output.lines() {
         let fields = split_terse(line);
-        let [in_use, ssid_hex, signal, frequency, security, wpa_flags, rsn_flags] =
-            fields.as_slice()
+        let [
+            in_use,
+            ssid_hex,
+            signal,
+            frequency,
+            security,
+            wpa_flags,
+            rsn_flags,
+        ] = fields.as_slice()
         else {
             continue;
         };
@@ -85,7 +95,10 @@ pub fn parse_scan(output: &str) -> Vec<Network> {
             ssid: ssid.clone(),
             security: classify(security, &flags),
             signal: signal.trim().parse().unwrap_or(0),
-            frequency: frequency.split_whitespace().next().and_then(|mhz| mhz.parse().ok()),
+            frequency: frequency
+                .split_whitespace()
+                .next()
+                .and_then(|mhz| mhz.parse().ok()),
             in_use: in_use.trim() == "*",
             sae_only: flags.contains(&"sae") && !flags.contains(&"psk"),
         };
@@ -105,7 +118,12 @@ pub fn parse_scan(output: &str) -> Vec<Network> {
             .or_insert(network);
     }
     let mut networks: Vec<Network> = networks.into_values().collect();
-    networks.sort_by(|left, right| right.signal.cmp(&left.signal).then(left.ssid.cmp(&right.ssid)));
+    networks.sort_by(|left, right| {
+        right
+            .signal
+            .cmp(&left.signal)
+            .then(left.ssid.cmp(&right.ssid))
+    });
     networks
 }
 
@@ -161,7 +179,9 @@ fn decode_ssid(hex: &str) -> Option<String> {
         .chunks(2)
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
         .collect::<Option<Vec<u8>>>()?;
-    String::from_utf8(bytes).ok().filter(|ssid| !ssid.is_empty())
+    String::from_utf8(bytes)
+        .ok()
+        .filter(|ssid| !ssid.is_empty())
 }
 
 /// The profile name and keyfile stem for an interface's Wi-Fi profile. Each
@@ -195,7 +215,10 @@ pub fn validate(
         WifiSecurity::WpaPersonal { password } => validate_password(password, key_management)?,
         WifiSecurity::WpaEnterprise(settings) => {
             // EAP-MD5 derives no keys to encrypt the link with.
-            ensure!(settings.eap != EapMethod::Md5, "security.eap md5 cannot be used with Wi-Fi");
+            ensure!(
+                settings.eap != EapMethod::Md5,
+                "security.eap md5 cannot be used with Wi-Fi"
+            );
             validate_8021x("security", settings, cert_roots)?;
         }
     }
@@ -207,7 +230,9 @@ fn validate_password(password: &str, key_management: KeyManagement) -> Result<()
         KeyManagement::WpaPsk => ensure!(
             (password.len() == 64 && password.chars().all(|c| c.is_ascii_hexdigit()))
                 || ((8..=63).contains(&password.len())
-                    && password.chars().all(|c| c.is_ascii() && !c.is_ascii_control())),
+                    && password
+                        .chars()
+                        .all(|c| c.is_ascii() && !c.is_ascii_control())),
             "security.password must be 8 to 63 printable ASCII characters, or 64 hex digits"
         ),
         KeyManagement::Sae => ensure!(
@@ -251,14 +276,15 @@ fn render_keyfile(
     let mut out = String::new();
     // Writing to a `String` cannot fail.
     let _ok: std::fmt::Result = (|| {
-        writeln!(out, "# Managed by Tetra (network.connect_wifi).")?;
-        writeln!(out, "[connection]")?;
-        writeln!(out, "id={}", connection_name(&request.interface))?;
-        writeln!(out, "uuid={uuid}")?;
-        writeln!(out, "type=wifi")?;
-        writeln!(out, "interface-name={}", request.interface)?;
-        writeln!(out, "autoconnect=true")?;
-        writeln!(out)?;
+        let id = connection_name(&request.interface);
+        render_connection(
+            &mut out,
+            "connect_wifi",
+            &id,
+            uuid,
+            "wifi",
+            &request.interface,
+        )?;
         writeln!(out, "[wifi]")?;
         writeln!(out, "mode=infrastructure")?;
         // As a list of bytes, so no SSID needs escaping or is read back as
@@ -277,7 +303,11 @@ fn render_keyfile(
                     KeyManagement::Sae => "sae",
                 };
                 writeln!(out, "key-mgmt={keyword}")?;
-                let shown = if redact { REDACTED.to_owned() } else { keyfile_value(password) };
+                let shown = if redact {
+                    REDACTED.to_owned()
+                } else {
+                    keyfile_value(password)
+                };
                 writeln!(out, "psk={shown}")?;
                 writeln!(out)?;
             }
@@ -289,11 +319,7 @@ fn render_keyfile(
                 writeln!(out)?;
             }
         }
-        writeln!(out, "[ipv4]")?;
-        writeln!(out, "method=auto")?;
-        writeln!(out)?;
-        writeln!(out, "[ipv6]")?;
-        writeln!(out, "method=auto")
+        render_ip(&mut out, &Ipv4Config::default(), &Ipv6Config::default())
     })();
     out
 }
@@ -318,7 +344,11 @@ mod tests {
 
     /// Roots no path is under.
     fn no_roots() -> CertRoots<'static> {
-        CertRoots { pki: Path::new("/nonexistent"), tetra: Path::new("/nonexistent"), profile: "wifi-wlan0" }
+        CertRoots {
+            pki: Path::new("/nonexistent"),
+            tetra: Path::new("/nonexistent"),
+            profile: "wifi-wlan0",
+        }
     }
 
     fn request(security: &Value) -> NetworkConnectWifiRequest {
@@ -335,7 +365,14 @@ mod tests {
         let networks = parse_scan(SCAN);
         let summary: Vec<_> = networks
             .iter()
-            .map(|network| (network.ssid.as_str(), network.security, network.signal, network.in_use))
+            .map(|network| {
+                (
+                    network.ssid.as_str(),
+                    network.security,
+                    network.signal,
+                    network.in_use,
+                )
+            })
             .collect();
         assert_eq!(
             summary,
@@ -392,7 +429,12 @@ mod tests {
 
     #[test]
     fn open_networks_have_no_security_section() {
-        let keyfile = render(&request(&json!({"type": "open"})), KeyManagement::WpaPsk, false, "u");
+        let keyfile = render(
+            &request(&json!({"type": "open"})),
+            KeyManagement::WpaPsk,
+            false,
+            "u",
+        );
         assert!(!keyfile.contains("[wifi-security]"));
     }
 
@@ -408,7 +450,15 @@ mod tests {
             "password": "hunter22",
             "ca_cert": ca,
         }));
-        validate(&mut request, KeyManagement::WpaPsk, &CertRoots { pki: store.path(), ..no_roots() }).unwrap();
+        validate(
+            &mut request,
+            KeyManagement::WpaPsk,
+            &CertRoots {
+                pki: store.path(),
+                ..no_roots()
+            },
+        )
+        .unwrap();
         let keyfile = render(&request, KeyManagement::WpaPsk, false, "u");
         assert!(keyfile.contains(&format!(
             "[wifi-security]\nkey-mgmt=wpa-eap\n\n[802-1x]\neap=peap;\nidentity=alice\n\
@@ -421,7 +471,9 @@ mod tests {
         let mut md5 = self::request(&json!({
             "type": "wpa-enterprise", "eap": "md5", "identity": "alice", "password": "hunter22",
         }));
-        let error = validate(&mut md5, KeyManagement::WpaPsk, &no_roots()).unwrap_err().to_string();
+        let error = validate(&mut md5, KeyManagement::WpaPsk, &no_roots())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("md5"), "{error}");
     }
 
@@ -431,23 +483,46 @@ mod tests {
             " :436F7270:70:5500 MHz:WPA3 802.1X:(none):pair_gcmp256 group_gcmp256 eap_suite_b_192\n\
              \x20:4D6978:60:5500 MHz:WPA2 WPA3 802.1X:(none):pair_ccmp group_ccmp 802.1X eap_suite_b_192\n",
         );
-        let security: Vec<_> = networks.iter().map(|network| (network.ssid.as_str(), network.security)).collect();
-        assert_eq!(security, [("Corp", Security::Unknown), ("Mix", Security::WpaEnterprise)]);
+        let security: Vec<_> = networks
+            .iter()
+            .map(|network| (network.ssid.as_str(), network.security))
+            .collect();
+        assert_eq!(
+            security,
+            [
+                ("Corp", Security::Unknown),
+                ("Mix", Security::WpaEnterprise)
+            ]
+        );
     }
 
     #[test]
     fn invalid_requests_are_rejected_without_echoing_passwords() {
         for (security, ssid) in [
             (json!({"type": "wpa-personal", "password": "short"}), "Home"),
-            (json!({"type": "wpa-personal", "password": "bad\npassword"}), "Home"),
+            (
+                json!({"type": "wpa-personal", "password": "bad\npassword"}),
+                "Home",
+            ),
             (json!({"type": "open"}), ""),
-            (json!({"type": "open"}), "an SSID longer than thirty-two bytes"),
-            (json!({"type": "wpa-enterprise", "eap": "tls", "identity": "a"}), "Home"),
+            (
+                json!({"type": "open"}),
+                "an SSID longer than thirty-two bytes",
+            ),
+            (
+                json!({"type": "wpa-enterprise", "eap": "tls", "identity": "a"}),
+                "Home",
+            ),
         ] {
             let mut request = request(&security);
             request.ssid = ssid.to_owned();
-            let error = validate(&mut request, KeyManagement::WpaPsk, &no_roots()).unwrap_err().to_string();
-            assert!(!error.contains("short") && !error.contains("bad"), "{error}");
+            let error = validate(&mut request, KeyManagement::WpaPsk, &no_roots())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !error.contains("short") && !error.contains("bad"),
+                "{error}"
+            );
         }
         // SAE passwords are not limited to WPA-PSK's 8-63 characters.
         let mut request = request(&json!({"type": "wpa-personal", "password": "short"}));

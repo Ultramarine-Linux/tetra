@@ -1,67 +1,96 @@
 // `settings` is always compiled — it provides the always-available `get_system`
 // action that other modules and the dashboard rely on for host identification.
 pub mod settings;
-pub use crate::prelude::*;
+use crate::agent::dispatcher::RunAs;
+use crate::agent::module_support::ModuleInfo;
+use crate::prelude::*;
 pub use settings::SettingsModule;
 
+// Declared here rather than inside `modules!` so rustfmt (and `cargo fmt
+// --check` in CI) sees these files.
+#[cfg(feature = "apps")]
+pub mod apps;
+#[cfg(feature = "files")]
+pub mod files;
+#[cfg(feature = "network")]
+pub mod network;
+#[cfg(feature = "nfs")]
+pub mod nfs;
+#[cfg(feature = "podman")]
+pub mod podman;
+#[cfg(feature = "power")]
+pub mod power;
+#[cfg(feature = "quadlets")]
+pub mod quadlets;
+#[cfg(feature = "recipes")]
+pub mod recipes;
+#[cfg(feature = "remote-access")]
+pub mod remote_access;
+#[cfg(feature = "reverse-proxy")]
+pub mod reverse_proxy;
+#[cfg(feature = "samba")]
+pub mod samba;
+#[cfg(feature = "selinux")]
+pub mod selinux;
+#[cfg(feature = "services")]
+pub mod services;
+#[cfg(feature = "storage")]
+pub mod storage;
+#[cfg(feature = "updates")]
+pub mod updates;
+#[cfg(feature = "users")]
+pub mod users;
+#[cfg(feature = "virtual-machines")]
+pub mod virtual_machines;
+
+/// Re-export each module type and register them all: `file: "feature" =>
+/// Type`, one per `pub mod` above.
 macro_rules! modules {
-    ($($m:ident),+$(,)?) => { ::preinterpret::preinterpret! {
+    ($($m:ident: $feature:literal => $Module:ident),+ $(,)?) => {
         $(
-            #[cfg(feature = [!kebab! $m])]
-            pub mod $m;
-            #[cfg(feature = [!kebab! $m])]
-            pub use $m::[!ident_camel! $m Module];
+            #[cfg(feature = $feature)]
+            pub use $m::$Module;
         )+
-        pub const MODULES: phf::Map<&'static str, Module> = ::phf::phf_map! {
-            "settings" => Module::SettingsModule(SettingsModule),
+        /// Register every module compiled into this build.
+        pub fn register_all(dispatcher: &mut super::Dispatcher) {
+            dispatcher.register(SettingsModule);
             $(
-                #[cfg(feature = [!kebab! $m])]
-                [!string! $m] => Module::[!ident_camel! $m Module]([!ident_camel! $m Module]),
-            )+
-        };
-        #[enum_dispatch::enum_dispatch]
-        #[derive(Clone, Debug)]
-        pub enum Module {
-            SettingsModule,
-            $(
-                #[cfg(feature = [!kebab! $m])]
-                [!ident_camel! $m Module],
+                #[cfg(feature = $feature)]
+                dispatcher.register($Module);
             )+
         }
-    } }
+    };
 }
 
 modules![
-    apps,
-    files,
-    network,
-    nfs,
-    podman,
-    power,
-    quadlets,
-    recipes,
-    remote_access,
-    reverse_proxy,
-    samba,
-    selinux,
-    services,
-    storage,
-    updates,
-    users,
-    virtual_machines,
+    apps: "apps" => AppsModule,
+    files: "files" => FilesModule,
+    network: "network" => NetworkModule,
+    nfs: "nfs" => NfsModule,
+    podman: "podman" => PodmanModule,
+    power: "power" => PowerModule,
+    quadlets: "quadlets" => QuadletsModule,
+    recipes: "recipes" => RecipesModule,
+    remote_access: "remote-access" => RemoteAccessModule,
+    reverse_proxy: "reverse-proxy" => ReverseProxyModule,
+    samba: "samba" => SambaModule,
+    selinux: "selinux" => SelinuxModule,
+    services: "services" => ServicesModule,
+    storage: "storage" => StorageModule,
+    updates: "updates" => UpdatesModule,
+    users: "users" => UsersModule,
+    virtual_machines: "virtual-machines" => VirtualMachinesModule,
 ];
 
 /// A single host-management surface exposed to the dashboard.
 ///
 /// Each module owns one slice of host state (settings, files, services,
-/// quadlets, …). The [`Dispatcher`] looks up a module by name and hands the
+/// quadlets, …). The [`Dispatcher`](super::Dispatcher) looks up a module by name and hands the
 /// command's `action` and `payload` to its `handle` method.
 ///
 /// Modules are stateless: `handle` takes `&self`, so the same module can be
 /// invoked concurrently from multiple transport tasks. State lives in the
 /// host (systemd, the filesystem, etc.), not in the module.
-#[allow(clippy::missing_errors_doc)]
-#[enum_dispatch::enum_dispatch(Module)]
 pub trait Mod: Send + Sync {
     /// Static metadata describing this module to the dashboard: name, feature
     /// flag, description, status, and the actions it supports.
@@ -74,13 +103,25 @@ pub trait Mod: Send + Sync {
         self.info().name
     }
 
-    /// Handle one action.
+    /// Answer the shared `capabilities`/`plan` meta-actions, which the
+    /// [`Dispatcher`](super::Dispatcher) asks before [`handle`](Self::handle). `None` for every
+    /// other action.
+    fn metadata(&self, action: &str, payload: &Value) -> Option<Value> {
+        self.info().metadata_response(action, payload)
+    }
+
+    /// Who unprivileged actions run as when the payload has no `run_as`
+    /// (see [`RunAs`]): the signed-in user, unless the host state `action`
+    /// reads is the apps account's (`podman`, `services` in apps scope).
+    /// `payload` still has every field but `run_as`.
+    fn default_run_as(&self, _action: &str, _payload: &Value) -> RunAs {
+        RunAs::User
+    }
+
+    /// Handle one module-specific action.
     ///
     /// - `action` is the command's `action` field
     /// - `payload` is the command's `payload` (already parsed from JSON by the transport)
-    ///
-    /// Implementations conventionally start with [`super::module_support::handle_metadata`] to
-    /// serve the shared `capabilities`/`plan` meta-actions, then match on `action`.
     fn handle(&self, action: &str, payload: Value, user: Option<&str>) -> Result<Value>;
 }
 
@@ -122,9 +163,9 @@ macro_rules! actions {
     (@[$payload:ident $user:ident $Action:ident]{$a:ident {$($struct:tt)*} => $body:expr, $($rest:tt)*}[$($done:ident)*]) => {
         #[derive(Debug, ::serde::Deserialize)]
         struct $a {$($struct)*}
-        impl $crate::prelude::Act for $a {
+        impl $crate::agent::modules::Act for $a {
             // fn is_priviledged(&self) -> bool { false }
-            fn handle(self, user: Option<&str>) -> Result<Value> {
+            fn handle(self, user: Option<&str>) -> ::anyhow::Result<::serde_json::Value> {
                 #[allow(unused_variables)]
                 let ($user, $payload) = (user, self);
                 $body
@@ -136,9 +177,9 @@ macro_rules! actions {
         // Takes no payload: any object (or `null`, see `parse_action`).
         #[derive(Debug, ::serde::Deserialize)]
         struct $a {}
-        impl $crate::prelude::Act for $a {
+        impl $crate::agent::modules::Act for $a {
             // fn is_priviledged(&self) -> bool { false }
-            fn handle(self, user: Option<&str>) -> Result<Value> {
+            fn handle(self, user: Option<&str>) -> ::anyhow::Result<::serde_json::Value> {
                 #[allow(unused_variables)]
                 let ($user, $payload) = (user, self);
                 $body
@@ -149,9 +190,9 @@ macro_rules! actions {
     (@[$payload:ident $user:ident $Action:ident]{$a:ident: $t:ty => $body:expr, $($rest:tt)*}[$($done:ident)*]) => {
         #[derive(Debug, ::serde::Deserialize)]
         struct $a($t);
-        impl $crate::prelude::Act for $a {
+        impl $crate::agent::modules::Act for $a {
             // fn is_priviledged(&self) -> bool { false }
-            fn handle(self, user: Option<&str>) -> Result<Value> {
+            fn handle(self, user: Option<&str>) -> ::anyhow::Result<::serde_json::Value> {
                 #[allow(unused_variables)]
                 let ($user, $payload) = (user, self.0);
                 $body
@@ -159,24 +200,30 @@ macro_rules! actions {
         }
         $crate::actions!(@[$payload $user $Action]{$($rest)*}[$($done)* $a]);
     };
-    (@[$payload:ident $user:ident $Action:ident]{$(,)?}[$($done:ident)*]) => { ::preinterpret::preinterpret! {
+    (@[$payload:ident $user:ident $Action:ident]{$(,)?}[$($done:ident)*]) => {
         #[derive(Debug, ::serde::Deserialize)]
         #[serde(rename_all = "snake_case")]
         enum $Action { $( $done($done), )* }
-        impl $crate::prelude::Act for $Action {
+        impl $crate::agent::modules::Act for $Action {
             // fn is_priviledged(&self) -> bool { match self {
             //     $( Self::$done(a) => a.is_priviledged(), )*
             // }}
-            fn handle(self, user: Option<&str>) -> Result<::serde_json::Value> { match self {
-                $( Self::$done(a) => a.handle(user), )*
+            fn handle(self, user: Option<&str>) -> ::anyhow::Result<::serde_json::Value> { match self {
+                $( Self::$done(a) => $crate::agent::modules::Act::handle(a, user), )*
             }}
         }
         impl $Action {
-            fn from_payload(action: &str, payload: Value) -> Result<impl Act> {
+            fn from_payload(action: &str, payload: ::serde_json::Value) -> ::anyhow::Result<Self> {
                 $crate::agent::module_support::parse_action::<$Action>(action, payload)
             }
+
+            /// [`Act::handle`]($crate::agent::modules::Act::handle), callable
+            /// without the trait in scope.
+            fn handle(self, user: Option<&str>) -> ::anyhow::Result<::serde_json::Value> {
+                $crate::agent::modules::Act::handle(self, user)
+            }
         }
-    } };
+    };
 }
 
 #[cfg(test)]
@@ -200,14 +247,14 @@ mod tests {
             let response = Action::from_payload("ping", payload).unwrap().handle(None);
             assert_eq!(response.unwrap(), "pong");
         }
-        assert!(Action::from_payload("ping", json!("")).is_err());
-        assert!(Action::from_payload("ping", json!([1])).is_err());
+        Action::from_payload("ping", json!("")).unwrap_err();
+        Action::from_payload("ping", json!([1])).unwrap_err();
         // A payload whose fields all have defaults may be left out.
         let response = Action::from_payload("stop", Value::Null)
             .unwrap()
             .handle(None);
         assert_eq!(response.unwrap(), false);
-        assert!(Action::from_payload("echo", Value::Null).is_err());
+        Action::from_payload("echo", Value::Null).unwrap_err();
         let response = Action::from_payload("echo", json!({ "value": 7 }))
             .unwrap()
             .handle(None);

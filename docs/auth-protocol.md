@@ -4,7 +4,9 @@ This is the API local clients (the dashboard and the server OOBE) use on
 `/run/tetra/tetra.sock`. Tetra is the only authority for login and
 authorization: it verifies passwords, TOTP codes and passkeys, issues session
 tokens, and checks every request against the caller's role and grants. Local
-clients only hold Tetra-issued tokens.
+clients only hold Tetra-issued tokens. The development-only `agent-ws-serve`
+listener serves this same protocol on loopback TCP; it does not introduce a
+second authentication system.
 
 For how the dashboard should drive these operations, see
 [dashboard-auth-guide.md](dashboard-auth-guide.md). Module actions themselves
@@ -42,10 +44,25 @@ Protocol version: `2026-10-session-v1`.
 }
 ```
 
-The controller-key login (Ed25519 challenge, signed commands) is **not**
-accepted on the local socket. It remains only on the development TCP listener
-(`agent-ws-serve`, `dev-listener` feature). Remote controllers use the outbound
-mTLS connection, which is unchanged.
+## Development TCP listener
+
+Build with `--features dev-listener`, then run `tetra agent-ws-serve` to serve
+the same session protocol over WebSocket on loopback TCP. Use the same
+privileges and PAM setup as the daemon (usually root):
+
+```sh
+cargo build --features dev-listener
+sudo target/debug/tetra agent-ws-serve \
+  --listen 127.0.0.1:7780 --client dashboard
+```
+
+`--listen` rejects non-loopback addresses. TCP has no peer credentials, so
+`--client dashboard|oobe` (default `dashboard`) is applied to every connection;
+any local process that can connect is treated as that client. Every request
+still uses the session tokens and authorization described below. The listener
+is development-only, has no TLS, and must not be exposed to other hosts. Use
+the Unix socket in production. Remote controllers use the outbound mTLS
+connection, not this local session protocol.
 
 ## Frames
 
@@ -98,6 +115,8 @@ without an `id`.
 | `conflict` | Already enrolled or already registered. |
 | `action_failed` | The module action ran and failed; `message` has its error. |
 | `queue_full` | Tetra's command queue is full; retry after backoff. |
+| `reauth_required` | The operation adds or removes a way to log in and the session is more than 10 minutes old; log in again and retry. |
+| `limit_reached` | Too many web shells are open, for the user or on the host; close one first. |
 | `internal` | Tetra failed; details are in the journal only. |
 
 ## Who can log in
@@ -112,7 +131,14 @@ An account can log in when all of these hold, checked on every login
 - PAM's account stack (`/etc/pam.d/ultramarine-dashboard`) accepts it.
 
 Locking, deleting or renaming an account ends its sessions on the next
-request.
+request. A successful `users.set_password` or `users.delete` (not a dry run)
+invalidates every session of the named account, including the caller’s own.
+The dispatcher bumps the account’s persisted session epoch under its store
+lock, so this applies equally to local `module.dispatch`, remote controller
+commands and `agent-dispatch` in another process. Existing sessions and shell
+keepalives fail on their next authorization check. Failed commands and dry
+runs do not change the epoch; a failure to persist invalidation is reported
+as an action failure even though the account command already succeeded.
 
 ## Sessions
 
@@ -123,8 +149,10 @@ A token (`tts_` + 43 characters) is issued only after full authentication:
 - the setup code (setup session, OOBE only).
 
 Tokens are bound to the client they were issued to. User sessions last 12
-hours and expire after 1 hour without use; setup sessions last 2 hours. Tetra
-stores only token hashes; sessions survive a Tetra restart.
+hours and expire after 1 hour without use; setup sessions last 2 hours. A
+user may have at most 32 sessions: a new login beyond that ends the user's
+least recently used session. Tetra stores only token hashes; sessions survive
+a Tetra restart.
 
 ## Operations
 
@@ -276,6 +304,12 @@ so the answer does not reveal whether an entry exists.
 | `account.passkey_list` | | `{passkeys: [{id, name, created_at, last_used_at}]}` |
 | `account.passkey_remove` | `id` | `{removed}` |
 
+`account.totp_begin`, `account.passkey_register_begin` and
+`account.passkey_remove` need a session from the last 10 minutes
+(`reauth_required` otherwise), so a stolen session cannot plant a credential
+that outlives it. `totp_disable` and `recovery_regenerate` already need the
+second factor itself.
+
 ### Authorization
 
 | Op | Params | Result |
@@ -287,6 +321,18 @@ so the answer does not reveal whether an entry exists.
 | `admin.actions` | `limit?` (100), `origin?` (`local`, `setup`, `remote`) | `{actions: [...]}`, newest first |
 
 `admin.*` operations need an administrator.
+
+The action log (`admin.actions`) records every module action run through
+`module.dispatch` or by a remote controller, the operations
+`access.set`, `setup.complete`, `admin.grants_set`, `admin.sessions_revoke`,
+`launcher.set`, `launcher.remove` and `launcher.public_set` (as `module`
+and `action`, such as `admin` and `grants_set`), and web shells opening and
+closing (module `shell`, actions `open` and `close`, see
+[Web shell](#web-shell)). An entry is `{at, origin, client?, uid?, username?,
+host_id?, command_id, module, action, ok, error?, detail?}`; `detail` is text
+Tetra composes itself, such as a shell's unit and why it ended. Requests
+refused before anything ran (`forbidden`, or `bad_request` for operations,
+or a `shell.open` whose ticket is not accepted) are not recorded.
 
 ### Launcher
 
@@ -345,6 +391,119 @@ the route answers 404. Tetra regenerates the page whenever entries or the
 setting change, after `access.set`, and when it starts. The page loads nothing
 from other origins (its CSP allows only inline styles and `data:` images).
 
+### Web shell
+
+A signed-in user can open a terminal on the host, running their own login
+shell as themselves (never as root; `sudo` inside it asks for their password
+as usual). The dashboard runs in a container and never starts host
+processes: Tetra owns the PTY, and the dashboard only relays bytes between
+the browser and the socket. There is no other listener.
+
+| Op | Params | Result |
+| --- | --- | --- |
+| `shell.ticket` | | `{ticket, expires_at}` |
+| `shell.open` | `ticket, cols?, rows?` | see below; only as the first request of a new connection |
+
+**`shell.ticket`** (dashboard user sessions only) returns a single-use
+ticket for the caller's own account, bound to the session that asked (its
+id, UID and username). Tickets live in memory only, expire after 30 seconds
+and are gone once redeemed. Each user may have 16 pending; a 17th replaces
+their oldest (4096 in all). The setup session gets `forbidden`, the OOBE
+`wrong_client`. Every signed-in user may open a shell by default; it is
+listed as `shell.open` (`Authenticated`) in the authorization table so it
+can be restricted later. Remote controllers never get a shell: they do not
+use the socket's operations.
+
+**`shell.open`** `{ticket, cols?, rows?}` turns a connection into a shell.
+Open a new connection to the socket (dashboard only), wait for `hello`, and
+send it as the connection's first request:
+
+```json
+{ "type": "request", "id": "sh-1", "op": "shell.open",
+  "params": { "ticket": "…", "cols": 120, "rows": 40 } }
+```
+
+`cols` and `rows` default to 80 by 24 and must be between 1 and 1000. No
+token is needed: the ticket is the credential. Redeeming it uses it up, then
+checks its session again (still live, same account under the same name,
+the account may still log in and open a shell). Errors come back as a normal
+`response` and the connection is closed: `invalid_credentials` (unknown,
+expired or used ticket: ask for a new one), `unauthenticated` (the session
+has ended), `forbidden`, `wrong_client`, `bad_request`, `limit_reached` (4
+shells per user, 16 on the host) or `internal` (the shell did not start).
+`shell.open` anywhere else, such as on a connection that already carried a
+request, is `bad_request` and does not use the ticket up.
+
+On success Tetra answers
+
+```json
+{ "type": "response", "id": "sh-1", "ok": true,
+  "result": { "uid": 1000, "username": "alice",
+              "unit": "tetra-shell-1000-1a2b3c4d5e6f.service",
+              "cols": 120, "rows": 40, "idle_timeout": 1800,
+              "max_lifetime": 14400 } }
+```
+
+and from then on the connection carries only the shell:
+
+- **Binary messages** are terminal bytes, both ways: what the user types to
+  Tetra, what the shell writes to the dashboard. An input message may be at
+  most 1 MiB (larger ones end the shell with `protocol_error`); split big
+  pastes.
+- **Text messages** are JSON control frames. From the dashboard,
+  `{"type": "resize", "cols": 120, "rows": 40}`. Text that is not a known,
+  valid control frame is ignored. From Tetra, once, just before it closes the
+  connection: `{"type": "exit", "status": 0, "reason": "exited"}`.
+  `status` is the shell's exit status when it exited by itself with one,
+  otherwise `null`. `reason` is `exited`, `session_ended` (logout,
+  revocation or expiry of the session, or its account may no longer log in
+  or open a shell), `idle_timeout` (no input for 30 minutes: no binary
+  message and no valid `resize` from the dashboard; output does not count,
+  so a forgotten `tail -f` or `watch` cannot keep a shell alive), `max_lifetime` (open for 4 hours, however it is used) or
+  `protocol_error`.
+
+Closing the connection ends the shell. So does the end of its session, which
+Tetra checks every 5 seconds while the shell runs. Input counts as using the
+session (`last_seen`), so a session does not expire while its shell is in
+use; the 12-hour limit still applies. Input is anything the dashboard sends:
+keystrokes, but also what xterm.js sends by itself (mouse and focus reports,
+answers to terminal queries), so a dashboard that keeps sending keeps the
+shell and its session from going idle; `max_lifetime` still ends it.
+
+How Tetra runs it: Tetra opens a PTY pair itself and runs
+
+```text
+systemd-run --quiet --pty --collect --service-type=exec --send-sighup
+    --expand-environment=no --unit=tetra-shell-<uid>-<random>
+    --uid=<uid> -p PAMName=tetra-shell -p WorkingDirectory=-~
+    -p TimeoutStopSec=10s --setenv=TERM=xterm-256color -- <login shell> -l
+```
+
+with the PTY as its controlling terminal, in a new session, with an empty
+environment apart from `PATH`, `TERM` and `LANG`. The shell runs in its own
+transient service with systemd's clean environment (`HOME`, `USER`, `SHELL`
+and `TERM`; nothing of Tetra's, such as `LISTEN_FDS`), in the user's home
+directory, with the user's groups. The PAM service `tetra-shell`
+(`pam/tetra-shell`, installed as `/etc/pam.d/tetra-shell`; `agent-serve
+--shell-pam-service` picks another) runs the account stack (`pam_nologin`,
+expiry) and the session stack, like a console login: the user's SELinux
+context, the audit `loginuid`, limits, and a logind session with
+`XDG_RUNTIME_DIR`, so `systemctl --user` and rootless Podman work. Its auth
+stack is `pam_deny`; systemd never runs it. Resizes reach the shell through
+systemd-run (`SIGWINCH`). Whenever a shell ends, for whatever reason,
+Tetra stops its unit (`SIGTERM` and `SIGHUP` to everything in it, `SIGKILL`
+after 10 seconds) and hangs up systemd-run if it still runs. That includes
+the shell exiting and systemd-run exiting by itself (detached with `^]`
+three times, which leaves the unit running): the connection then ends with
+`exited`. As with SSH, processes the user deliberately moved out of the
+unit (`systemd-run --user`, user services with `loginctl enable-linger`)
+are not stopped. Output waits when the dashboard reads slower than the
+shell writes, so neither side buffers without bound. If Tetra stops,
+systemd kills its systemd-run processes, which hangs up every shell's
+terminal; a shell that ignores `SIGHUP` keeps running in its unit until
+Tetra starts again, which stops every `tetra-shell-*.service` it did not
+start itself.
+
 ### Access and setup completion
 
 | Op | Params | Result |
@@ -389,9 +548,12 @@ administrator.
   `bad_request`: Caddy listens on every address, so it would collide with
   those listeners. The same goes for a `dashboard_upstream` on 443 when
   `port` is omitted.
-- `dashboard_upstream` defaults to `127.0.0.1:3972`. Its port may not be
-  0, 80, 2019, 6623 or 6624 either (`bad_request`), since Caddy or the OOBE
-  listens there.
+- `dashboard_upstream` defaults to `127.0.0.1:3972` (`tetra agent-serve
+  --dashboard-upstream`). It must be `host:port` and nothing else: an IPv4
+  address, a bracketed IPv6 address or a DNS name, and a decimal port, without
+  a scheme or path (`bad_request` otherwise). Its port may not be 0, 80,
+  2019, 6623 or 6624 either (`bad_request`), since Caddy or the OOBE listens
+  there.
 - Changing the hostname invalidates passkeys registered under the old one.
 - `dashboard_url` is `https://hostname[:port]`, IPv6 addresses bracketed.
 - Every `access.set` writes `ORIGIN=<dashboard_url>` to
@@ -474,9 +636,12 @@ while starting shows up in `systemctl status ultramarine-dashboard`, not here.
 **`module.dispatch`** `{module, action, payload?}`
 
 Runs a module action (see [agent-protocol.md](agent-protocol.md)). The result
-is the action's payload; a failed action is `action_failed`. Unprivileged
-actions run as the session's user through `runuser`; privileged ones as root.
-Every dispatched action is recorded in the action log.
+is the action's payload; a failed action is `action_failed`, and a full
+command queue `queue_full`. Unprivileged actions run as the session's user
+through `runuser`; privileged ones, and every action of the setup session, as
+root. Module actions run one at a time on the host; a host command that takes
+longer than 15 minutes is killed and the action fails. Every dispatched
+action that passes authorization is recorded in the action log.
 
 ## Authorization
 
@@ -484,11 +649,13 @@ Every dispatched action is recorded in the action log.
   every action) may run everything.
 - **Other users** have `launcher: view` by default (the Services page: the
   apps shared with them), plus their grants. `manage` implies `view`.
+- **Every signed-in user** may open their own [web shell](#web-shell)
+  (`shell.open` in the table is `Authenticated`); the setup session may not.
 - **The setup session** may run only the module actions the OOBE needs, each
   named individually (list in `src/auth/authz.rs`, `SETUP_ALLOWED`):
   `agent.capabilities`; `settings.set_hostname/set_keymap/set_locale/set_timezone`;
   `users.create/set_password/set_authorized_keys/add_admin`;
-  `power.reboot/poweroff`; `network.interfaces/status/scan_wifi/connect_wifi/configure/confirm`;
+  `power.reboot/poweroff`; `network.interfaces/status/scan_wifi/connect_wifi/configure/confirm/pending`;
   `updates.set_policy`; and
   `remote_access.status/tailscale_up/tailscale_disable/cloudflared_set_token/cloudflared_disable`.
   No `services.*`, no raw network configuration (`network.get_config/set_config`),
@@ -512,22 +679,33 @@ Every dispatched action is recorded in the action log.
 | Page | `view` | `manage` (grantable) | Administrator only |
 | --- | --- | --- | --- |
 | `launcher` (default) | `launcher.list/get` | — | `launcher.set/remove/public_get/public_set` |
+| — (any signed-in user) | `shell.open` (`shell.ticket`): the user's own shell | — | — |
 | `system_services` | `services.list/status/logs` (systemd units and their journal; not a default, grant it explicitly) | — | start, stop, restart, enable, disable, daemon_reload |
-| `apps` | `apps.list/get`, `quadlets.list/read/validate/list_files`, `recipes.render_inline/context_inline` | — | apps create/update/remove, quadlets write/delete/install, `recipes.render/context` (read paths as root) |
-| `containers` | `podman.containers/inspect/images/volumes/networks/logs` | — | podman start/stop/restart/remove |
+| `apps` | `apps.list/get` (`get` shows secret values as `********`), `quadlets.list/validate/list_files`, `recipes.context_inline` | — | apps create/update/remove, quadlets read (unit files hold app secrets)/write/delete/install, `recipes.render/context` (read paths as root), `recipes.render_inline` (templates can loop for a very long time) |
+| `containers` | `podman.containers/inspect/images/volumes/networks/logs` (as `ultramarine-apps` by default; `inspect` hides environment values) | — | podman start/stop/restart/remove, `inspect` with `show_env` |
 | `storage` | `storage.list/status/zfs` | — | `storage.mount/unmount/configure` |
-| `sharing` | `samba.list_shares/get_config`, `nfs.list_exports/get_config` | `samba/nfs.set_config/reload` | samba/nfs enable, disable |
-| `network` | `network.interfaces/status/dns/routes`, `reverse_proxy.list/render` | `reverse_proxy.write/delete/reload` | `network.get_config/set_config/reload/configure/confirm/scan_wifi/connect_wifi`, `remote_access.*` |
+| `sharing` | `samba.list_shares/get_config`, `nfs.list_exports/get_config` (default config path only) | `samba/nfs.reload` | samba/nfs `set_config` (the files can run commands as root), enable, disable |
+| `network` | `network.interfaces/status/dns/routes`, `reverse_proxy.list/render` | `reverse_proxy.write/delete/reload` | `network.get_config/set_config/reload/configure/confirm/pending/scan_wifi/connect_wifi`, `remote_access.*` |
 | `virtual_machines` | `virtual_machines.list/status/logs` | — | start, stop, restart, create, delete |
 | `settings` | `selinux.status/booleans/file_contexts`, `updates.get_policy` | — | `settings.set_hostname/set_keymap/set_locale/set_timezone`, `updates.set_policy`, `power.reboot/poweroff`, SELinux changes |
 | `users` | `users.list/status/groups` | — | create, update, delete, set_password, set_authorized_keys, add_admin |
 | `files` | — | — | `files.read/write` |
 
-Payload fields that point an action at arbitrary host paths are
-administrator-only: `config_dir` on `reverse_proxy` actions,
-`base_dir`/`files_base_dir` on `quadlets` and `apps` actions, and `home` on
-`users` actions. The setup session
-and granted users always get the default directories. Stored grants that are
+Some payload fields need more than the action itself (`RESTRICTED_FIELDS`).
+`scope` other than `"apps"` on `apps` and `quadlets` actions (system scope,
+or `"all"` on `apps.list`) needs the `system_services` grant, since system
+scope holds the rootful system services. Payload fields that point an action
+at arbitrary host paths are administrator-only: `config_dir` on `reverse_proxy`
+actions, `base_dir`/`files_base_dir` on `quadlets` and `apps` actions, `home`
+on `users` actions, and `path` on `samba` and `nfs` actions, which may only
+be left out or set to the default (`/etc/samba/smb.conf`, `/etc/exports`).
+So is `run_as` on any module's action, unless it is `"user"` or `"apps"`
+(the signed-in user's own view, or that of the `ultramarine-apps` account
+user apps run under): running a read as root shows the host's view (rootful
+containers and their environment, every VM). So is `show_env: true` on
+`podman.inspect`, which would show the apps' secrets. Otherwise the request
+is `forbidden`. The setup session and granted users
+always get the default directories; remote controllers may set them. Stored grants that are
 no longer grantable (such as `files: view` from an earlier release) are
 ignored. Grants stored under the page's earlier name, `services`, are read as
 `system_services`.
@@ -535,9 +713,12 @@ ignored. Grants stored under the page's earlier name, `services`, are read as
 Managing users, reading or writing files (the files module runs as root on
 any path), settings or storage (mounting is root-equivalent), and
 anything that manages rootful systemd units, containers or VMs, is never
-grantable. Apps are currently installed as
-system-scope units, so app management is administrator-only until apps run
-rootless under `ultramarine-apps`.
+grantable. App management (`apps.create/update/remove`,
+`quadlets.write/delete/install`) stays administrator-only even though apps
+now run rootless under `ultramarine-apps` by default: its payloads can read
+recipes from host paths and relabel paths as root (`selinux`), system scope
+is still rootful, and every app shares the one account, so one app's units
+could read another's secrets.
 
 Remote controllers (the outbound mTLS connection) are authorized as a
 `RemoteController` principal that may run everything. Each of their actions
@@ -552,7 +733,11 @@ is recorded with `origin: "remote"`.
   generates the code once (`XXXX-XXXX`, sealed in
   `/var/lib/tetra/auth/setup-code.json`) and writes it to
   `/run/tetra/setup-code` (root-only, for the console screen) and
-  `/run/issue.d/50-tetra-setup.issue` (getty login banner). It is never shown
+  `/run/issue.d/50-tetra-setup.issue` (getty login banner, mode `0600`, read by agetty as root). The banner lists
+  `https://\4:6623` and `https://[\6]:6623`, using agetty’s IPv4/IPv6
+  issue escapes; use the address family available on your network. These
+  escapes select a configured interface and fall back to hostname resolution
+  ([agetty(8)](https://man7.org/linux/man-pages/man8/agetty.8.html)). It is never shown
   over SSH.
 - The code stays the same across reboots until setup completes or the
   wrong-code limit replaces it. Tetra republishes a replaced code itself.

@@ -15,11 +15,22 @@
 //!   remote catalog publish new recipes without bumping the installed Tetra
 //!   version, as long as the recipe schema is one the agent understands.
 
-use serde_yaml::Value as YamlValue;
+use std::collections::BTreeMap;
+
+use serde_json::json;
+use serde_norway::Value as YamlValue;
+
+use crate::actions;
+use crate::agent::module_support::{ModuleInfo, ModuleStatus, write_under};
+use crate::agent::modules::Mod;
 
 use crate::{
-    catalog::{AppRecipe, RenderOptions, RenderedResource},
+    catalog::{
+        AppRecipe, load_values,
+        verification::{RecipeSource, verify_images},
+    },
     prelude::*,
+    types::AppRecipeSource,
 };
 
 /// Agent module that wraps the recipe catalog for remote rendering.
@@ -39,12 +50,15 @@ const INFO: ModuleInfo = ModuleInfo {
     status: ModuleStatus::Available,
     actions: &[
         "capabilities",
+        "plan",
         "render",
         "render_inline",
         "context",
         "context_inline",
     ],
-    privileged_actions: &[],
+    // `render` writes its output when given an `output_dir`, so it runs
+    // once, as root, never twice under `run_as: both`.
+    privileged_actions: &["render"],
 };
 
 impl Mod for RecipesModule {
@@ -61,34 +75,51 @@ actions!(Action [payload user] => {
     Render {
         recipe_path: PathBuf,
         templates_dir: PathBuf,
+        source: Option<RecipeSource>,
+        #[serde(default)]
+        allow_unpinned_images: bool,
         values_path: Option<PathBuf>,
         output_dir: Option<PathBuf>,
         #[serde(default)]
         dry_run: bool,
     } => {
-        let resources = RenderedResource::from_files(&RenderOptions {
+        let bundle = AppRecipeSource::File {
             recipe_path: payload.recipe_path,
-            values_path: payload.values_path,
             templates_dir: payload.templates_dir,
-            output_dir: payload.output_dir,
-            dry_run: payload.dry_run,
-        })?;
-        Ok(jsonf! { resources })
+        }.snapshot()?;
+        let source = bundle.verify(payload.source.as_ref(), payload.allow_unpinned_images)?;
+        let mut values = load_values(payload.values_path.as_ref())?;
+        let (recipe, resources) = bundle.render(&mut values)?;
+        verify_images(&resources, payload.allow_unpinned_images, bundle_dir(&recipe, &values).as_deref())?;
+        if let Some(output_dir) = payload.output_dir {
+            for resource in &resources {
+                write_under(&output_dir, &resource.filename, resource.contents.as_bytes(),
+                    resource.kind.mode(), payload.dry_run)?;
+            }
+        }
+        Ok(json!({ "resources": resources, "source": source }))
     },
     RenderInline {
         recipe: String,
+        source: Option<RecipeSource>,
+        #[serde(default)]
+        allow_unpinned_images: bool,
         #[serde(default)]
         templates: BTreeMap<String, String>,
         #[serde(default)]
         values: BTreeMap<String, YamlValue>,
     } => {
+        let source = crate::catalog::verification::verify_source(&payload.recipe, &payload.templates,
+            payload.source.as_ref(), payload.allow_unpinned_images)?;
         let recipe = AppRecipe::load_str(&payload.recipe)?;
         let resources =
             recipe.render_with_templates(&payload.values, &payload.templates)?;
+        verify_images(&resources, payload.allow_unpinned_images,
+            bundle_dir(&recipe, &payload.values).as_deref())?;
         // Echo the parsed recipe alongside the rendered resources so
         // the dashboard can display normalized metadata (id, version,
         // parameters) without re-parsing the YAML it just sent.
-        Ok(jsonf! { recipe, resources })
+        Ok(json!({ "recipe": recipe, "resources": resources, "source": source }))
     },
     Context {
         recipe_path: PathBuf,
@@ -97,7 +128,7 @@ actions!(Action [payload user] => {
     } => {
         let recipe = AppRecipe::load(payload.recipe_path)?;
         let context = recipe.context_for_agent(&payload.values)?;
-        Ok(jsonf! { context })
+        Ok(json!({ "context": context }))
     },
     ContextInline {
         recipe: String,
@@ -106,6 +137,31 @@ actions!(Action [payload user] => {
     } => {
         let recipe = AppRecipe::load_str(&payload.recipe)?;
         let context = recipe.context_for_agent(&payload.values)?;
-        Ok(jsonf! { recipe, context })
+        Ok(json!({ "recipe": recipe, "context": context }))
     },
 });
+
+/// The `bundle_dir` the recipe renders with (its value or default), which a
+/// pinned kube unit's `Yaml=` must point into: there is no installed bundle
+/// to check against when only rendering.
+fn bundle_dir(recipe: &AppRecipe, values: &BTreeMap<String, YamlValue>) -> Option<PathBuf> {
+    let parameter = recipe.parameters.iter().find(|p| p.key == "bundle_dir")?;
+    parameter
+        .json_value(values)
+        .ok()?
+        .as_str()
+        .map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_writes_so_it_is_privileged() {
+        assert!(INFO.is_privileged("render"));
+        for action in ["render_inline", "context", "context_inline"] {
+            assert!(!INFO.is_privileged(action), "{action}");
+        }
+    }
+}

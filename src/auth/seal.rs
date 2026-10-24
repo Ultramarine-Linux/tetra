@@ -14,10 +14,7 @@
 //! starting without the key; `tetra auth reset-2fa` recovers them from the
 //! console.
 
-use std::{
-    io::Write,
-    process::{Command, Stdio},
-};
+use std::process::Command;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chacha20poly1305::{
@@ -53,25 +50,21 @@ pub struct SystemdCreds;
 
 impl SystemdCreds {
     fn run(args: &[String], input: &[u8]) -> Result<Vec<u8>> {
-        let mut child = Command::new("systemd-creds")
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("failed to run systemd-creds")?;
-        child
-            .stdin
-            .take()
-            .context("systemd-creds stdin")?
-            .write_all(input)?;
-        let output = child.wait_with_output()?;
+        // Bounded like every other host command; the child is always
+        // reaped, and a failed write (EPIPE when it exits early) is reported
+        // after its status, whose stderr says more.
+        let (output, written) = crate::agent::module_support::output_with_timeout(
+            Command::new("systemd-creds").args(args),
+            Some(input),
+        )
+        .context("failed to run systemd-creds")?;
         ensure!(
             output.status.success(),
             "systemd-creds {} failed: {}",
             args.first().map_or("", String::as_str),
             String::from_utf8_lossy(&output.stderr).trim()
         );
+        written.context("failed to write to systemd-creds")?;
         Ok(output.stdout)
     }
 }
@@ -106,12 +99,15 @@ impl Sealer for SystemdCreds {
 }
 
 /// An encrypted value as stored in JSON.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sealed {
     /// Base64 `XChaCha20` nonce.
     pub nonce: String,
     /// Base64 ciphertext with the Poly1305 tag.
     pub ciphertext: String,
+    /// Fields from a newer build, kept across a rewrite.
+    #[serde(flatten)]
+    pub extra: store::Extra,
 }
 
 /// The unsealed store key.
@@ -135,7 +131,7 @@ impl StoreKey {
     /// # Errors
     /// Fails when the key cannot be unsealed, generated or written.
     pub fn load_or_create(path: &Path, sealer: &dyn Sealer) -> Result<Self> {
-        let key = if let Some(blob) = read_optional(path)? {
+        let key = if let Some(blob) = store::read_optional(path)? {
             let key = sealer
                 .unseal(CREDENTIAL_NAME, &blob)
                 .with_context(|| format!("failed to unseal `{}`", path.display()))?;
@@ -193,6 +189,7 @@ impl StoreKey {
         Ok(Sealed {
             nonce: STANDARD.encode(nonce),
             ciphertext: STANDARD.encode(ciphertext),
+            extra: store::Extra::new(),
         })
     }
 
@@ -216,14 +213,6 @@ impl StoreKey {
                 },
             )
             .map_err(|_| anyhow::anyhow!("failed to decrypt {purpose}"))
-    }
-}
-
-fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to read `{}`", path.display())),
     }
 }
 

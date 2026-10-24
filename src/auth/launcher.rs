@@ -19,19 +19,20 @@
 //! ([`Tolerant`]): such an entry is shown to administrators only, opens its
 //! stored URL, and is written back unchanged.
 
-use std::{collections::BTreeSet, os::unix::fs::PermissionsExt};
+use std::{collections::BTreeSet, os::unix::fs::PermissionsExt, sync::Arc};
 
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
+use serde_json::json;
 use webauthn_rs::prelude::Url;
 
 use crate::prelude::*;
 
 use super::{
     access::{AccessConfig, AccessMode},
-    store::{self, Extra, Header, Record, StoreLock, Tolerant},
+    store::{self, Cached, Extra, Header, Record, StoreLock, Tolerant},
 };
 
 const MAX_NAME: usize = 64;
@@ -119,7 +120,7 @@ impl CatalogRoute {
                     DomainRoute::Subdomain { name } => {
                         let label = name.trim().to_ascii_lowercase();
                         ensure!(
-                            is_dns_label(&label),
+                            super::access::is_dns_label(&label),
                             "`{name}` is not a valid subdomain label"
                         );
                         format!("https://{label}.{}{port}/", access.url_host())
@@ -151,16 +152,6 @@ fn is_path_segment(segment: &str) -> bool {
         && segment
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-}
-
-fn is_dns_label(label: &str) -> bool {
-    !label.is_empty()
-        && label.len() <= 63
-        && !label.starts_with('-')
-        && !label.ends_with('-')
-        && label
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
 }
 
 /// One stored entry.
@@ -236,9 +227,9 @@ impl Entry {
     /// and where it came from; everyone else only what they need to open it.
     #[must_use]
     pub fn to_json(&self, admin: bool, access: Option<&AccessConfig>) -> Value {
-        let mut entry = jsonf! {
-            self.id, self.name, self.icon, "url": self.resolved_url(access),
-        };
+        let mut entry = json!({
+            "id": self.id, "name": self.name, "icon": self.icon, "url": self.resolved_url(access),
+        });
         if admin {
             entry["visibility"] = serde_json::to_value(&self.visibility).unwrap_or(Value::Null);
             entry["public"] = Value::Bool(self.public);
@@ -408,12 +399,24 @@ pub enum ChangeError {
 pub struct LauncherStore {
     path: PathBuf,
     public_dir: PathBuf,
+    /// The entries last read: `launcher.can_access` runs for every
+    /// `forward_auth` request.
+    cache: Cached<[Entry]>,
 }
 
 impl LauncherStore {
     #[must_use]
-    pub const fn new(path: PathBuf, public_dir: PathBuf) -> Self {
-        Self { path, public_dir }
+    pub fn new(path: PathBuf, public_dir: PathBuf) -> Self {
+        Self {
+            path,
+            public_dir,
+            cache: Cached::new(),
+        }
+    }
+
+    /// The stored entries, parsed again only when the file changed.
+    fn entries(&self) -> Result<Arc<[Entry]>> {
+        self.cache.get((), &self.path, || Ok(self.load()?.entries))
     }
 
     /// The public page's path.
@@ -434,10 +437,10 @@ impl LauncherStore {
     /// Fails when the file exists but cannot be read.
     pub fn visible(&self, viewer: &Viewer) -> Result<Vec<Entry>> {
         Ok(self
-            .load()?
-            .entries
-            .into_iter()
+            .entries()?
+            .iter()
             .filter(|entry| entry.visible_to(viewer))
+            .cloned()
             .collect())
     }
 
@@ -448,9 +451,10 @@ impl LauncherStore {
     /// Fails when the file exists but cannot be read.
     pub fn get(&self, id: &str, viewer: &Viewer) -> Result<Option<Entry>> {
         Ok(self
-            .visible(viewer)?
-            .into_iter()
-            .find(|entry| entry.id == id))
+            .entries()?
+            .iter()
+            .find(|entry| entry.id == id && entry.visible_to(viewer))
+            .cloned())
     }
 
     /// Add an entry (`id` is `None`) or replace entry `id`, then regenerate
@@ -545,7 +549,9 @@ impl LauncherStore {
             Ok(result) => result,
             Err(error) => return Ok(Err(error)),
         };
-        store::write(&self.path, &mut file)?;
+        let written = store::write(&self.path, &mut file);
+        self.cache.invalidate(&());
+        written?;
         self.write_public_page(&file, access)?;
         Ok(Ok(result))
     }
@@ -576,7 +582,8 @@ impl LauncherStore {
         )
         .with_context(|| format!("failed to set the mode of `{}`", self.public_dir.display()))?;
         let html = public_html(&file.entries, access);
-        store::replace(&path, html.as_bytes(), PUBLIC_FILE_MODE)
+        // Unchanged pages keep their mtime (and caches stay valid).
+        store::replace_if_changed(&path, html.as_bytes(), PUBLIC_FILE_MODE).map(drop)
     }
 }
 
