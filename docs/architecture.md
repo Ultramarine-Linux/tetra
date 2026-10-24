@@ -367,11 +367,13 @@ network.
 
 **Loopback WebSocket (`agent-ws-serve`).** Runs the daemon and serves the same
 `LocalServer` session protocol and `AuthService` as the Unix socket, over TCP
-for dashboard or OOBE development. Every request still needs a Tetra-issued
-session token and goes through the normal authorization and action log. TCP
-has no peer credentials, so `--client dashboard|oobe` (default `dashboard`)
-is applied to every connection. Any process on the host can connect and claim
-that configured client; use it only for development. `--listen` refuses every
+for dashboard or OOBE development. Requests go through the same token checks,
+authorization and action log as on the socket (login and the other "no token"
+operations included). TCP has no peer credentials, so `--client
+dashboard|oobe` (default `dashboard`) is applied to every connection. Any
+process on the host can connect and claim that configured client; use it only
+for development. Handshakes carrying an `Origin` header come from a web page
+(browsers let any page open a WebSocket to loopback) and are refused with 403. `--listen` refuses every
 non-loopback address. TLS is intentionally omitted: this listener is for
 loopback-only development; plain TLS would not identify the local process,
 while mutual TLS would require a separate client-credential setup. It does not
