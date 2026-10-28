@@ -43,8 +43,8 @@ use tera::{Context as TeraContext, Tera};
 /// drive rendering. This is the top-level schema deserialized from recipe YAML.
 ///
 /// `recipe_id` is the stable key the catalog indexes recipes by; `name`,
-/// `description`, `category`, `icon`, and `version` are UI metadata surfaced
-/// to the dashboard. `parameters` become keys in the Tera render context, and
+/// `description`, `category`, `icon`, `homepage`, `documentation`, and
+/// `version` are UI metadata surfaced to the dashboard. `parameters` become keys in the Tera render context, and
 /// `resources` are the files to produce.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRecipe {
@@ -59,6 +59,15 @@ pub struct AppRecipe {
     pub category: Option<String>,
     /// Optional icon asset name/URL for the dashboard.
     pub icon: Option<String>,
+    /// Optional link to the upstream project's website. Must be an
+    /// `https://` URL (enforced in [`AppRecipe::validate`]), so a dashboard
+    /// can render it as a link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+    /// Optional link to the upstream docs for running the app, usually its
+    /// container docs. Same rules as [`AppRecipe::homepage`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<String>,
     /// Recipe version, surfaced as metadata; not used to gate rendering.
     pub version: String,
     /// Host capabilities the recipe expects (e.g. `podman`, `quadlets`).
@@ -515,6 +524,14 @@ impl AppRecipe {
         assert_not_empty!(self.name.trim() => "name is required");
         assert_not_empty!(self.version.trim() => "version is required");
         assert_not_empty!(self.resources => "at least one resource is required");
+        for (field, url) in [
+            ("homepage", &self.homepage),
+            ("documentation", &self.documentation),
+        ] {
+            if let Some(url) = url {
+                validate_link(field, url)?;
+            }
+        }
 
         // Parameter keys become Tera context keys, so duplicates would silently
         // shadow each other. Reject them up front with a precise error.
@@ -712,6 +729,20 @@ impl AppRecipe {
     }
 }
 
+/// A recipe link must be an `https://` URL with a host and no whitespace or
+/// control characters: dashboards render it as a link, so `javascript:` and
+/// friends must never get through.
+fn validate_link(field: &str, url: &str) -> Result<()> {
+    let Some(rest) = url.strip_prefix("https://") else {
+        bail!("{field} must be an https:// URL");
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if host.is_empty() || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("{field} must be an https:// URL");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -754,6 +785,45 @@ resources:
         assert_eq!(recipe.recipe_id, "nextcloud");
         assert_eq!(recipe.parameters.len(), 2);
         assert_eq!(recipe.resources.len(), 2);
+        assert_eq!(recipe.homepage, None);
+        assert_eq!(recipe.documentation, None);
+    }
+
+    #[test]
+    fn parses_and_checks_links() {
+        let yaml = serde_norway::to_string(&nextcloud_recipe()).unwrap();
+        // Unset links stay out of the serialized recipe (and the template
+        // context built from it).
+        assert!(!yaml.contains("homepage"));
+
+        let with = |homepage: &str| {
+            AppRecipe::load_str(&format!(
+                "{yaml}homepage: {homepage}\ndocumentation: https://docs.example.com/install#docker\n"
+            ))
+        };
+        let recipe = with("https://nextcloud.com/").unwrap();
+        assert_eq!(recipe.homepage.as_deref(), Some("https://nextcloud.com/"));
+        assert_eq!(
+            recipe.documentation.as_deref(),
+            Some("https://docs.example.com/install#docker")
+        );
+
+        for bad in [
+            "http://nextcloud.com/",
+            "javascript:alert(1)",
+            "https://",
+            "https:///path",
+            "'https://a.example/ b'",
+            "//nextcloud.com",
+        ] {
+            let error = with(bad).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("homepage must be an https:// URL"),
+                "{bad}: {error:#}"
+            );
+        }
     }
 
     #[test]

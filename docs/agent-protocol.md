@@ -583,14 +583,15 @@ writes, including dry runs. Responses include verified `source` metadata and
 the computed digest. Context actions are unchanged. No catalog fetching occurs.
 See [image policy and limitations](recipes.md#rendered-image-policy).
 
-`render` payload (`templates_dir` here is the `templates/` directory of an
+`render` payload (`templates_dir` is a directory holding the templates the
+recipe names; Tetra doesn't ship templates, and the catalog's recipes in
 [Ultramarine-Linux/recipes](https://github.com/Ultramarine-Linux/recipes)
-checkout; Tetra doesn't ship templates):
+reach hosts inline through `render_inline`):
 
 ```json
 {
   "recipe_path": "schema.yaml",
-  "templates_dir": "../recipes/templates",
+  "templates_dir": "/srv/recipes/templates",
   "values_path": "examples/nextcloud.values.yaml",
   "output_dir": "./quadlets",
   "dry_run": true
@@ -2307,7 +2308,7 @@ disables it and removes the drop-in and the sealed token; as with
   "action": "render",
   "payload": {
     "recipe_path": "schema.yaml",
-    "templates_dir": "../recipes/templates",
+    "templates_dir": "/srv/recipes/templates",
     "values_path": "examples/nextcloud.values.yaml",
     "dry_run": true
   }

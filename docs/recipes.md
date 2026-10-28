@@ -13,7 +13,7 @@ A recipe has three top-level sections:
 
 | Section | Purpose |
 |---------|---------|
-| `recipe_id`, `name`, `description`, `category`, `icon`, `version` | Metadata shown by the dashboard/catalog. |
+| `recipe_id`, `name`, `description`, `category`, `icon`, `homepage`, `documentation`, `version` | Metadata shown by the dashboard/catalog. `homepage` (the project's site) and `documentation` (its docs) are optional and must be `https://` URLs; Tetra rejects anything else. |
 | `requires` | Host capabilities the recipe expects (e.g. `podman`, `quadlets`). Declarative only — not enforced at render time. |
 | `parameters` | User-facing inputs that become template variables. |
 | `resources` | Files to render (Quadlet units and companion files). |
@@ -26,6 +26,8 @@ name: Demo App
 description: A minimal example application
 category: web
 icon: demo
+homepage: https://example.com/
+documentation: https://example.com/docs/
 version: 1.0.0
 
 requires:
